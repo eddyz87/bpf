@@ -461,5 +461,8 @@ LIBBPF_0.8.0 {
 } LIBBPF_0.7.0;
 
 LIBBPF_1.0.0 {
+	global:
+		btf__add_enum64;
+		btf__add_enum64_value;
 	local: *;
 };
