@@ -28,6 +28,62 @@ static int libbpf_print_fn(enum libbpf_print_level level,
 	return vfprintf(stderr, format, args);
 }
 
+#define benchres_getter(field) bench_res__ ## field
+#define DEFINE_BENCHRES_GETTER(field) \
+static long benchres_getter(field)(struct bench_res *res) { return res->field; }
+
+DEFINE_BENCHRES_GETTER(hits);
+DEFINE_BENCHRES_GETTER(drops);
+DEFINE_BENCHRES_GETTER(important_hits);
+static long benchres_getter(total_ops)(struct bench_res *res)
+{
+	return res->hits + res->drops;
+}
+
+static double calc_mean_long(struct bench_res res[], int res_cnt,
+			     long (*fn)(struct bench_res *res))
+{
+	double sum;
+	int i;
+
+	for (i = 0, sum = 0; i < res_cnt; i++)
+		sum += fn(&res[i]);
+	return sum / res_cnt;
+}
+
+#define calc_mean_hits(res, res_cnt) calc_mean_long(res, res_cnt, benchres_getter(hits))
+#define calc_mean_drops(res, res_cnt) calc_mean_long(res, res_cnt, benchres_getter(drops))
+#define calc_mean_important_hits(res, res_cnt) \
+	calc_mean_long(res, res_cnt, benchres_getter(important_hits))
+#define calc_mean_total_ops(res, res_cnt) calc_mean_long(res, res_cnt, benchres_getter(total_ops))
+
+static double calc_stddev_long(struct bench_res res[], int res_cnt,
+			       double mean, long (*fn)(struct bench_res *res))
+{
+	double sum;
+	long val;
+	int i;
+
+	for (i = 0, sum = 0; i < res_cnt; i++) {
+		val = fn(&res[i]);
+		sum += (mean - val) * (mean - val) / (res_cnt - 1.0);
+	}
+	return sqrt(sum);
+}
+
+#define calc_stddev_hits(res, res_cnt, mean) \
+	calc_stddev_long(res, res_cnt, mean, benchres_getter(hits))
+#define calc_stddev_drops(res, res_cnt, mean) \
+	calc_stddev_long(res, res_cnt, mean, benchres_getter(drops))
+#define calc_stddev_important_hits(res, res_cnt, mean) \
+	calc_stddev_long(res, res_cnt, mean, benchres_getter(important_hits))
+#define calc_stddev_total_ops(res, res_cnt, mean) \
+	calc_stddev_long(res, res_cnt, mean, benchres_getter(total_ops))
+
+#define NS_IN_SEC   1000000000
+#define NS_IN_SEC_F 1000000000.0
+#define MILLION_F   1000000.0
+
 void setup_libbpf(void)
 {
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
@@ -39,7 +95,7 @@ void false_hits_report_progress(int iter, struct bench_res *res, long delta_ns)
 	long total = res->false_hits  + res->hits + res->drops;
 
 	printf("Iter %3d (%7.3lfus): ",
-	       iter, (delta_ns - 1000000000) / 1000.0);
+	       iter, (delta_ns - NS_IN_SEC) / 1000.0);
 
 	printf("%ld false hits of %ld total operations. Percentage = %2.2f %%\n",
 	       res->false_hits, total, ((float)res->false_hits / total) * 100);
@@ -68,12 +124,12 @@ void hits_drops_report_progress(int iter, struct bench_res *res, long delta_ns)
 	double hits_per_sec, drops_per_sec;
 	double hits_per_prod;
 
-	hits_per_sec = res->hits / 1000000.0 / (delta_ns / 1000000000.0);
+	hits_per_sec = res->hits / MILLION_F / (delta_ns / NS_IN_SEC_F);
 	hits_per_prod = hits_per_sec / env.producer_cnt;
-	drops_per_sec = res->drops / 1000000.0 / (delta_ns / 1000000000.0);
+	drops_per_sec = res->drops / MILLION_F / (delta_ns / NS_IN_SEC_F);
 
 	printf("Iter %3d (%7.3lfus): ",
-	       iter, (delta_ns - 1000000000) / 1000.0);
+	       iter, (delta_ns - NS_IN_SEC) / 1000.0);
 
 	printf("hits %8.3lfM/s (%7.3lfM/prod), drops %8.3lfM/s, total operations %8.3lfM/s\n",
 	       hits_per_sec, hits_per_prod, drops_per_sec, hits_per_sec + drops_per_sec);
@@ -81,34 +137,26 @@ void hits_drops_report_progress(int iter, struct bench_res *res, long delta_ns)
 
 void hits_drops_report_final(struct bench_res res[], int res_cnt)
 {
-	int i;
 	double hits_mean = 0.0, drops_mean = 0.0, total_ops_mean = 0.0;
 	double hits_stddev = 0.0, drops_stddev = 0.0, total_ops_stddev = 0.0;
-	double total_ops;
 
-	for (i = 0; i < res_cnt; i++) {
-		hits_mean += res[i].hits / 1000000.0 / (0.0 + res_cnt);
-		drops_mean += res[i].drops / 1000000.0 / (0.0 + res_cnt);
-	}
-	total_ops_mean = hits_mean + drops_mean;
+	hits_mean = calc_mean_hits(res, res_cnt);
+	drops_mean = calc_mean_drops(res, res_cnt);
+	total_ops_mean = calc_mean_total_ops(res, res_cnt);
 
 	if (res_cnt > 1)  {
-		for (i = 0; i < res_cnt; i++) {
-			hits_stddev += (hits_mean - res[i].hits / 1000000.0) *
-				       (hits_mean - res[i].hits / 1000000.0) /
-				       (res_cnt - 1.0);
-			drops_stddev += (drops_mean - res[i].drops / 1000000.0) *
-					(drops_mean - res[i].drops / 1000000.0) /
-					(res_cnt - 1.0);
-			total_ops = res[i].hits + res[i].drops;
-			total_ops_stddev += (total_ops_mean - total_ops / 1000000.0) *
-					(total_ops_mean - total_ops / 1000000.0) /
-					(res_cnt - 1.0);
-		}
-		hits_stddev = sqrt(hits_stddev);
-		drops_stddev = sqrt(drops_stddev);
-		total_ops_stddev = sqrt(total_ops_stddev);
+		hits_stddev = calc_stddev_hits(res, res_cnt, hits_mean);
+		drops_stddev = calc_stddev_drops(res, res_cnt, drops_mean);
+		total_ops_stddev = calc_stddev_total_ops(res, res_cnt, total_ops_mean);
 	}
+
+	hits_mean /= MILLION_F;
+	drops_mean /= MILLION_F;
+	total_ops_mean /= MILLION_F;
+	hits_stddev /= MILLION_F;
+	drops_stddev /= MILLION_F;
+	total_ops_stddev /= MILLION_F;
+
 	printf("Summary: hits %8.3lf \u00B1 %5.3lfM/s (%7.3lfM/prod), ",
 	       hits_mean, hits_stddev, hits_mean / env.producer_cnt);
 	printf("drops %8.3lf \u00B1 %5.3lfM/s, ",
@@ -121,10 +169,10 @@ void ops_report_progress(int iter, struct bench_res *res, long delta_ns)
 {
 	double hits_per_sec, hits_per_prod;
 
-	hits_per_sec = res->hits / 1000000.0 / (delta_ns / 1000000000.0);
+	hits_per_sec = res->hits / MILLION_F / (delta_ns / NS_IN_SEC_F);
 	hits_per_prod = hits_per_sec / env.producer_cnt;
 
-	printf("Iter %3d (%7.3lfus): ", iter, (delta_ns - 1000000000) / 1000.0);
+	printf("Iter %3d (%7.3lfus): ", iter, (delta_ns - NS_IN_SEC) / 1000.0);
 
 	printf("hits %8.3lfM/s (%7.3lfM/prod)\n", hits_per_sec, hits_per_prod);
 }
@@ -132,19 +180,13 @@ void ops_report_progress(int iter, struct bench_res *res, long delta_ns)
 void ops_report_final(struct bench_res res[], int res_cnt)
 {
 	double hits_mean = 0.0, hits_stddev = 0.0;
-	int i;
 
-	for (i = 0; i < res_cnt; i++)
-		hits_mean += res[i].hits / 1000000.0 / (0.0 + res_cnt);
+	hits_mean = calc_mean_hits(res, res_cnt);
+	if (res_cnt > 1)
+		hits_stddev = calc_stddev_hits(res, res_cnt, hits_mean);
+	hits_mean /= MILLION_F;
+	hits_stddev /= MILLION_F;
 
-	if (res_cnt > 1)  {
-		for (i = 0; i < res_cnt; i++)
-			hits_stddev += (hits_mean - res[i].hits / 1000000.0) *
-				       (hits_mean - res[i].hits / 1000000.0) /
-				       (res_cnt - 1.0);
-
-		hits_stddev = sqrt(hits_stddev);
-	}
 	printf("Summary: throughput %8.3lf \u00B1 %5.3lf M ops/s (%7.3lfM ops/prod), ",
 	       hits_mean, hits_stddev, hits_mean / env.producer_cnt);
 	printf("latency %8.3lf ns/op\n", 1000.0 / hits_mean * env.producer_cnt);
@@ -154,12 +196,12 @@ void local_storage_report_progress(int iter, struct bench_res *res,
 				   long delta_ns)
 {
 	double important_hits_per_sec, hits_per_sec;
-	double delta_sec = delta_ns / 1000000000.0;
+	double delta_sec = delta_ns / NS_IN_SEC_F;
 
-	hits_per_sec = res->hits / 1000000.0 / delta_sec;
-	important_hits_per_sec = res->important_hits / 1000000.0 / delta_sec;
+	hits_per_sec = res->hits / MILLION_F / delta_sec;
+	important_hits_per_sec = res->important_hits / MILLION_F / delta_sec;
 
-	printf("Iter %3d (%7.3lfus): ", iter, (delta_ns - 1000000000) / 1000.0);
+	printf("Iter %3d (%7.3lfus): ", iter, (delta_ns - NS_IN_SEC) / 1000.0);
 
 	printf("hits %8.3lfM/s ", hits_per_sec);
 	printf("important_hits %8.3lfM/s\n", important_hits_per_sec);
@@ -169,27 +211,19 @@ void local_storage_report_final(struct bench_res res[], int res_cnt)
 {
 	double important_hits_mean = 0.0, important_hits_stddev = 0.0;
 	double hits_mean = 0.0, hits_stddev = 0.0;
-	int i;
 
-	for (i = 0; i < res_cnt; i++) {
-		hits_mean += res[i].hits / 1000000.0 / (0.0 + res_cnt);
-		important_hits_mean += res[i].important_hits / 1000000.0 / (0.0 + res_cnt);
+	hits_mean = calc_mean_hits(res, res_cnt);
+	important_hits_mean = calc_mean_important_hits(res, res_cnt);
+	if (res_cnt > 1) {
+		hits_stddev = calc_stddev_hits(res, res_cnt, hits_mean);
+		important_hits_stddev =
+			calc_stddev_important_hits(res, res_cnt, important_hits_mean);
 	}
+	hits_mean /= MILLION_F;
+	important_hits_mean /= MILLION_F;
+	hits_stddev /= MILLION_F;
+	important_hits_stddev /= MILLION_F;
 
-	if (res_cnt > 1)  {
-		for (i = 0; i < res_cnt; i++) {
-			hits_stddev += (hits_mean - res[i].hits / 1000000.0) *
-				       (hits_mean - res[i].hits / 1000000.0) /
-				       (res_cnt - 1.0);
-			important_hits_stddev +=
-				       (important_hits_mean - res[i].important_hits / 1000000.0) *
-				       (important_hits_mean - res[i].important_hits / 1000000.0) /
-				       (res_cnt - 1.0);
-		}
-
-		hits_stddev = sqrt(hits_stddev);
-		important_hits_stddev = sqrt(important_hits_stddev);
-	}
 	printf("Summary: hits throughput %8.3lf \u00B1 %5.3lf M ops/s, ",
 	       hits_mean, hits_stddev);
 	printf("hits latency %8.3lf ns/op, ", 1000.0 / hits_mean);
