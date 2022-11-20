@@ -3217,7 +3217,13 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	}
 
 	mark_stack_slot_scratched(env, spi);
-	if (reg && !(off % BPF_REG_SIZE) && register_is_bounded(reg) &&
+	if (reg && !(off % BPF_REG_SIZE) && size == BPF_REG_SIZE &&
+	    (reg->type == SCALAR_VALUE) && dst_reg == BPF_REG_FP &&
+	    !register_is_null(reg) && env->bpf_capable) {
+		if (!reg->id && !tnum_is_const(reg->var_off))
+			reg->id = ++env->id_gen;
+		save_register_state(state, spi, reg, size);
+	} else if (reg && !(off % BPF_REG_SIZE) && register_is_bounded(reg) &&
 	    !register_is_null(reg) && env->bpf_capable) {
 		if (dst_reg != BPF_REG_FP) {
 			/* The backtracking logic can only recognize explicit
@@ -3279,6 +3285,32 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 				type;
 	}
 	return 0;
+}
+
+static void scratch_spilled_unbound_scalars(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *st;
+	struct bpf_stack_state *stack;
+	struct bpf_func_state *frame;
+	struct bpf_reg_state *reg;
+	int i, j, k;
+
+	for (st = env->cur_state; st && !st->branches; st = st->parent) {
+		for (i = 0; i <= st->curframe; ++i) {
+			frame = st->frame[i];
+			for (j = 0; j < frame->allocated_stack / BPF_REG_SIZE; j++) {
+				stack = &frame->stack[j];
+				reg = &stack->spilled_ptr;
+				if (!is_spilled_reg(stack) || reg->type != SCALAR_VALUE ||
+				    !__is_scalar_unbounded(reg))
+					continue;
+				reg->type = NOT_INIT;
+				reg->live |= REG_LIVE_WRITTEN;
+				for (k = 0; k < BPF_REG_SIZE; ++k)
+					stack->slot_type[k] = STACK_MISC;
+			}
+		}
+	}
 }
 
 /* Write the stack: 'stack[ptr_regno + off] = value_regno'. 'ptr_regno' is
@@ -11810,6 +11842,13 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC &&
 		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_ZERO)
 			continue;
+
+		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC &&
+		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_SPILL &&
+		    cur->stack[spi].spilled_ptr.type == SCALAR_VALUE &&
+		    __is_scalar_unbounded(&cur->stack[spi].spilled_ptr))
+			continue;
+
 		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
 		    cur->stack[spi].slot_type[i % BPF_REG_SIZE])
 			/* Ex: old explored (safe) state has STACK_SPILL in
@@ -12620,6 +12659,7 @@ static int do_check(struct bpf_verifier_env *env)
 process_bpf_exit:
 				mark_verifier_state_scratched(env);
 				update_branch_counts(env, env->cur_state);
+				scratch_spilled_unbound_scalars(env);
 				err = pop_stack(env, &prev_insn_idx,
 						&env->insn_idx, pop_log);
 				if (err < 0) {
