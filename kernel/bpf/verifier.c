@@ -10840,10 +10840,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 				/* case: R1 = R2
 				 * copy register state to dest reg
 				 */
-				if (src_reg->type == SCALAR_VALUE && !src_reg->id)
+				if (src_reg->type == SCALAR_VALUE && !src_reg->id &&
+				    !tnum_is_const(src_reg->var_off))
 					/* Assign src and dst registers the same ID
 					 * that will be used by find_equal_scalars()
 					 * to propagate min/max range.
+					 * Skip constants to avoid allocation of useless ID.
 					 */
 					src_reg->id = ++env->id_gen;
 				copy_register_state(dst_reg, src_reg);
@@ -13082,17 +13084,7 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		return false;
 	switch (base_type(rold->type)) {
 	case SCALAR_VALUE:
-		if (equal)
-			return true;
-		if (env->explore_alu_limits)
-			return false;
-		if (rcur->type == SCALAR_VALUE) {
-			if (!rold->precise)
-				return true;
-			/* new val must satisfy old val knowledge */
-			return range_within(rold, rcur) &&
-			       tnum_in(rold->var_off, rcur->var_off);
-		} else {
+		if (rcur->type != SCALAR_VALUE)
 			/* We're trying to use a pointer in place of a scalar.
 			 * Even if the scalar was unbounded, this could lead to
 			 * pointer leaks because scalars are allowed to leak
@@ -13101,7 +13093,18 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 			 * probably not worth the hassle.
 			 */
 			return false;
-		}
+		/* id relations must be preserved */
+		if (rold->id && !check_ids(rold->id, rcur->id, idmap))
+			return false;
+		if (equal)
+			return true;
+		if (env->explore_alu_limits)
+			return false;
+		if (!rold->precise)
+			return true;
+		/* new val must satisfy old val knowledge */
+		return range_within(rold, rcur) &&
+		       tnum_in(rold->var_off, rcur->var_off);
 	case PTR_TO_MAP_KEY:
 	case PTR_TO_MAP_VALUE:
 		/* a PTR_TO_MAP_VALUE could be safe to use as a
