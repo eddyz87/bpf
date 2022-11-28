@@ -26,6 +26,7 @@
 #include <linux/poison.h>
 
 #include "disasm.h"
+#include "u32_hashset.h"
 
 static const struct bpf_verifier_ops * const bpf_verifier_ops[] = {
 #define BPF_PROG_TYPE(_id, _name, prog_ctx_type, kern_ctx_type) \
@@ -3277,6 +3278,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	int i, slot = -off - 1, spi = slot / BPF_REG_SIZE, err;
 	u32 dst_reg = env->prog->insnsi[insn_idx].dst_reg;
 	struct bpf_reg_state *reg = NULL;
+	bool ensure_id;
 
 	err = grow_stack_state(state, round_up(slot + 1, BPF_REG_SIZE));
 	if (err)
@@ -3309,9 +3311,11 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	}
 
 	mark_stack_slot_scratched(env, spi);
-	if (reg && !(off % BPF_REG_SIZE) && register_is_bounded(reg) &&
+	ensure_id = reg && reg->type == SCALAR_VALUE && size == BPF_REG_SIZE &&
+		dst_reg == BPF_REG_FP;
+	if (reg && !(off % BPF_REG_SIZE) && (register_is_bounded(reg) || ensure_id) &&
 	    !register_is_null(reg) && env->bpf_capable) {
-		if (dst_reg != BPF_REG_FP) {
+		if (dst_reg != BPF_REG_FP && register_is_bounded(reg)) {
 			/* The backtracking logic can only recognize explicit
 			 * stack slot address like [fp - 8]. Other spill of
 			 * scalar via different register has to be conservative.
@@ -3322,6 +3326,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			if (err)
 				return err;
 		}
+		if (ensure_id && !reg->id && !tnum_is_const(reg->var_off))
+			reg->id = ++env->id_gen;
 		save_register_state(state, spi, reg, size);
 	} else if (reg && is_spillable_regtype(reg->type)) {
 		/* register containing pointer is being spilled into stack */
@@ -11650,17 +11656,44 @@ static bool try_match_pkt_pointers(const struct bpf_insn *insn,
 	return true;
 }
 
-static void find_equal_scalars(struct bpf_verifier_state *vstate,
-			       struct bpf_reg_state *known_reg)
+static int find_equal_scalars(struct bpf_verifier_env *env,
+			      struct bpf_verifier_state *vstate,
+			      struct bpf_reg_state *known_reg)
 {
 	struct bpf_func_state *state;
 	struct bpf_reg_state *reg;
+	int err = 0, count = 0;
 
 	bpf_for_each_reg_in_vstate(vstate, state, reg, ({
-		if (reg->type == SCALAR_VALUE && reg->id == known_reg->id)
+		if (reg->type == SCALAR_VALUE && reg->id == known_reg->id) {
 			copy_register_state(reg, known_reg);
+			++count;
+		}
 	}));
+
+	/* Count equal to 1 means that find_equal_scalars have not
+	 * found any registers with the same id (except self), thus
+	 * the range knowledge have not been transferred.
+	 */
+	if (count > 1) {
+		/* Mark current id as a range transfer id, but assign a new id
+		 * to all registers / spills in the state in a hope that new id
+		 * would not be used in find_equal_scalars().
+		 * This allows more pruning in stacksafe().
+		 */
+		u32 id = known_reg->id;
+		u32 new_id = ++env->id_gen;
+
+		err = u32_hashset_add(env->range_transfer_ids, id);
+		bpf_for_each_reg_in_vstate(vstate, state, reg, ({
+			if (reg->type == SCALAR_VALUE && reg->id == id)
+				reg->id = new_id;
+		}));
+	}
+
+	return err;
 }
+
 
 static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			     struct bpf_insn *insn, int *insn_idx)
@@ -11812,8 +11845,13 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 						    src_reg, dst_reg, opcode);
 			if (src_reg->id &&
 			    !WARN_ON_ONCE(src_reg->id != other_branch_regs[insn->src_reg].id)) {
-				find_equal_scalars(this_branch, src_reg);
-				find_equal_scalars(other_branch, &other_branch_regs[insn->src_reg]);
+				err = find_equal_scalars(env, this_branch, src_reg);
+				if (err)
+					return err;
+				err = find_equal_scalars(env, other_branch,
+							 &other_branch_regs[insn->src_reg]);
+				if (err)
+					return err;
 			}
 
 		}
@@ -11825,8 +11863,12 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 
 	if (dst_reg->type == SCALAR_VALUE && dst_reg->id &&
 	    !WARN_ON_ONCE(dst_reg->id != other_branch_regs[insn->dst_reg].id)) {
-		find_equal_scalars(this_branch, dst_reg);
-		find_equal_scalars(other_branch, &other_branch_regs[insn->dst_reg]);
+		err = find_equal_scalars(env, this_branch, dst_reg);
+		if (err)
+			return err;
+		err = find_equal_scalars(env, other_branch, &other_branch_regs[insn->dst_reg]);
+		if (err)
+			return err;
 	}
 
 	/* if one pointer register is compared to another pointer
@@ -13176,6 +13218,7 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		      struct bpf_func_state *cur, struct bpf_id_pair *idmap)
 {
+	bool old_is_scalar_with_unsued_id;
 	int i, spi;
 
 	/* walk slots of the explored stack and ignore any additional
@@ -13190,6 +13233,14 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			/* explored state didn't use this */
 			continue;
 		}
+
+		/* compute this once per spi */
+		if (i % BPF_REG_SIZE == 0)
+			old_is_scalar_with_unsued_id =
+				is_spilled_reg(&old->stack[spi]) &&
+				old->stack[spi].spilled_ptr.type == SCALAR_VALUE &&
+				!u32_hashset_find(env->range_transfer_ids,
+						  old->stack[spi].spilled_ptr.id);
 
 		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_INVALID)
 			continue;
@@ -13207,6 +13258,52 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC &&
 		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_ZERO)
 			continue;
+
+		/* The shortcuts below are safe if old spi could be
+		 * replaced by cur spi in the old state w/o observable
+		 * difference in the verifier behavior.
+		 *
+		 * When STACK_MISC is read from spi mark_reg_stack_read()
+		 * marks destination register as unbound scalar w/o id.
+		 *
+		 * When old is STACK_SPILL it matters if it's id was
+		 * used in the range transfer, because id information
+		 * is not present in cur spi marked as STACK_MISC or
+		 * STACK_ZERO.
+		 *
+		 * All children states of 'old' are already verified.
+		 * Thus env->range_transfer_ids contains all ids that
+		 * gained range via find_equal_scalars() during
+		 * children verification.
+		 *
+		 * The following substitutions are safe:
+		 * - old: STACK_MISC
+		 * - cur: unbound SCALAR_VALUE
+		 *
+		 * - old: unbound SCALAR_VALUE, id not used for range transfer
+		 * - cur: STACK_MISC
+		 *
+		 * - old: imprecise SCALAR_VALUE or zero, id not used for range transfer
+		 * - cur: STACK_ZERO
+		 */
+		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC &&
+		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_SPILL &&
+		    cur->stack[spi].spilled_ptr.type == SCALAR_VALUE &&
+		    __is_scalar_unbounded(&cur->stack[spi].spilled_ptr))
+			continue;
+		if (old_is_scalar_with_unsued_id &&
+		    old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_SPILL &&
+		    __is_scalar_unbounded(&old->stack[spi].spilled_ptr) &&
+		    !old->stack[spi].spilled_ptr.precise &&
+		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC)
+			continue;
+		if (old_is_scalar_with_unsued_id &&
+		    old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_SPILL &&
+		    (!old->stack[spi].spilled_ptr.precise ||
+		     tnum_equals_const(old->stack[spi].spilled_ptr.var_off, 0)) &&
+		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_ZERO)
+			continue;
+
 		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
 		    cur->stack[spi].slot_type[i % BPF_REG_SIZE])
 			/* Ex: old explored (safe) state has STACK_SPILL in
@@ -16916,6 +17013,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
 	if (!env->explored_states)
 		goto skip_full_check;
 
+	env->range_transfer_ids = kzalloc(sizeof(struct u32_hashset), GFP_KERNEL);
+	if (!env->range_transfer_ids)
+		goto skip_full_check;
+
 	ret = add_subprog_and_kfunc(env);
 	if (ret < 0)
 		goto skip_full_check;
@@ -16954,6 +17055,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
 
 skip_full_check:
 	kvfree(env->explored_states);
+	u32_hashset_clear(env->range_transfer_ids);
+	kvfree(env->range_transfer_ids);
 
 	if (ret == 0)
 		ret = check_max_stack_depth(env);

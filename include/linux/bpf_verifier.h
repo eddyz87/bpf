@@ -509,6 +509,8 @@ struct bpf_subprog_info {
 	bool is_async_cb;
 };
 
+struct u32_hashset;
+
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
@@ -575,6 +577,7 @@ struct bpf_verifier_env {
 	/* Same as scratched_regs but for stack slots */
 	u64 scratched_stack_slots;
 	u32 prev_log_len, prev_insn_print_len;
+	struct u32_hashset *range_transfer_ids;
 	/* buffer used in reg_type_str() to generate reg_type string */
 	char type_str_buf[TYPE_STR_BUF_LEN];
 };
