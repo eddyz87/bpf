@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   set-matrix:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       build-matrix: ${{ steps.set-matrix-impl.outputs.build_matrix }}
       test-matrix: ${{ steps.set-matrix-impl.outputs.test_matrix }}
@@ -81,7 +81,7 @@ jobs:
               if matrix[idx]["arch"] != Arch.x86_64.value:
                 del matrix[idx]
               else:
-                matrix[idx]["runs_on"] = ["ubuntu-latest"]
+                matrix[idx]["runs_on"] = ["self-hosted"]
           else:
             # Otherwise, run on (self-hosted, arch) runners
             for idx in range(len(matrix) - 1, -1, -1):
