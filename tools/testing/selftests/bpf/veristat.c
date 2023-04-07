@@ -997,6 +997,15 @@ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf
 	stats->stats[VERDICT] = err == 0; /* 1 - success, 0 - failure */
 	parse_verif_log(buf, buf_sz, stats);
 
+	if (random() % 100 < 10) {
+		float k = (random() % 100) / 50.0f;
+		stats->stats[TOTAL_STATES] = stats->stats[TOTAL_STATES] * k;
+	}
+
+	if (random() % 100 < 10) {
+		stats->stats[VERDICT] = !stats->stats[VERDICT];
+	}
+
 	if (env.verbose) {
 		printf("PROCESSING %s/%s, DURATION US: %ld, VERDICT: %s, VERIFIER LOG:\n%s\n",
 		       filename, prog_name, stats->stats[DURATION],
@@ -2032,6 +2041,8 @@ static int handle_replay_mode(void)
 int main(int argc, char **argv)
 {
 	int err = 0, i;
+
+	srandom(clock());
 
 	if (argp_parse(&argp, argc, argv, 0, NULL, NULL))
 		return 1;
