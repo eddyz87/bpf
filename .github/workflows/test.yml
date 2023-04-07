@@ -67,6 +67,7 @@ jobs:
           self_hosted_repos = [
             "kernel-patches/bpf",
             "kernel-patches/vmtest",
+            "eddyz87/bpf"
           ]
 
           for idx in range(len(matrix) - 1, -1, -1):
