@@ -10,6 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/bpf_common.h>
+#include <linux/bpf_ctx.h>
 
 /* Extended instruction set based on top of classic BPF */
 
@@ -6042,7 +6043,7 @@ struct __sk_buff {
 	__u8  tstamp_type;
 	__u32 :24;		/* Padding, future use. */
 	__u64 hwtstamp;
-};
+} __bpf_ctx;
 
 struct bpf_tunnel_key {
 	__u32 tunnel_id;
@@ -6123,7 +6124,7 @@ struct bpf_sock {
 	__u32 dst_ip6[4];
 	__u32 state;
 	__s32 rx_queue_mapping;
-};
+} __bpf_ctx;
 
 struct bpf_tcp_sock {
 	__u32 snd_cwnd;		/* Sending congestion window		*/
@@ -6218,7 +6219,7 @@ struct xdp_md {
 	__u32 rx_queue_index;  /* rxq->queue_index  */
 
 	__u32 egress_ifindex;  /* txq->dev->ifindex */
-};
+} __bpf_ctx;
 
 /* DEVMAP map-value layout
  *
@@ -6268,7 +6269,7 @@ struct sk_msg_md {
 	__u32 size;		/* Total size of sk_msg */
 
 	__bpf_md_ptr(struct bpf_sock *, sk); /* current socket */
-};
+} __bpf_ctx;
 
 struct sk_reuseport_md {
 	/*
@@ -6307,7 +6308,7 @@ struct sk_reuseport_md {
 	 */
 	__bpf_md_ptr(struct bpf_sock *, sk);
 	__bpf_md_ptr(struct bpf_sock *, migrating_sk);
-};
+} __bpf_ctx;
 
 #define BPF_TAG_SIZE	8
 
@@ -6467,7 +6468,7 @@ struct bpf_sock_addr {
 				 * Stored in network byte order.
 				 */
 	__bpf_md_ptr(struct bpf_sock *, sk);
-};
+} __bpf_ctx;
 
 /* User bpf_sock_ops struct to access socket values and specify request ops
  * and their replies.
@@ -6550,7 +6551,7 @@ struct bpf_sock_ops {
 				 * been written yet.
 				 */
 	__u64 skb_hwtstamp;
-};
+} __bpf_ctx;
 
 /* Definitions for bpf_sock_ops_cb_flags */
 enum {
@@ -6823,11 +6824,11 @@ struct bpf_cgroup_dev_ctx {
 	__u32 access_type;
 	__u32 major;
 	__u32 minor;
-};
+} __bpf_ctx;
 
 struct bpf_raw_tracepoint_args {
 	__u64 args[0];
-};
+} __bpf_ctx;
 
 /* DIRECT:  Skip the FIB rules and go to FIB table associated with device
  * OUTPUT:  Do lookup from egress perspective; default is ingress
@@ -7036,7 +7037,7 @@ struct bpf_sysctl {
 	__u32	file_pos;	/* Sysctl file position to read from, write to.
 				 * Allows 1,2,4-byte read an 4-byte write.
 				 */
-};
+} __bpf_ctx;
 
 struct bpf_sockopt {
 	__bpf_md_ptr(struct bpf_sock *, sk);
@@ -7047,7 +7048,7 @@ struct bpf_sockopt {
 	__s32	optname;
 	__s32	optlen;
 	__s32	retval;
-};
+} __bpf_ctx;
 
 struct bpf_pidns_info {
 	__u32 pid;
@@ -7071,7 +7072,7 @@ struct bpf_sk_lookup {
 	__u32 local_ip6[4];	/* Network byte order */
 	__u32 local_port;	/* Host byte order */
 	__u32 ingress_ifindex;		/* The arriving interface. Determined by inet_iif. */
-};
+} __bpf_ctx;
 
 /*
  * struct btf_ptr is used for typed pointer representation; the
