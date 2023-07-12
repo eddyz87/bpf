@@ -4397,7 +4397,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		return err;
 
 	mark_stack_slot_scratched(env, spi);
-	if (reg && !(off % BPF_REG_SIZE) && register_is_bounded(reg) &&
+	if (reg && !(off % BPF_REG_SIZE) && reg->type == SCALAR_VALUE &&
+	    (register_is_bounded(reg) || size == BPF_REG_SIZE) &&
 	    !register_is_null(reg) && env->bpf_capable) {
 		if (dst_reg != BPF_REG_FP) {
 			/* The backtracking logic can only recognize explicit
@@ -4410,9 +4411,12 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			if (err)
 				return err;
 		}
+
+		if (size == BPF_REG_SIZE)
+			assign_scalar_id_before_mov(env, reg);
 		save_register_state(state, spi, reg, size);
-		/* Break the relation on a narrowing spill. */
-		if (get_reg_width(reg) > BITS_PER_BYTE * size)
+		/* Break the relation on a narrowing spill */
+		if (size != BPF_REG_SIZE)
 			state->stack[spi].spilled_ptr.id = 0;
 	} else if (!reg && !(off % BPF_REG_SIZE) && is_bpf_st_mem(insn) &&
 		   insn->imm != 0 && env->bpf_capable) {
