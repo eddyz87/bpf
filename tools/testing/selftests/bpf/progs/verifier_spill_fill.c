@@ -450,4 +450,51 @@ l0_%=:	r1 >>= 16;					\
 	: __clobber_all);
 }
 
+/* Check that scalar ID is generated for spill of unbound scalar value
+ * to stack. This ID would tie range information for fp-8, r0 and r2.
+ */
+SEC("socket")
+__success __log_level(2)
+__msg("R2_w=scalar(id=1,smin=smin32=0,smax=umax=smax32=umax32=42,var_off=(0x0; 0x3f))")
+__naked void unbound_scalar_spill_link(void)
+{
+	asm volatile(
+	"call %[bpf_ktime_get_ns];\n"
+	"*(u64*)(r10 - 8) = r0;"
+	/* comparison should propagate range info for fp-8 */
+	"if r0 > 42 goto 1f;"
+	"r2 = *(u64*)(r10 - 8);"
+	"r1 = r10;\n"
+	/* if r2 range is not known the next instruction would cause
+	 * verification error
+	 */
+	"r1 += r2;\n"
+	"1: exit;\n"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
+/* Same as unbound_scalar_spill() but with ID link broken. */
+SEC("socket")
+__failure
+__msg("math between fp pointer and register with unbounded min value is not allowed")
+__naked void unbound_scalar_spill_broken_link(void)
+{
+	asm volatile(
+	"call %[bpf_ktime_get_ns];\n"
+	"*(u64*)(r10 - 8) = r0;"
+	/* second call break link between r0 and fp-8 */
+	"call %[bpf_ktime_get_ns];\n"
+	"if r0 > 42 goto 1f;"
+	"r2 = *(u64*)(r10 - 8);"
+	"r1 = r10;\n"
+	/* next instruction should cause verification error */
+	"r1 += r2;\n"
+	"1: exit;\n"
+	:
+	: __imm(bpf_ktime_get_ns)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
