@@ -1490,12 +1490,9 @@ static void do_test_single(struct bpf_test *test, bool unpriv,
 		       test->errstr_unpriv : test->errstr;
 
 	opts.expected_attach_type = test->expected_attach_type;
-	if (verbose)
-		opts.log_level = VERBOSE_LIBBPF_LOG_LEVEL;
-	else if (expected_ret == VERBOSE_ACCEPT)
+	opts.log_level = verbose ? VERBOSE_LIBBPF_LOG_LEVEL : DEFAULT_LIBBPF_LOG_LEVEL;
+	if (expected_ret == VERBOSE_ACCEPT)
 		opts.log_level = 2;
-	else
-		opts.log_level = DEFAULT_LIBBPF_LOG_LEVEL;
 	opts.prog_flags = pflags;
 
 	if ((prog_type == BPF_PROG_TYPE_TRACING ||
