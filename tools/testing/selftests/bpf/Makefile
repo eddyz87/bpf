@@ -33,9 +33,9 @@ CFLAGS += -g $(OPT_FLAGS) -rdynamic					\
 	  -Wall -Werror 						\
 	  $(GENFLAGS) $(SAN_CFLAGS)					\
 	  -I$(CURDIR) -I$(INCLUDE_DIR) -I$(GENDIR) -I$(LIBDIR)		\
-	  -I$(TOOLSINCDIR) -I$(APIDIR) -I$(OUTPUT)
+	  -I$(TOOLSINCDIR) -I$(APIDIR) -I$(OUTPUT) -static
 LDFLAGS += $(SAN_LDFLAGS)
-LDLIBS += -lelf -lz -lrt -lpthread
+LDLIBS += -lelf -lzstd -lz -lrt -lpthread
 
 ifneq ($(LLVM),)
 # Silence some warnings when compiled with clang
