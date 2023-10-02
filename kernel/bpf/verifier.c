@@ -182,6 +182,7 @@ struct bpf_verifier_stack_elem {
 
 #define BPF_COMPLEXITY_LIMIT_JMP_SEQ	8192
 #define BPF_COMPLEXITY_LIMIT_STATES	64
+#define BPF_ITER_DEPTH_LIMIT		128
 
 #define BPF_MAP_KEY_POISON	(1ULL << 63)
 #define BPF_MAP_KEY_SEEN	(1ULL << 62)
@@ -1765,6 +1766,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->parent = src->parent;
 	dst_state->first_insn_idx = src->first_insn_idx;
 	dst_state->last_insn_idx = src->last_insn_idx;
+	dst_state->stack_size_at_entry = src->stack_size_at_entry;
 	for (i = 0; i <= src->curframe; i++) {
 		dst = dst_state->frame[i];
 		if (!dst) {
@@ -1797,8 +1799,37 @@ static void update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifi
 	}
 }
 
-static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
-		     int *insn_idx, bool pop_log)
+static void __free_stack_elem(struct bpf_verifier_stack_elem *elem)
+{
+	free_verifier_state(&elem->st, false);
+	kfree(elem);
+}
+
+static void __free_stack_elem_list(struct bpf_verifier_stack_elem *head)
+{
+	struct bpf_verifier_stack_elem *next;
+
+	for (; head; head = next) {
+		next = head->next;
+		__free_stack_elem(head);
+	}
+}
+
+static void __free_loop_stack(struct bpf_loop_stack *loop_stack)
+{
+	struct bpf_loop_stack_elem *loop_elem, *loop_next;
+
+	for (loop_elem = loop_stack->head; loop_elem; loop_elem = loop_next) {
+		loop_next = loop_elem->next;
+		__free_stack_elem_list(loop_elem->delays_head);
+		kfree(loop_elem);
+	}
+	loop_stack->head = NULL;
+	loop_stack->size = 0;
+}
+
+static int pop_stack(struct bpf_verifier_env *env,
+		     int *prev_insn_idx, int *insn_idx, bool pop_log)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 	struct bpf_verifier_stack_elem *elem, *head = env->head;
@@ -1819,16 +1850,15 @@ static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
 	if (prev_insn_idx)
 		*prev_insn_idx = head->prev_insn_idx;
 	elem = head->next;
-	free_verifier_state(&head->st, false);
-	kfree(head);
+	__free_stack_elem(head);
 	env->head = elem;
 	env->stack_size--;
 	return 0;
 }
 
-static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
-					     int insn_idx, int prev_insn_idx,
-					     bool speculative)
+static struct bpf_verifier_stack_elem *__make_stack_elem(struct bpf_verifier_env *env,
+							 int insn_idx, int prev_insn_idx,
+							 bool speculative)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 	struct bpf_verifier_stack_elem *elem;
@@ -1836,23 +1866,18 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 
 	elem = kzalloc(sizeof(struct bpf_verifier_stack_elem), GFP_KERNEL);
 	if (!elem)
-		goto err;
+		return NULL;
 
 	elem->insn_idx = insn_idx;
 	elem->prev_insn_idx = prev_insn_idx;
-	elem->next = env->head;
 	elem->log_pos = env->log.end_pos;
-	env->head = elem;
-	env->stack_size++;
-	err = copy_verifier_state(&elem->st, cur);
-	if (err)
-		goto err;
 	elem->st.speculative |= speculative;
-	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
-		verbose(env, "The sequence of %d jumps is too complex.\n",
-			env->stack_size);
-		goto err;
+	err = copy_verifier_state(&elem->st, cur);
+	if (err) {
+		kfree(elem);
+		return NULL;
 	}
+
 	if (elem->st.parent) {
 		++elem->st.parent->branches;
 		/* WARN_ON(branches > 2) technically makes sense here,
@@ -1865,12 +1890,166 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 		 * which might have large 'branches' count.
 		 */
 	}
+
+	return elem;
+}
+
+static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
+					     int insn_idx, int prev_insn_idx,
+					     bool speculative)
+{
+	struct bpf_verifier_stack_elem *elem;
+
+	elem = __make_stack_elem(env, insn_idx, prev_insn_idx, speculative);
+	if (!elem)
+		goto err;
+
+	elem->next = env->head;
+	env->head = elem;
+	env->stack_size++;
+	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
+		verbose(env, "The sequence of %d jumps is too complex.\n",
+			env->stack_size);
+		goto err;
+	}
 	return &elem->st;
 err:
 	free_verifier_state(env->cur_state, true);
 	env->cur_state = NULL;
 	/* pop all elements and return */
 	while (!pop_stack(env, NULL, NULL, false));
+	__free_loop_stack(&env->loop_stack);
+	return NULL;
+}
+
+/* Copy current state and save it as a delay associated with loop
+ * entry state `entry_state`. Delays are tracked by env->loop_stack in
+ * order corresponding to loop entry order in simulated loop execution.
+ * E.g. for the following code:
+ *
+ *   void foo(void) {
+ *     for(;;) {...} // entry at E1           .-- head.
+ *     for(;;) {...} // entry at E2           v
+ *     --> at this point loop_stack would be {E2,E1}
+ *   }
+ *
+ * Pop env->loop_stack elements that have their loop_stack.head->entry_state
+ * logically after entry_state in current state's parentage chain.
+ * Squash delayed states in the process, for example, suppose state
+ * S5 is reached in the state graph below and state S5' has to be
+ * delayed at entry state S0:
+ *
+ *    S0                                        S0 <--. S2', S4', S5'
+ *    |                                         |     |
+ *    V                                         V     |
+ *    S1 <. S2' // delayed state S2'            S1    |
+ *    |   |     // associated with S1           |     |
+ *    V   |                                     V     |
+ *    S2 -'                           ---->     S2    |
+ *    |                                         |     |
+ *    V                                         V     |
+ *    S3 <. S4' // delayed state S4'            S3    |
+ *    |   |     // associated with S3           |     |
+ *    V   |                                     V     |
+ *    S4 -'                                     S4    |
+ *    |                                         |     |
+ *    S5                                        S5 ---'
+ */
+static struct bpf_verifier_state *push_loop_stack(struct bpf_verifier_env *env,
+						  struct bpf_verifier_state *entry_state,
+						  int insn_idx, int prev_insn_idx)
+{
+	struct bpf_verifier_stack_elem *delays_head = NULL;
+	struct bpf_verifier_stack_elem *delays_tail = NULL;
+	struct bpf_verifier_stack_elem *delay = NULL;
+	struct bpf_loop_stack_elem *loop_elem = NULL, *loop_next;
+	struct bpf_verifier_state *parent;
+	bool print_acc_header = true;
+
+	delay = __make_stack_elem(env, insn_idx, prev_insn_idx, false);
+	if (!delay)
+		return NULL;
+
+	if (env->log.level & BPF_LOG_LEVEL2) {
+		verbose(env, "delaying loop state at (%d):\n", insn_idx);
+		print_verifier_state(env, cur_func(env), true);
+	}
+
+	/* Every bpf_loop_stack_elem::entry_state in the loop_stack is
+	 * in the parentage chain of current state, entry_state is a
+	 * in the same chain as well.
+	 * The loop below pops items from loop_stack until entry_state
+	 * is found in parentage chain.
+	 */
+	for (parent = delay->st.parent; parent; parent = parent->parent) {
+		if (!env->loop_stack.head)
+			break;
+		/* If parent is on top of the loop_stack, pop it and
+		 * accumulate delayed states in delays_{head,tail}.
+		 */
+		if (env->loop_stack.head->entry_state == parent) {
+			if (!delays_head) {
+				delays_head = env->loop_stack.head->delays_head;
+				delays_tail = env->loop_stack.head->delays_tail;
+			} else {
+				delays_tail->next = env->loop_stack.head->delays_head;
+				delays_tail = env->loop_stack.head->delays_tail;
+			}
+			if (env->log.level & BPF_LOG_LEVEL2 && parent != entry_state) {
+				if (print_acc_header)
+					verbose(env,
+						"moving delayed states from loop entries at:");
+				print_acc_header = false;
+				verbose(env, " %d",
+					env->loop_stack.head->entry_state->insn_idx);
+			}
+			/* Don't pop if current loop_stack head could
+			 * be immediately reused.
+			 */
+			if (parent != entry_state) {
+				loop_next = env->loop_stack.head->next;
+				kfree(env->loop_stack.head);
+				env->loop_stack.head = loop_next;
+			}
+		}
+		if (parent == entry_state)
+			break;
+	}
+
+	if (env->log.level & BPF_LOG_LEVEL2 && !print_acc_header)
+		verbose(env, "\n");
+
+	if (delays_tail) {
+		delays_tail->next = delay;
+		delays_tail = delay;
+	} else {
+		delays_head = delay;
+		delays_tail = delay;
+	}
+
+	if (!env->loop_stack.head ||
+	    env->loop_stack.head->entry_state != entry_state) {
+		loop_elem = kzalloc(sizeof(struct bpf_loop_stack_elem), GFP_KERNEL);
+		if (!loop_elem) {
+			__free_stack_elem_list(delays_head);
+			goto err;
+		}
+		loop_elem->next = env->loop_stack.head;
+		loop_elem->entry_state = entry_state;
+		env->loop_stack.head = loop_elem;
+	} else {
+		loop_elem = env->loop_stack.head;
+	}
+	loop_elem->delays_head = delays_head;
+	loop_elem->delays_tail = delays_tail;
+	// TODO: put some limit here
+	env->loop_stack.size++;
+
+	return &delay->st;
+
+err:
+	while (!pop_stack(env, NULL, NULL, false));
+	__free_loop_stack(&env->loop_stack);
 	return NULL;
 }
 
@@ -2406,6 +2585,7 @@ err:
 	env->cur_state = NULL;
 	/* pop all elements and return */
 	while (!pop_stack(env, NULL, NULL, false));
+	__free_loop_stack(&env->loop_stack);
 	return NULL;
 }
 
@@ -7652,6 +7832,31 @@ static int process_iter_arg(struct bpf_verifier_env *env, int regno, int insn_id
 	return 0;
 }
 
+/* Look for a first loop entry at insn_idx, in other words:
+ * oldest parent state stopped at insn_idx with callsites
+ * matching those in cur->frame.
+ *
+ * TODO: this needs some more efficient implementation,
+ *       link the last "maybe loop entry" state in each verifier state?
+ */
+static struct bpf_verifier_state *find_prev_entry(struct bpf_verifier_state *cur, int insn_idx)
+{
+	struct bpf_verifier_state *last_seen = NULL, *st;
+	int i;
+
+	for (st = cur->parent; st; st = st->parent) {
+		if (st->insn_idx != insn_idx)
+			continue;
+		if (st->curframe != cur->curframe)
+			continue;
+		for (i = cur->curframe; i >= 0; --i)
+			if (st->frame[i]->callsite != cur->frame[i]->callsite)
+				continue;
+		last_seen = st;
+	}
+	return last_seen;
+}
+
 /* process_iter_next_call() is called when verifier gets to iterator's next
  * "method" (e.g., bpf_iter_num_next() for numbers iterator) call. We'll refer
  * to it as just "iter_next()" in comments below.
@@ -7711,7 +7916,7 @@ static int process_iter_arg(struct bpf_verifier_env *env, int regno, int insn_id
 static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 				  struct bpf_kfunc_call_arg_meta *meta)
 {
-	struct bpf_verifier_state *cur_st = env->cur_state, *queued_st;
+	struct bpf_verifier_state *cur_st = env->cur_state, *queued_st, *prev_st;
 	struct bpf_func_state *cur_fr = cur_st->frame[cur_st->curframe], *queued_fr;
 	struct bpf_reg_state *cur_iter, *queued_iter;
 	int iter_frameno = meta->iter.frameno;
@@ -7729,8 +7934,12 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 	}
 
 	if (cur_iter->iter.state == BPF_ITER_STATE_ACTIVE) {
+		prev_st = find_prev_entry(cur_st, insn_idx + 1);
 		/* branch out active iter state */
-		queued_st = push_stack(env, insn_idx + 1, insn_idx, false);
+		if (prev_st)
+			queued_st = push_loop_stack(env, prev_st, insn_idx + 1, insn_idx);
+		else
+			queued_st = push_stack(env, insn_idx + 1, insn_idx, false);
 		if (!queued_st)
 			return -ENOMEM;
 
@@ -14934,6 +15143,14 @@ static u32 state_htab_size(struct bpf_verifier_env *env)
 	return env->prog->len;
 }
 
+static struct bpf_verifier_state_list **__explored_state(
+					struct bpf_verifier_env *env,
+					int callsite,
+					int idx)
+{
+	return &env->explored_states[(idx ^ callsite) % state_htab_size(env)];
+}
+
 static struct bpf_verifier_state_list **explored_state(
 					struct bpf_verifier_env *env,
 					int idx)
@@ -14941,7 +15158,7 @@ static struct bpf_verifier_state_list **explored_state(
 	struct bpf_verifier_state *cur = env->cur_state;
 	struct bpf_func_state *state = cur->frame[cur->curframe];
 
-	return &env->explored_states[(idx ^ state->callsite) % state_htab_size(env)];
+	return __explored_state(env, state->callsite, idx);
 }
 
 static void mark_prune_point(struct bpf_verifier_env *env, int idx)
@@ -14963,7 +15180,6 @@ static bool is_force_checkpoint(struct bpf_verifier_env *env, int insn_idx)
 {
 	return env->insn_aux_data[insn_idx].force_checkpoint;
 }
-
 
 enum {
 	DONE_EXPLORING = 0,
@@ -15084,8 +15300,8 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 			struct bpf_kfunc_call_arg_meta meta;
 
 			ret = fetch_kfunc_meta(env, insn, &meta, NULL);
-			if (ret == 0 && is_iter_next_kfunc(&meta)) {
-				mark_prune_point(env, t);
+			if (ret == 0 && is_iter_next_kfunc(&meta) && t + 1 < env->prog->len) {
+				mark_prune_point(env, t + 1);
 				/* Checking and saving state checkpoints at iter_next() call
 				 * is crucial for fast convergence of open-coded iterator loop
 				 * logic, so we need to force it. If we don't do that,
@@ -15097,7 +15313,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 				 * convergence will happen quickly, so we don't run a risk of
 				 * exhausting memory.
 				 */
-				mark_force_checkpoint(env, t);
+				mark_force_checkpoint(env, t + 1);
 			}
 		}
 		return visit_func_call_insn(t, insns, env, insn->src_reg == BPF_PSEUDO_CALL);
@@ -16333,11 +16549,6 @@ static bool states_maybe_looping(struct bpf_verifier_state *old,
 	return true;
 }
 
-static bool is_iter_next_insn(struct bpf_verifier_env *env, int insn_idx)
-{
-	return env->insn_aux_data[insn_idx].is_iter_next;
-}
-
 /* is_state_visited() handles iter_next() (see process_iter_next_call() for
  * terminology) calls specially: as opposed to bounded BPF loops, it *expects*
  * states to match, which otherwise would look like an infinite loop. So while
@@ -16396,14 +16607,14 @@ static bool is_iter_next_insn(struct bpf_verifier_env *env, int insn_idx)
  *   }
  *
  */
-static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf_verifier_state *cur)
+static bool max_active_iter_depth(struct bpf_verifier_state *cur)
 {
 	struct bpf_reg_state *slot, *cur_slot;
 	struct bpf_func_state *state;
-	int i, fr;
+	int i, fr, depth = -1;
 
-	for (fr = old->curframe; fr >= 0; fr--) {
-		state = old->frame[fr];
+	for (fr = cur->curframe; fr >= 0; fr--) {
+		state = cur->frame[fr];
 		for (i = 0; i < state->allocated_stack / BPF_REG_SIZE; i++) {
 			if (state->stack[i].slot_type[0] != STACK_ITER)
 				continue;
@@ -16413,11 +16624,11 @@ static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf
 				continue;
 
 			cur_slot = &cur->frame[fr]->stack[i].spilled_ptr;
-			if (cur_slot->iter.depth != slot->iter.depth)
-				return true;
+			if (depth < cur_slot->iter.depth)
+				depth = cur_slot->iter.depth;
 		}
 	}
-	return false;
+	return depth;
 }
 
 static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
@@ -16425,7 +16636,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	struct bpf_verifier_state_list *new_sl;
 	struct bpf_verifier_state_list *sl, **pprev;
 	struct bpf_verifier_state *cur = env->cur_state, *new;
-	int i, j, err, states_cnt = 0;
+	int i, j, err, states_cnt = 0, max_iter_depth;
 	bool force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx);
 	bool add_new_state = force_new_state;
 
@@ -16469,46 +16680,19 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				 */
 				goto skip_inf_loop_check;
 			}
-			/* BPF open-coded iterators loop detection is special.
-			 * states_maybe_looping() logic is too simplistic in detecting
-			 * states that *might* be equivalent, because it doesn't know
-			 * about ID remapping, so don't even perform it.
-			 * See process_iter_next_call() and iter_active_depths_differ()
-			 * for overview of the logic. When current and one of parent
-			 * states are detected as equivalent, it's a good thing: we prove
-			 * convergence and can stop simulating further iterations.
-			 * It's safe to assume that iterator loop will finish, taking into
-			 * account iter_next() contract of eventually returning
-			 * sticky NULL result.
-			 */
-			if (is_iter_next_insn(env, insn_idx)) {
-				if (states_equal(env, &sl->state, cur)) {
-					struct bpf_func_state *cur_frame;
-					struct bpf_reg_state *iter_state, *iter_reg;
-					int spi;
-
-					cur_frame = cur->frame[cur->curframe];
-					/* btf_check_iter_kfuncs() enforces that
-					 * iter state pointer is always the first arg
-					 */
-					iter_reg = &cur_frame->regs[BPF_REG_1];
-					/* current state is valid due to states_equal(),
-					 * so we can assume valid iter and reg state,
-					 * no need for extra (re-)validations
-					 */
-					spi = __get_spi(iter_reg->off + iter_reg->var_off.value);
-					iter_state = &func(env, iter_reg)->stack[spi].spilled_ptr;
-					if (iter_state->iter.state == BPF_ITER_STATE_ACTIVE)
-						goto hit;
-				}
-				goto skip_inf_loop_check;
-			}
 			/* attempt to detect infinite loop to avoid unnecessary doomed work */
 			if (states_maybe_looping(&sl->state, cur) &&
 			    states_equal(env, &sl->state, cur) &&
-			    !iter_active_depths_differ(&sl->state, cur)) {
+			    (max_iter_depth = max_active_iter_depth(cur)) &&
+			    (max_iter_depth == -1 || max_iter_depth > BPF_ITER_DEPTH_LIMIT)) {
 				verbose_linfo(env, insn_idx, "; ");
 				verbose(env, "infinite loop detected at insn %d\n", insn_idx);
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose(env, "old: ");
+					print_verifier_state(env, sl->state.frame[sl->state.curframe], true);
+					verbose(env, "cur: ");
+					print_verifier_state(env, cur->frame[cur->curframe], true);
+				}
 				return -EINVAL;
 			}
 			/* if the verifier is processing a loop, avoid adding new state
@@ -16531,7 +16715,6 @@ skip_inf_loop_check:
 			goto miss;
 		}
 		if (states_equal(env, &sl->state, cur)) {
-hit:
 			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
@@ -16570,7 +16753,8 @@ miss:
 		 * Higher numbers increase max_states_per_insn and verification time,
 		 * but do not meaningfully decrease insn_processed.
 		 */
-		if (sl->miss_cnt > sl->hit_cnt * 3 + 3) {
+		if (sl->miss_cnt > sl->hit_cnt * 3 + 3 &&
+		    !(is_force_checkpoint(env, insn_idx) && sl->state.branches > 0)) {
 			/* the state is unlikely to be useful. Remove it to
 			 * speed up verification
 			 */
@@ -16681,6 +16865,24 @@ next:
 	return 0;
 }
 
+static bool has_equal_state(struct bpf_verifier_env *env,
+			    struct bpf_verifier_state *st, u32 insn_idx)
+{
+	struct bpf_verifier_state_list *sl;
+
+	sl = *__explored_state(env, st->frame[st->curframe]->callsite, insn_idx);
+	while (sl) {
+		if (sl->state.insn_idx != insn_idx) {
+			sl = sl->next;
+			continue;
+		}
+		if (states_equal(env, &sl->state, st))
+			return true;
+		sl = sl->next;
+	}
+	return false;
+}
+
 /* Return true if it's OK to have the same insn return a different type. */
 static bool reg_type_mismatch_ok(enum bpf_reg_type type)
 {
@@ -16748,6 +16950,95 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 			verbose(env, "same insn cannot be used with different pointers\n");
 			return -EINVAL;
 		}
+	}
+
+	return 0;
+}
+
+/* Check if all delayed states from the top of env->loop_stack have
+ * equivalent explored states. If so, retire the delays and pop
+ * env->loop_stack, otherwise push non-explored delays to env->head.
+ */
+static bool reschedule_loop_states_once(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_stack_elem *elem, *next, *last_remaining, **pprev;
+	struct bpf_loop_stack_elem *loop_head;
+	struct bpf_func_state *func;
+	bool rescheduled_any = false;
+
+	loop_head = env->loop_stack.head;
+	pprev = &loop_head->delays_head;
+	elem = *pprev;
+	last_remaining = NULL;
+	while (elem) {
+		if (has_equal_state(env, &elem->st, elem->insn_idx)) {
+			last_remaining = elem;
+			pprev = &elem->next;
+			elem = elem->next;
+		} else {
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				verbose(env, "rescheduling (%d):\n", elem->insn_idx);
+				func = elem->st.frame[elem->st.curframe];
+				print_verifier_state(env, func, true);
+			}
+			next = elem->next;
+			*pprev = next;
+			elem->next = env->head;
+			env->head = elem;
+			env->loop_stack.size--;
+			env->stack_size++;
+			elem = next;
+			rescheduled_any = true;
+		}
+	}
+	loop_head->delays_tail = last_remaining;
+
+	if (rescheduled_any)
+		return true;
+
+	for (elem = loop_head->delays_head; elem; elem = elem->next) {
+		if (env->log.level & BPF_LOG_LEVEL2) {
+			verbose(env, "retiring (%d): ", elem->insn_idx);
+			func = elem->st.frame[elem->st.curframe];
+			print_verifier_state(env, func, true);
+		}
+		update_branch_counts(env, &elem->st);
+	}
+	__free_stack_elem_list(loop_head->delays_head);
+	env->loop_stack.head = loop_head->next;
+	kfree(loop_head);
+
+	return false;
+}
+
+/* Check if all states pushed to env->head after entry to
+ * env->loop_stack.head->entry_state had been explored.
+ * If so, check if delayed loop states from the loop_stack
+ * top have to be pushed to env->head or could be retired.
+ */
+static int reschedule_loop_states(struct bpf_verifier_env *env)
+{
+	struct bpf_loop_stack_elem *loop_head;
+	u32 stack_size_at_entry;
+
+	/* Several loop states could have identical
+	 * stack_size_at_entry, so do this in a loop.
+	 */
+	for (;;) {
+		loop_head = env->loop_stack.head;
+		if (!loop_head)
+			break;
+		stack_size_at_entry = loop_head->entry_state->stack_size_at_entry;
+		if (stack_size_at_entry < env->stack_size)
+			break;
+		if (WARN_ON_ONCE(stack_size_at_entry > env->stack_size)) {
+			verbose(env,
+				"state stack underflow: size == %d, size on loop entry == %d\n",
+				env->stack_size, stack_size_at_entry);
+			return -EFAULT;
+		}
+		if (reschedule_loop_states_once(env))
+			break;
 	}
 
 	return 0;
@@ -17070,13 +17361,16 @@ process_bpf_exit_full:
 process_bpf_exit:
 				mark_verifier_state_scratched(env);
 				update_branch_counts(env, env->cur_state);
-				err = pop_stack(env, &prev_insn_idx,
-						&env->insn_idx, pop_log);
+				err = reschedule_loop_states(env);
+				if (err)
+					return err;
+				err = pop_stack(env, &prev_insn_idx, &env->insn_idx, pop_log);
 				if (err < 0) {
 					if (err != -ENOENT)
 						return err;
 					break;
 				} else {
+					env->cur_state->stack_size_at_entry = env->stack_size;
 					do_print_state = true;
 					continue;
 				}
@@ -19528,6 +19822,7 @@ out:
 		env->cur_state = NULL;
 	}
 	while (!pop_stack(env, NULL, NULL, false));
+	__free_loop_stack(&env->loop_stack);
 	if (!ret && pop_log)
 		bpf_vlog_reset(&env->log, 0);
 	free_states(env);

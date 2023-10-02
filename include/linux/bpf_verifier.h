@@ -384,6 +384,7 @@ struct bpf_verifier_state {
 	 */
 	struct bpf_idx_pair *jmp_history;
 	u32 jmp_history_cnt;
+	u32 stack_size_at_entry;
 };
 
 #define bpf_get_spilled_reg(slot, frame)				\
@@ -571,6 +572,18 @@ struct bpf_idset {
 	u32 ids[BPF_ID_MAP_SIZE];
 };
 
+struct bpf_loop_stack_elem {
+	struct bpf_loop_stack_elem *next;
+	struct bpf_verifier_stack_elem *delays_head;
+	struct bpf_verifier_stack_elem *delays_tail;
+	struct bpf_verifier_state *entry_state;
+};
+
+struct bpf_loop_stack {
+	struct bpf_loop_stack_elem *head;
+	int size;
+};
+
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
@@ -581,6 +594,7 @@ struct bpf_verifier_env {
 	const struct bpf_verifier_ops *ops;
 	struct bpf_verifier_stack_elem *head; /* stack of verifier states to be processed */
 	int stack_size;			/* number of states to be processed */
+	struct bpf_loop_stack loop_stack;
 	bool strict_alignment;		/* perform strict pointer alignment checks */
 	bool test_state_freq;		/* test verifier with different pruning frequency */
 	struct bpf_verifier_state *cur_state; /* current verifier state */
