@@ -181,7 +181,7 @@ struct bpf_verifier_stack_elem {
 };
 
 #define BPF_COMPLEXITY_LIMIT_JMP_SEQ	8192
-#define BPF_COMPLEXITY_LIMIT_STATES	64
+#define BPF_COMPLEXITY_LIMIT_STATES	128
 
 #define BPF_MAP_KEY_POISON	(1ULL << 63)
 #define BPF_MAP_KEY_SEEN	(1ULL << 62)
