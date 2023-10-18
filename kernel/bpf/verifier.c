@@ -4441,6 +4441,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 				fmt_stack_mask(env->tmp_str_buf, TMP_STR_BUF_LEN,
 					       bt_frame_stack_mask(bt, fr));
 				verbose(env, "stack=%s: ", env->tmp_str_buf);
+				verbose(env, " [%4x]", debug_ptr_sig(st));
 				print_verifier_state(env, func, true);
 			}
 		}
@@ -7900,42 +7901,67 @@ static bool regs_exact(const struct bpf_reg_state *rold,
 		       const struct bpf_reg_state *rcur,
 		       struct bpf_idmap *idmap);
 
-static void widen_reg(struct bpf_verifier_env *env,
-		     struct bpf_reg_state *rold, struct bpf_reg_state *rcur,
-		     struct bpf_idmap *idmap, int i)
+static bool widen_reg(struct bpf_verifier_env *env,
+		      struct bpf_reg_state *prev_rold,
+		      struct bpf_reg_state *rold,
+		      struct bpf_reg_state *rcur,
+		      struct bpf_idmap *idmap)
 {
 	if (rold->type != SCALAR_VALUE)
-		return;
+		return false;
 	if (rold->type != rcur->type)
-		return;
-	if (rold->precise || rcur->precise || regs_exact(rold, rcur, idmap))
-		return;
+		return false;
+	if (prev_rold->precise ||
+	    rold->precise || rcur->precise || regs_exact(rold, rcur, idmap))
+		return false;
 	__mark_reg_unknown(env, rcur);
+	return true;
 }
 
 static int widen_imprecise_scalars(struct bpf_verifier_env *env,
+				   struct bpf_verifier_state *prev_old,
 				   struct bpf_verifier_state *old,
 				   struct bpf_verifier_state *cur)
 {
-	struct bpf_func_state *fold, *fcur;
+	struct bpf_func_state *prev_fold, *fold, *fcur;
 	int i, fr;
+	bool w;
 
 	reset_idmap_scratch(env);
 	for (fr = old->curframe; fr >= 0; fr--) {
+		prev_fold = prev_old->frame[fr];
 		fold = old->frame[fr];
 		fcur = cur->frame[fr];
 
-		for (i = 0; i < MAX_BPF_REG; i++)
-			widen_reg(env, &fold->regs[i], &fcur->regs[i], &env->idmap_scratch, i);
+		for (i = 0; i < MAX_BPF_REG; i++) {
+			w = widen_reg(env,
+				      &prev_fold->regs[i],
+				      &fold->regs[i],
+				      &fcur->regs[i],
+				      &env->idmap_scratch);
+			if ((env->log.level & BPF_LOG_LEVEL2) && w)
+				verbose(env, "[%4x] vs [%4x] vs [%4x] widening R%d\n",
+					debug_ptr_sig(prev_old),
+					debug_ptr_sig(old),
+					debug_ptr_sig(cur),
+					i);
+		}
 
 		for (i = 0; i < fold->allocated_stack / BPF_REG_SIZE; i++) {
-			if (fold->stack[i].slot_type[0] != STACK_SPILL)
+			if (!is_spilled_scalar_reg(&fold->stack[i]))
 				continue;
 
-			widen_reg(env,
-				  &fold->stack[i].spilled_ptr,
-				  &fcur->stack[i].spilled_ptr,
-				  &env->idmap_scratch, -(i - 1) * 8);
+			w = widen_reg(env,
+				      &prev_fold->stack[i].spilled_ptr,
+				      &fold->stack[i].spilled_ptr,
+				      &fcur->stack[i].spilled_ptr,
+				      &env->idmap_scratch);
+			if ((env->log.level & BPF_LOG_LEVEL2) && w)
+				verbose(env, "[%4x] vs [%4x] vs [%4x] widening R%d\n",
+					debug_ptr_sig(prev_old),
+					debug_ptr_sig(old),
+					debug_ptr_sig(cur),
+					-(i - 1) * 8);
 		}
 	}
 	return 0;
@@ -8000,7 +8026,7 @@ static int widen_imprecise_scalars(struct bpf_verifier_env *env,
 static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 				  struct bpf_kfunc_call_arg_meta *meta)
 {
-	struct bpf_verifier_state *cur_st = env->cur_state, *queued_st, *prev_st;
+	struct bpf_verifier_state *cur_st = env->cur_state, *queued_st, *prev_st, *old_prev_st;
 	struct bpf_func_state *cur_fr = cur_st->frame[cur_st->curframe], *queued_fr;
 	struct bpf_reg_state *cur_iter, *queued_iter;
 	int iter_frameno = meta->iter.frameno;
@@ -8022,7 +8048,8 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 		 * checkpoint created for cur_st by is_state_visited()
 		 * right at this instruction.
 		 */
-		prev_st = find_prev_entry(env, cur_st->parent, insn_idx);
+		prev_st = find_prev_entry(env, cur_st, insn_idx);
+		old_prev_st = prev_st ? find_prev_entry(env, prev_st, insn_idx) : NULL;
 		/* branch out active iter state */
 		queued_st = push_stack(env, insn_idx + 1, insn_idx, false);
 		if (!queued_st)
@@ -8042,8 +8069,8 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 		 *  of presence of precision marks, thus w/o widening
 		 *  each i++ would produce a new distinct state).
 		 */
-		if (prev_st)
-			widen_imprecise_scalars(env, prev_st, queued_st);
+		if (prev_st && old_prev_st)
+			widen_imprecise_scalars(env, old_prev_st, prev_st, queued_st);
 
 		queued_fr = queued_st->frame[queued_st->curframe];
 		mark_ptr_not_null_reg(&queued_fr->regs[BPF_REG_0]);

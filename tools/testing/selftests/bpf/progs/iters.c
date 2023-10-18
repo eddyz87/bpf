@@ -718,7 +718,7 @@ int iter_pass_iter_ptr_to_subprog(const void *ctx)
 
 SEC("fentry/" SYS_PREFIX "sys_nanosleep")
 __failure
-__msg("math between fp pointer and register with unbounded")
+__msg("invalid read from stack R0 off=-32 size=8")
 __naked int iter_precision_fixed_point1(void)
 {
 	/* This is equivalent to C program below.
@@ -881,7 +881,7 @@ int num_iter_bug(const void *ctx) {
 
 SEC("?raw_tp")
 __failure
-__msg("math between fp pointer and register with unbounded")
+__msg("misaligned stack access off (0x0; 0x0)+-25+0 size 8")
 __flag(BPF_F_TEST_STATE_FREQ)
 __naked int loop_state_deps1(void)
 {
@@ -994,7 +994,7 @@ __naked int loop_state_deps1(void)
 
 SEC("?raw_tp")
 __failure
-__msg("math between fp pointer and register with unbounded")
+__msg("misaligned stack access off (0x0; 0x0)+-25+0 size 8")
 __flag(BPF_F_TEST_STATE_FREQ)
 __naked int loop_state_deps2(void)
 {
