@@ -7859,29 +7859,32 @@ static bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_sta
 	return true;
 }
 
-/* Look for a previous loop entry at insn_idx: nearest parent state
+/* Look for a previous loop entries at insn_idx: nearest parent states
  * stopped at insn_idx with callsites matching those in cur->frame.
  */
-static struct bpf_verifier_state *find_prev_entry(struct bpf_verifier_env *env,
-						  struct bpf_verifier_state *cur,
-						  int insn_idx)
+static u32 sample_loop_history(struct bpf_verifier_env *env,
+			       struct bpf_verifier_state *cur,
+			       u32 insn_idx,
+			       struct bpf_verifier_state *history[],
+			       u32 history_max)
 {
 	struct bpf_verifier_state_list *sl;
 	struct bpf_verifier_state *st;
+	u32 history_idx = 0;
 
 	/* Explored states are pushed in stack order, most recent states come first */
 	sl = *__explored_state(env, insn_idx, cur->frame[cur->curframe]->callsite);
-	for (; sl; sl = sl->next) {
+	for (; sl && history_idx < history_max; sl = sl->next) {
 		/* If st->branches != 0 state is a part of current DFS verification path,
 		 * hence cur & st for a loop.
 		 */
 		st = &sl->state;
 		if (st->insn_idx == insn_idx && st->branches && same_callsites(st, cur)
 		    && st->dfs_depth < cur->dfs_depth)
-			return st;
+			history[history_idx++] = st;
 	}
 
-	return NULL;
+	return history_idx;
 }
 
 static void reset_idmap_scratch(struct bpf_verifier_env *env);
@@ -7889,45 +7892,81 @@ static bool regs_exact(const struct bpf_reg_state *rold,
 		       const struct bpf_reg_state *rcur,
 		       struct bpf_idmap *idmap);
 
-static void maybe_widen_reg(struct bpf_verifier_env *env,
-			    struct bpf_reg_state *rold, struct bpf_reg_state *rcur,
-			    struct bpf_idmap *idmap)
+static bool maybe_precise_reg(struct bpf_verifier_state *history[], u32 history_cnt,
+			      int fr, u32 regno)
 {
-	if (rold->type != SCALAR_VALUE)
+	struct bpf_reg_state *reg;
+	u32 i;
+
+	for (i = 0; i < history_cnt; ++i) {
+		reg = &history[i]->frame[fr]->regs[regno];
+		if (reg->type == SCALAR_VALUE && reg->precise)
+			return true;
+	}
+
+	return false;
+}
+
+static bool maybe_precise_spill(struct bpf_verifier_state *history[], u32 history_cnt,
+				int fr, u32 slot)
+{
+	struct bpf_stack_state *stack;
+	struct bpf_reg_state *reg;
+	u32 i;
+
+	for (i = 0; i < history_cnt; ++i) {
+		if (history[i]->frame[fr]->allocated_stack / BPF_REG_SIZE < slot)
+			continue;
+
+		stack = &history[i]->frame[fr]->stack[slot];
+		reg = &stack->spilled_ptr;
+		if (is_spilled_scalar_reg(stack) && reg->precise)
+			return true;
+	}
+
+	return false;
+}
+
+static void maybe_widen_reg(struct bpf_verifier_env *env,
+			    struct bpf_reg_state *rold,
+			    struct bpf_reg_state *rcur,
+			    bool maybe_precise)
+{
+	if (rcur->type != SCALAR_VALUE || rold->type != SCALAR_VALUE || maybe_precise ||
+	    regs_exact(rold, rcur, &env->idmap_scratch))
 		return;
-	if (rold->type != rcur->type)
-		return;
-	if (rold->precise || rcur->precise || regs_exact(rold, rcur, idmap))
-		return;
+
 	__mark_reg_unknown(env, rcur);
 }
 
 static int widen_imprecise_scalars(struct bpf_verifier_env *env,
-				   struct bpf_verifier_state *old,
-				   struct bpf_verifier_state *cur)
+				   struct bpf_verifier_state *cur,
+				   struct bpf_verifier_state *history[],
+				   u32 history_cnt)
 {
-	struct bpf_func_state *fold, *fcur;
+	struct bpf_func_state *fcur, *fold;
 	int i, fr;
 
 	reset_idmap_scratch(env);
-	for (fr = old->curframe; fr >= 0; fr--) {
-		fold = old->frame[fr];
+	for (fr = cur->curframe; fr >= 0; fr--) {
+		fold = history[0]->frame[fr];
 		fcur = cur->frame[fr];
 
 		for (i = 0; i < MAX_BPF_REG; i++)
 			maybe_widen_reg(env,
 					&fold->regs[i],
 					&fcur->regs[i],
-					&env->idmap_scratch);
+					maybe_precise_reg(history, history_cnt, fr, i));
 
-		for (i = 0; i < fold->allocated_stack / BPF_REG_SIZE; i++) {
-			if (is_spilled_scalar_reg(&fold->stack[i]))
+		for (i = 0; i < fcur->allocated_stack / BPF_REG_SIZE; i++) {
+			if (fold->allocated_stack / BPF_REG_SIZE < i ||
+			    !is_spilled_reg(&fcur->stack[i]))
 				continue;
 
 			maybe_widen_reg(env,
 					&fold->stack[i].spilled_ptr,
 					&fcur->stack[i].spilled_ptr,
-					&env->idmap_scratch);
+					maybe_precise_spill(history, history_cnt, fr, i));
 		}
 	}
 	return 0;
@@ -7988,33 +8027,46 @@ static int widen_imprecise_scalars(struct bpf_verifier_env *env,
  * eventually instruction processing limit would be reached.
  *
  * To avoid such behavior speculatively forget (widen) range for
- * imprecise scalar registers, if those registers were not precise at the
- * end of the previous iteration and do not match exactly.
+ * imprecise scalar registers if:
+ * - registers were not precise at the end of the previous iteration or
+ *   iteration before previous *and*
+ * - registers values differ between current and previous iteration.
  *
- * This is a conservative heuristic that allows to verify wide range of programs,
- * however it precludes verification of programs that conjure an
- * imprecise value on first loop iteration and use it as precise on a second.
- * For example, the following safe program would fail to verify:
+ * The goal of this heuristic is to cover simple cases like above and
+ * also code slightly obfuscated by compiler. E.g. the C code below:
  *
- *     struct bpf_num_iter it;
- *     int arr[10];
- *     int i = 0, a = 0;
- *     bpf_iter_num_new(&it, 0, 10);
- *     while (bpf_iter_num_next(&it)) {
- *       if (a == 0) {
- *         a = 1;
- *         i = 7; // Because i changed verifier would forget
- *                // it's range on second loop entry.
- *       } else {
- *         arr[i] = 42; // This would fail to verify.
- *       }
+ *     unsigned int seen = 0;
+ *     ...
+ *     bpf_for_each(task_vma, vma, task, 0) {
+ *       if (seen >= 1000)
+ *         break;
+ *       ...
+ *       seen++;
  *     }
- *     bpf_iter_num_destroy(&it);
+ *
+ * Is compiled by clang as:
+ *
+ *   loop: r8 = r6                          ; stash current value of 'seen'
+ *         ... body ...
+ *         r1 = r10
+ *         r1 += -0x8
+ *         call bpf_iter_task_vma_next
+ *         r6 += 0x1                        ; seen++;
+ *         if r0 == 0x0 goto ... exit ...   ; exit on next returning NULL
+ *         if r8 < 0x3e7 goto loop          ; loop on seen < 1000
+ *
+ * Note that counter in r6 is copied to r8 and then incremented,
+ * conditional jump is done using r8. Because of this precision mark for
+ * r6 lags one state behind of precision mark on r8.
+ *
+ * In general users should expect that verifier would not be able to
+ * verify programs that conjure an imprecise value on first loop
+ * iteration and use it as precise on a second.
  */
 static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 				  struct bpf_kfunc_call_arg_meta *meta)
 {
-	struct bpf_verifier_state *cur_st = env->cur_state, *queued_st, *prev_st;
+	struct bpf_verifier_state *cur_st = env->cur_state, *queued_st;
 	struct bpf_func_state *cur_fr = cur_st->frame[cur_st->curframe], *queued_fr;
 	struct bpf_reg_state *cur_iter, *queued_iter;
 	int iter_frameno = meta->iter.frameno;
@@ -8032,11 +8084,15 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 	}
 
 	if (cur_iter->iter.state == BPF_ITER_STATE_ACTIVE) {
+		struct bpf_verifier_state *history[2];
+		u32 history_cnt;
+
 		/* Note cur_st->parent in the call below, it is necessary to skip
 		 * checkpoint created for cur_st by is_state_visited()
 		 * right at this instruction.
 		 */
-		prev_st = find_prev_entry(env, cur_st->parent, insn_idx);
+		history_cnt = sample_loop_history(env, cur_st->parent, insn_idx,
+						  history, ARRAY_SIZE(history));
 		/* branch out active iter state */
 		queued_st = push_stack(env, insn_idx + 1, insn_idx, false);
 		if (!queued_st)
@@ -8045,8 +8101,8 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 		queued_iter = &queued_st->frame[iter_frameno]->stack[iter_spi].spilled_ptr;
 		queued_iter->iter.state = BPF_ITER_STATE_ACTIVE;
 		queued_iter->iter.depth++;
-		if (prev_st)
-			widen_imprecise_scalars(env, prev_st, queued_st);
+		if (history_cnt == ARRAY_SIZE(history))
+			widen_imprecise_scalars(env, queued_st, history, ARRAY_SIZE(history));
 
 		queued_fr = queued_st->frame[queued_st->curframe];
 		mark_ptr_not_null_reg(&queued_fr->regs[BPF_REG_0]);
