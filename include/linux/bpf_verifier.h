@@ -651,6 +651,10 @@ struct bpf_verifier_env {
 	 * memory consumption during verification
 	 */
 	u32 peak_states;
+	u32 min_miss_cnt;
+	u32 max_miss_cnt;
+	u32 min_hit_cnt;
+	u32 max_hit_cnt;
 	/* longest register parentage chain walked for liveness marking */
 	u32 longest_mark_read_walk;
 	bpfptr_t fd_array;

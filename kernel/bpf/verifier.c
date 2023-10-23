@@ -26,6 +26,7 @@
 #include <linux/poison.h>
 #include <linux/module.h>
 #include <linux/cpumask.h>
+#include <linux/debugfs.h>
 #include <net/xdp.h>
 
 #include "disasm.h"
@@ -16812,6 +16813,21 @@ static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf
 	return false;
 }
 
+static u32 M;
+static u32 N;
+
+__init static int debugfs_init(void)
+{
+	struct dentry *dir;
+	dir = debugfs_create_dir("bpf", 0);
+	debugfs_create_u32("M", 0666, dir, &M);
+	debugfs_create_u32("N", 0666, dir, &N);
+	M = 3;
+	N = 3;
+	return 0;
+}
+late_initcall(debugfs_init);
+
 static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
@@ -16820,7 +16836,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	int i, j, err, states_cnt = 0;
 	bool force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx);
 	bool add_new_state = force_new_state;
-	bool force_exact;
+	bool force_exact, discard;
 
 	/* bpf progs typically have pruning point every 4 instructions
 	 * http://vger.kernel.org/bpfconf2019.html#session-1
@@ -17022,8 +17038,35 @@ miss:
 		 * Higher numbers increase max_states_per_insn and verification time,
 		 * but do not meaningfully decrease insn_processed.
 		 */
-		if (sl->miss_cnt > sl->hit_cnt * 3 + 3 &&
-		    !(is_force_checkpoint(env, insn_idx) && sl->state.branches > 0)) {
+		if (is_force_checkpoint(env, insn_idx) && sl->state.branches > 0) {
+			bool print = false;
+
+ 			if (sl->miss_cnt != 0 && sl->miss_cnt < env->min_miss_cnt) {
+				env->min_miss_cnt = sl->miss_cnt;
+				print = true;
+			}
+			if (sl->miss_cnt > env->max_miss_cnt) {
+				env->max_miss_cnt = sl->miss_cnt;
+				print = true;
+			}
+			if (sl->hit_cnt != 0 && sl->hit_cnt < env->min_hit_cnt) {
+				env->min_hit_cnt = sl->hit_cnt;
+				print = true;
+			}
+			if (sl->hit_cnt > env->max_hit_cnt) {
+				env->max_hit_cnt = sl->hit_cnt;
+				print = true;
+			}
+			if (print) {
+				verbose(env, "(%5d, %5d), miss_cnt: %5d, %5d, hit_cnt: %5d, %5d\n",
+					sl->miss_cnt, sl->hit_cnt,
+					env->min_miss_cnt, env->max_miss_cnt,
+					env->min_hit_cnt, env->max_hit_cnt);
+			}
+			discard = sl->miss_cnt > sl->hit_cnt * M + N;
+		} else
+			discard = sl->miss_cnt > sl->hit_cnt * 3 + 3;
+		if (discard) {
 			/* the state is unlikely to be useful. Remove it to
 			 * speed up verification
 			 */
