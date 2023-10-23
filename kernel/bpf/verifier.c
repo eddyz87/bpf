@@ -182,6 +182,7 @@ struct bpf_verifier_stack_elem {
 
 #define BPF_COMPLEXITY_LIMIT_JMP_SEQ	8192
 #define BPF_COMPLEXITY_LIMIT_STATES	64
+#define BPF_MAX_TOTAL_ITER_DEPTH	128
 
 #define BPF_MAP_KEY_POISON	(1ULL << 63)
 #define BPF_MAP_KEY_SEEN	(1ULL << 62)
@@ -1804,6 +1805,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->last_insn_idx = src->last_insn_idx;
 	dst_state->dfs_depth = src->dfs_depth;
 	dst_state->used_as_loop_entry = src->used_as_loop_entry;
+	dst_state->total_iter_depth = src->total_iter_depth;
 	for (i = 0; i <= src->curframe; i++) {
 		dst = dst_state->frame[i];
 		if (!dst) {
@@ -7884,6 +7886,12 @@ static int process_iter_arg(struct bpf_verifier_env *env, int regno, int insn_id
 			err = unmark_stack_slots_iter(env, reg, nr_slots);
 			if (err)
 				return err;
+			env->cur_state->total_iter_depth -= reg->iter.depth;
+			if (env->cur_state->total_iter_depth < 0) {
+				verbose(env, "bug: negative total iterator depth (%d)",
+					env->cur_state->total_iter_depth);
+				return -EFAULT;
+			}
 		}
 	}
 
@@ -8085,6 +8093,22 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 		queued_iter = &queued_st->frame[iter_frameno]->stack[iter_spi].spilled_ptr;
 		queued_iter->iter.state = BPF_ITER_STATE_ACTIVE;
 		queued_iter->iter.depth++;
+		queued_st->total_iter_depth++;
+		/* Checkpoints created for iter_next_call() are never evicted from
+		 * explored states cache, because doing otherwise would hinder loop
+		 * detection and thus prevent iteration convergence.
+		 *
+		 * This might lead long chains of checkpoint states associated with a
+		 * single instruction, which would lead to quadratic complexity in
+		 * is_state_visited() explored states search.
+		 *
+		 * Avoid this by limiting maximal total iteration depth.
+		 */
+		if (queued_st->total_iter_depth == BPF_MAX_TOTAL_ITER_DEPTH) {
+			verbose(env, "Maximal iteration depth reached (%d)\n",
+				BPF_MAX_TOTAL_ITER_DEPTH);
+			return -E2BIG;
+		}
 		if (prev_st)
 			widen_imprecise_scalars(env, prev_st, queued_st);
 
