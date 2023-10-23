@@ -1281,6 +1281,54 @@ __naked int widen_spill(void)
 	);
 }
 
+SEC("?raw_tp")
+__failure
+__naked int max_iter_depth(void)
+{
+	/* This is equivalent to C program below.
+	 * The counter stored in r6 is used as precise after the loop,
+	 * thus preventing widening. Verifier won't be able to conclude
+	 * that such program terminates but it should gracefully exit.
+	 *
+	 * r6 = 0
+	 * bpf_iter_num_new(&fp[-8], 0, 10)
+	 * while (bpf_iter_num_next(&fp[-8])) {
+	 *   r6 += 1;
+	 * }
+	 * bpf_iter_num_destroy(&fp[-8])
+	 * ... force r6 precise ...
+	 * return 0
+	 */
+	asm volatile (
+		"r6 = 0;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+	"loop_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto loop_end_%=;"
+		"r6 += 1;"
+		"goto loop_%=;"
+	"loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = r10;"
+		"r0 += r6;" /* this forces r6 to be precise */
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy)
+		: __clobber_all
+	);
+}
+
 SEC("raw_tp")
 __success
 __naked int checkpoint_states_deletion(void)
