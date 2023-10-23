@@ -1376,6 +1376,12 @@ __naked int checkpoint_states_deletion(void)
 		"r6 = 0;"   /* a */
 		"r7 = 0;"   /* b */
 		"r8 = 0;"   /* c */
+		"*(u64 *)(r10 - 24) = r6;" // 4
+		"*(u64 *)(r10 - 32) = r6;" // 5
+		"*(u64 *)(r10 - 40) = r6;" // 6
+		"*(u64 *)(r10 - 48) = r6;" // 7
+		"*(u64 *)(r10 - 56) = r6;" // 8
+		"*(u64 *)(r10 - 64) = r6;" // 9
 		"r9 = 0;"   /* sum */
 		"r1 = r10;"
 		"r1 += -8;"
@@ -1408,11 +1414,71 @@ __naked int checkpoint_states_deletion(void)
 		"call %[bpf_map_lookup_elem];"
 		"r8 = r0;"
 
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"*(u64 *)(r10 - 24) = r0;"
+		"r0 = 0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"*(u64 *)(r10 - 32) = r0;"
+		"r0 = 0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"*(u64 *)(r10 - 40) = r0;"
+		"r0 = 0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"*(u64 *)(r10 - 48) = r0;"
+		"r0 = 0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"*(u64 *)(r10 - 56) = r0;"
+		"r0 = 0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"*(u64 *)(r10 - 64) = r0;"
+		"r0 = 0;"
+
 		"if r6 == 0 goto +1;"
 		"r9 += 1;"
 		"if r7 == 0 goto +1;"
 		"r9 += 1;"
 		"if r8 == 0 goto +1;"
+		"r9 += 1;"
+		"r0 = *(u64 *)(r10 - 24);"
+		"if r0 == 0 goto +1;"
+		"r9 += 1;"
+		"r0 = *(u64 *)(r10 - 32);"
+		"if r0 == 0 goto +1;"
+		"r9 += 1;"
+		"r0 = *(u64 *)(r10 - 40);"
+		"if r0 == 0 goto +1;"
+		"r9 += 1;"
+		"r0 = *(u64 *)(r10 - 48);"
+		"if r0 == 0 goto +1;"
+		"r9 += 1;"
+		"r0 = *(u64 *)(r10 - 56);"
+		"if r0 == 0 goto +1;"
+		"r9 += 1;"
+		"r0 = *(u64 *)(r10 - 64);"
+		"if r0 == 0 goto +1;"
 		"r9 += 1;"
 
 		/* "r6 = 0;" // Commented out 'a = NULL;' */
