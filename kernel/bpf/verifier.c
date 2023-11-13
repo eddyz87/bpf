@@ -9615,6 +9615,23 @@ err_out:
 	return err;
 }
 
+static int check_global_func_call(struct bpf_verifier_env *env, struct bpf_func_state *caller,
+				  int subprog)
+{
+	int err;
+
+	err = btf_check_subprog_call(env, subprog, caller->regs);
+	if (err) {
+		verbose(env, "Caller passes invalid args into func#%d\n", subprog);
+		return err;
+	}
+
+	if (env->log.level & BPF_LOG_LEVEL)
+		verbose(env, "Func#%d is global and valid. Skipping.\n", subprog);
+
+	return 0;
+}
+
 static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			      int insn_idx, int subprog,
 			      set_callee_state_fn set_callee_state_cb)
@@ -9624,9 +9641,9 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	int err;
 
 	caller = state->frame[state->curframe];
-	err = btf_check_subprog_call(env, subprog, caller->regs);
-	if (err == -EFAULT)
-		return err;
+	/* err = btf_check_subprog_call(env, subprog, caller->regs); */
+	/* if (err == -EFAULT) */
+	/* 	return err; */
 
 	/* set_callee_state is used for direct subprog calls, but we are
 	 * interested in validating only BPF helpers that can call subprogs as
@@ -9667,6 +9684,29 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 		return 0;
 	}
 
+	/* if global subprog is passed as a callback:
+	 * - setup a fake entry frame to get callback-specific R1-R5;
+	 * - use check_global_func_call to verify that R1-R5 are compatible;
+	 * - free fake entry frame.
+	 */
+	if (subprog_is_global(env, subprog)) {
+		struct bpf_func_state *callee;
+
+		err = setup_func_entry(env, subprog, insn_idx, set_callee_state_cb, state);
+		if (err)
+			return err;
+		callee = state->frame[state->curframe];
+		if (env->log.level & BPF_LOG_LEVEL) {
+			verbose(env, "global callback callee:\n");
+			print_verifier_state(env, callee, true);
+		}
+		err = check_global_func_call(env, callee, subprog);
+		if (err)
+			return err;
+		free_func_state(callee);
+		state->frame[state->curframe--] = NULL;
+	}
+
 	/* for callback functions enqueue entry to callback and
 	 * proceed with next instruction within current frame.
 	 */
@@ -9701,29 +9741,24 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	caller = state->frame[state->curframe];
+	if (subprog_is_global(env, subprog)) {
+		err = check_global_func_call(env, caller, subprog);
+		if (err)
+			return err;
+
+		clear_caller_saved_regs(env, caller->regs);
+
+		/* All global functions return a 64-bit SCALAR_VALUE */
+		mark_reg_unknown(env, caller->regs, BPF_REG_0);
+		caller->regs[BPF_REG_0].subreg_def = DEF_NOT_SUBREG;
+
+		/* continue with next insn after call */
+		return 0;
+	}
+
 	err = btf_check_subprog_call(env, subprog, caller->regs);
 	if (err == -EFAULT)
 		return err;
-	if (subprog_is_global(env, subprog)) {
-		if (err) {
-			verbose(env, "Caller passes invalid args into func#%d\n",
-				subprog);
-			return err;
-		} else {
-			if (env->log.level & BPF_LOG_LEVEL)
-				verbose(env,
-					"Func#%d is global and valid. Skipping.\n",
-					subprog);
-			clear_caller_saved_regs(env, caller->regs);
-
-			/* All global functions return a 64-bit SCALAR_VALUE */
-			mark_reg_unknown(env, caller->regs, BPF_REG_0);
-			caller->regs[BPF_REG_0].subreg_def = DEF_NOT_SUBREG;
-
-			/* continue with next insn after call */
-			return 0;
-		}
-	}
 
 	/* for regular function entry setup new frame and continue
 	 * from that frame.
@@ -15210,10 +15245,10 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			verbose(env, "missing btf func_info\n");
 			return -EINVAL;
 		}
-		if (aux->func_info_aux[subprogno].linkage != BTF_FUNC_STATIC) {
-			verbose(env, "callback function not static\n");
-			return -EINVAL;
-		}
+		/* if (aux->func_info_aux[subprogno].linkage != BTF_FUNC_STATIC) { */
+		/* 	verbose(env, "callback function not static\n"); */
+		/* 	return -EINVAL; */
+		/* } */
 
 		dst_reg->type = PTR_TO_FUNC;
 		dst_reg->subprogno = subprogno;
