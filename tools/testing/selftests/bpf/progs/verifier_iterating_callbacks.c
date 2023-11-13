@@ -181,4 +181,38 @@ int bpf_loop_iter_limit_overflow(void *unused) {
 	return choice_arr[ctx.i];
 }
 
+long global_safe_cb(__u32 idx, struct num_context *ctx)
+{
+	if (!ctx)
+		return 0;
+
+	ctx->i = 1;
+	return 0;
+}
+
+SEC("socket")
+__success __retval(1)
+int global_cb_ok(void *unused)
+{
+	struct num_context loop_ctx = { .i = 0 };
+
+	bpf_loop(7, global_safe_cb, &loop_ctx, 0);
+	if (loop_ctx.i > 1)
+		loop_ctx.i = 0;
+	return choice_arr[loop_ctx.i];
+}
+
+SEC("?raw_tp")
+__failure
+__msg("math between map_value pointer and register with unbounded min value is not allowed")
+int global_cb_unsafe(void *unused)
+{
+	struct num_context loop_ctx = { .i = 0 };
+
+	bpf_loop(7, global_safe_cb, &loop_ctx, 0);
+	return choice_arr[loop_ctx.i];
+}
+
+// todo: global cb bad sig
+
 char _license[] SEC("license") = "GPL";
