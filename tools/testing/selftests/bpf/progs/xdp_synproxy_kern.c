@@ -6,6 +6,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <asm/errno.h>
+#include "bpf_kfuncs.h"
 
 #define TC_ACT_OK 0
 #define TC_ACT_SHOT 2
@@ -183,63 +184,65 @@ static __always_inline __u32 tcp_clock_ms(void)
 }
 
 struct tcpopt_context {
-	__u8 *ptr;
-	__u8 *end;
-	void *data_end;
 	__be32 *tsecr;
 	__u8 wscale;
 	bool option_timestamp;
 	bool option_sack;
+	__u32 off;
+	struct bpf_dynptr *packet_data;
 };
+
+static __always_inline u8 *next(struct tcpopt_context *ctx, __u32 sz)
+{
+	__u8 *data = bpf_dynptr_slice(ctx->packet_data, ctx->off, NULL, sz);
+
+	ctx->off += sz;
+	return data;
+}
 
 static int tscookie_tcpopt_parse(struct tcpopt_context *ctx)
 {
-	__u8 opcode, opsize;
+	__u8 *opcode, *opsize, *wscale, *tsecr;
+	__u32 off = ctx->off;
 
-	if (ctx->ptr >= ctx->end)
-		return 1;
-	if (ctx->ptr >= ctx->data_end)
+	opcode = next(ctx, 1);
+	if (!opcode)
 		return 1;
 
-	opcode = ctx->ptr[0];
-
-	if (opcode == TCPOPT_EOL)
+	if (*opcode == TCPOPT_EOL)
 		return 1;
-	if (opcode == TCPOPT_NOP) {
-		++ctx->ptr;
+	if (*opcode == TCPOPT_NOP)
 		return 0;
-	}
 
-	if (ctx->ptr + 1 >= ctx->end)
-		return 1;
-	if (ctx->ptr + 1 >= ctx->data_end)
-		return 1;
-	opsize = ctx->ptr[1];
-	if (opsize < 2)
+	opsize = next(ctx, 1);
+	if (!opsize || *opsize < 2)
 		return 1;
 
-	if (ctx->ptr + opsize > ctx->end)
-		return 1;
-
-	switch (opcode) {
+	switch (*opcode) {
 	case TCPOPT_WINDOW:
-		if (opsize == TCPOLEN_WINDOW && ctx->ptr + TCPOLEN_WINDOW <= ctx->data_end)
-			ctx->wscale = ctx->ptr[2] < TCP_MAX_WSCALE ? ctx->ptr[2] : TCP_MAX_WSCALE;
+		wscale = next(ctx, 1);
+		if (!wscale)
+			return 1;
+		if (*opsize == TCPOLEN_WINDOW)
+			ctx->wscale = *wscale < TCP_MAX_WSCALE ? *wscale : TCP_MAX_WSCALE;
 		break;
 	case TCPOPT_TIMESTAMP:
-		if (opsize == TCPOLEN_TIMESTAMP && ctx->ptr + TCPOLEN_TIMESTAMP <= ctx->data_end) {
+		tsecr = next(ctx, 4);
+		if (!tsecr)
+			return 1;
+		if (*opsize == TCPOLEN_TIMESTAMP) {
 			ctx->option_timestamp = true;
 			/* Client's tsval becomes our tsecr. */
-			*ctx->tsecr = get_unaligned((__be32 *)(ctx->ptr + 2));
+			*ctx->tsecr = get_unaligned((__be32 *)tsecr);
 		}
 		break;
 	case TCPOPT_SACK_PERM:
-		if (opsize == TCPOLEN_SACK_PERM)
+		if (*opsize == TCPOLEN_SACK_PERM)
 			ctx->option_sack = true;
 		break;
 	}
 
-	ctx->ptr += opsize;
+	ctx->off = off + *opsize;
 
 	return 0;
 }
@@ -256,16 +259,16 @@ static int tscookie_tcpopt_parse_batch(__u32 index, void *context)
 
 static __always_inline bool tscookie_init(struct tcphdr *tcp_header,
 					  __u16 tcp_len, __be32 *tsval,
-					  __be32 *tsecr, void *data_end)
+					  __be32 *tsecr, void *data, void *data_end,
+					  struct bpf_dynptr *packet_data)
 {
 	struct tcpopt_context loop_ctx = {
-		.ptr = (__u8 *)(tcp_header + 1),
-		.end = (__u8 *)tcp_header + tcp_len,
-		.data_end = data_end,
 		.tsecr = tsecr,
 		.wscale = TS_OPT_WSCALE_MASK,
 		.option_timestamp = false,
 		.option_sack = false,
+		.off = (__u8 *)(tcp_header + 1) - (__u8 *)data,
+		.packet_data = packet_data,
 	};
 	u32 cookie;
 
@@ -557,6 +560,7 @@ static __always_inline void tcpv6_gen_synack(struct header_pointers *hdr,
 static __always_inline int syncookie_handle_syn(struct header_pointers *hdr,
 						void *ctx,
 						void *data, void *data_end,
+						struct bpf_dynptr *packet_data,
 						bool xdp)
 {
 	__u32 old_pkt_size, new_pkt_size;
@@ -635,7 +639,7 @@ static __always_inline int syncookie_handle_syn(struct header_pointers *hdr,
 	cookie = (__u32)value;
 
 	if (tscookie_init((void *)hdr->tcp, hdr->tcp_len,
-			  &tsopt_buf[0], &tsopt_buf[1], data_end))
+			  &tsopt_buf[0], &tsopt_buf[1], data, data_end, packet_data))
 		tsopt = tsopt_buf;
 
 	/* Check that there is enough space for a SYNACK. It also covers
@@ -763,6 +767,7 @@ static __always_inline int syncookie_part1(void *ctx, void *data, void *data_end
 }
 
 static __always_inline int syncookie_part2(void *ctx, void *data, void *data_end,
+					   struct bpf_dynptr *packet_data,
 					   struct header_pointers *hdr, bool xdp)
 {
 	if (hdr->ipv4) {
@@ -792,7 +797,7 @@ static __always_inline int syncookie_part2(void *ctx, void *data, void *data_end
 	if (hdr->tcp_len < sizeof(*hdr->tcp))
 		return XDP_ABORTED;
 
-	return hdr->tcp->syn ? syncookie_handle_syn(hdr, ctx, data, data_end, xdp) :
+	return hdr->tcp->syn ? syncookie_handle_syn(hdr, ctx, data, data_end, packet_data, xdp) :
 			       syncookie_handle_ack(hdr);
 }
 
@@ -802,7 +807,11 @@ int syncookie_xdp(struct xdp_md *ctx)
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
 	struct header_pointers hdr;
+	struct bpf_dynptr packet_data;
 	int ret;
+
+	if (bpf_dynptr_from_xdp(ctx, 0, &packet_data))
+		return XDP_ABORTED;
 
 	ret = syncookie_part1(ctx, data, data_end, &hdr, true);
 	if (ret != XDP_TX)
@@ -811,7 +820,7 @@ int syncookie_xdp(struct xdp_md *ctx)
 	data_end = (void *)(long)ctx->data_end;
 	data = (void *)(long)ctx->data;
 
-	return syncookie_part2(ctx, data, data_end, &hdr, true);
+	return syncookie_part2(ctx, data, data_end, &packet_data, &hdr, true);
 }
 
 SEC("tc")
@@ -819,8 +828,12 @@ int syncookie_tc(struct __sk_buff *skb)
 {
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;
+	struct bpf_dynptr packet_data;
 	struct header_pointers hdr;
 	int ret;
+
+	if (bpf_dynptr_from_skb(skb, 0, &packet_data))
+		return TC_ACT_OK;
 
 	ret = syncookie_part1(skb, data, data_end, &hdr, false);
 	if (ret != XDP_TX)
@@ -829,7 +842,7 @@ int syncookie_tc(struct __sk_buff *skb)
 	data_end = (void *)(long)skb->data_end;
 	data = (void *)(long)skb->data;
 
-	ret = syncookie_part2(skb, data, data_end, &hdr, false);
+	ret = syncookie_part2(skb, data, data_end, &packet_data, &hdr, false);
 	switch (ret) {
 	case XDP_PASS:
 		return TC_ACT_OK;
