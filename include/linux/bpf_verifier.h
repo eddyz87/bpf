@@ -70,6 +70,8 @@ enum bpf_iter_state {
 	BPF_ITER_STATE_DRAINED,
 };
 
+#define BPF_ID_TRANSFERED_RANGE	BIT(31)
+
 struct bpf_reg_state {
 	/* Ordering of fields matters.  See states_equal() */
 	enum bpf_reg_type type;

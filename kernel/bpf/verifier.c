@@ -14649,13 +14649,25 @@ static bool try_match_pkt_pointers(const struct bpf_insn *insn,
 static void find_equal_scalars(struct bpf_verifier_state *vstate,
 			       struct bpf_reg_state *known_reg)
 {
+	struct bpf_reg_state *reg, *first = NULL;
 	struct bpf_func_state *state;
-	struct bpf_reg_state *reg;
+	bool did_transfer_range;
+	u32 id = known_reg->id;
 
 	bpf_for_each_reg_in_vstate(vstate, state, reg, ({
-		if (reg->type == SCALAR_VALUE && reg->id == known_reg->id)
-			copy_register_state(reg, known_reg);
+		if (reg->type != SCALAR_VALUE || reg->id != id)
+			continue;
+		if (first == NULL) {
+			first = reg;
+		} else {
+			did_transfer_range = true;
+			known_reg->id |= BPF_ID_TRANSFERED_RANGE;
+		}
+		copy_register_state(reg, known_reg);
 	}));
+
+	if (did_transfer_range)
+		first->id |= BPF_ID_TRANSFERED_RANGE;
 }
 
 static int check_cond_jmp_op(struct bpf_verifier_env *env,
@@ -16776,13 +16788,15 @@ static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf
 	return false;
 }
 
-static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+static int is_state_visited(struct bpf_verifier_env *env, int insn_idx, bool force_checkpoint)
 {
 	struct bpf_verifier_state_list *new_sl;
 	struct bpf_verifier_state_list *sl, **pprev;
 	struct bpf_verifier_state *cur = env->cur_state, *new, *loop_entry;
 	int i, j, n, err, states_cnt = 0;
-	bool force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx);
+	bool force_new_state = env->test_state_freq ||
+			       is_force_checkpoint(env, insn_idx) ||
+			       force_checkpoint;
 	bool add_new_state = force_new_state;
 	bool force_exact;
 
@@ -17182,6 +17196,80 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 	return 0;
 }
 
+static struct bpf_reg_state *get_spilled_reg(struct bpf_verifier_env *env,
+					     struct bpf_reg_state *base_reg,
+					     s32 off)
+{
+	struct bpf_stack_state *stack;
+	struct bpf_func_state *fn;
+	int spi;
+
+	if (base_reg->type != PTR_TO_STACK || !tnum_is_const(base_reg->var_off))
+		return NULL;
+
+	spi = __get_spi(base_reg->off + base_reg->var_off.value);
+	fn = func(env, base_reg);
+	if (!is_spi_bounds_valid(fn, spi, 1))
+		return NULL;
+
+	stack = &fn->stack[spi];
+	if (!is_spilled_reg(stack))
+		return NULL;
+
+	return &stack->spilled_ptr;
+}
+
+static bool range_transfer_id(struct bpf_reg_state *reg)
+{
+	return reg->type == SCALAR_VALUE && (reg->id & BPF_ID_TRANSFERED_RANGE);
+}
+
+static bool might_break_id_link(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	struct bpf_reg_state *src, *dst, *spill, *regs = cur_regs(env);
+	u8 class = BPF_CLASS(insn->code);
+	u8 opcode = BPF_OP(insn->code);
+	u32 i;
+
+	/* When true, it's an invalid instruction but that would be reported later. */
+	if (insn->dst_reg >= MAX_BPF_REG || insn->src_reg >= MAX_BPF_REG)
+		return false;
+
+	src = &regs[insn->src_reg];
+	dst = &regs[insn->dst_reg];
+	switch (class) {
+	case BPF_ALU64:
+	case BPF_ALU:
+	case BPF_LDX:
+	case BPF_LD:
+		return range_transfer_id(dst);
+	case BPF_STX:
+		if (dst->type != PTR_TO_STACK)
+			return false;
+
+		if (!tnum_is_const(dst->var_off))
+			return true;
+
+		spill = get_spilled_reg(env, dst, insn->off);
+		return spill && range_transfer_id(spill);
+	case BPF_JMP:
+	case BPF_JMP32:
+		if (bpf_pseudo_call(insn)) {
+			for (i = 0; i < CALLER_SAVED_REGS; ++i)
+				if (range_transfer_id(&regs[i]))
+					return true;
+			return false;
+		}
+		if (opcode == BPF_CALL)
+			return true;
+
+		// BPF_JA, BPF_EXIT, conditional jumps
+		return false;
+	default:
+		return true;
+	}
+}
+
 static int do_check(struct bpf_verifier_env *env)
 {
 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
@@ -17194,6 +17282,7 @@ static int do_check(struct bpf_verifier_env *env)
 
 	for (;;) {
 		bool exception_exit = false;
+		bool force_checkpoint;
 		struct bpf_insn *insn;
 		u8 class;
 		int err;
@@ -17220,8 +17309,9 @@ static int do_check(struct bpf_verifier_env *env)
 
 		state->last_insn_idx = env->prev_insn_idx;
 
-		if (is_prune_point(env, env->insn_idx)) {
-			err = is_state_visited(env, env->insn_idx);
+		force_checkpoint = might_break_id_link(env, insn);
+		if (is_prune_point(env, env->insn_idx) || force_checkpoint) {
+			err = is_state_visited(env, env->insn_idx, force_checkpoint);
 			if (err < 0)
 				return err;
 			if (err == 1) {
