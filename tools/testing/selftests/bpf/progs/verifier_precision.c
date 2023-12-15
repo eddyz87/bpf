@@ -130,4 +130,71 @@ __naked int state_loop_first_last_equal(void)
 	);
 }
 
+SEC("socket")
+__failure
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("8: (37) r0 /= 0")
+__msg("div by zero")
+__naked void middle_state_breaks_id_link(void)
+{
+	asm volatile (
+	"   call %[bpf_get_prandom_u32];\n"
+	"   r7 = r0;\n"
+	"   r8 = r0;\n"
+	"   call %[bpf_get_prandom_u32];\n"
+	"   if r0 > 1 goto +0;\n"
+	"   if r8 >= r0 goto 1f;\n"
+	"   r8 += r8;\n"
+	"   if r7 == 0 goto 1f;\n"
+	"   r0 /= 0;\n"
+	"1: r0 = 42;\n"
+	"   exit;\n"
+	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+#include "../../../include/linux/filter.h"
+
+SEC("socket")
+__success __log_level(2)
+__msg("30: (18) r0 = 0x4")
+__naked void pruning_test(void)
+{
+	asm volatile (
+	/*  0 */ "r2 = 0x1a000000be ll;\n"
+	/*  2 */ "r5 = r1;\n"
+	/*  3 */ "r8 = r2;\n"
+	/*  4 */ "w4 = w5;\n"
+	/*  5 */ "call %[bpf_get_prandom_u32];\n"
+	/*  6 */ "if w8 >= 0x69 goto +1;\n"
+	/*  7 */ "exit;\n"
+	/*  8 */ "r4 = 0x52 ll;\n"
+	/* 10 */ "w4 = -w4;\n"
+	/* 11 */ ".8byte %[r0_jset];\n"	/* if r0 & 0xfffffffe goto pc+3; */
+	/* 12 */ "r8 -= r4;\n"
+	/* 13 */ "r0 += r0;\n"
+	/* 14 */ "r4 *= r4;\n"
+	/* 15 */ "r3 = 0x1f00000034 ll;\n"
+	/* 17 */ "w4 s>>= 29;\n"
+	/* 18 */ "if w8 != 0xf goto +3;\n"
+	/* 19 */ ".8byte %[bswap32_r3];\n" /* bswap32 r3; */
+	/* 20 */ "r2 = 0x1c ll;\n"
+	/* 22 */ "r4 <<= 2;\n"
+	/* 23 */ "r5 = r8;\n"
+	/* 24 */ "r2 = 0x4 ll;\n"
+	/* 26 */ "if w8 s>= w0 goto +5;\n"
+	/* 27 */ "r8 |= r8;\n"
+	/* 28 */ "r8 += r8;\n"
+	/* 29 */ "if w5 s<= 0x1d goto +2;\n"
+	/* 30 */ "r0 = 0x4 ll;\n"
+	/* 32 */ "exit;\n"
+	:
+	: __imm(bpf_get_prandom_u32),
+	  __imm_insn(r0_jset, BPF_JMP_IMM(BPF_JSET, BPF_REG_0, 0xfffffffe, 3)),
+	  __imm_insn(bswap32_r3, BPF_RAW_INSN(BPF_ALU64 | BPF_TO_LE | BPF_END,
+					      BPF_REG_3, 0, 0, 32))
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
