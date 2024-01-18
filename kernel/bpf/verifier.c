@@ -362,6 +362,26 @@ __printf(2, 3) static void verbose(void *private_data, const char *fmt, ...)
 	va_end(args);
 }
 
+static u32 debug_ptr_sig(void *ptr)
+{
+	return ((u64)ptr) >> 3 & 0xFFFF;
+}
+
+static void debug_print_verifier_state(struct bpf_verifier_env *env,
+				       const char *prefix,
+				       u32 insn_idx,
+				       struct bpf_verifier_state *cur) {
+	if (!(env->log.level & BPF_LOG_LEVEL2))
+		return;
+	for (int i = cur->curframe; i >= 0; --i) {
+		if (i == 0)
+			verbose(env, "[%04x] %s (%d):", debug_ptr_sig(cur), prefix, insn_idx);
+		else
+			verbose(env, "       %s (%d):", prefix, insn_idx);
+		print_verifier_state(env, cur->frame[i], true);
+	}
+}
+
 static void verbose_invalid_scalar(struct bpf_verifier_env *env,
 				   struct bpf_reg_state *reg,
 				   struct bpf_retval_range range, const char *ctx,
@@ -16612,6 +16632,9 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 {
 	int i;
 
+       /* if (old->callback_depth > cur->callback_depth) */
+       /*         return false; */
+
 	for (i = 0; i < MAX_BPF_REG; i++)
 		if (!regsafe(env, &old->regs[i], &cur->regs[i],
 			     &env->idmap_scratch, exact))
@@ -17027,14 +17050,23 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 					iter_state = &func(env, iter_reg)->stack[spi].spilled_ptr;
 					if (iter_state->iter.state == BPF_ITER_STATE_ACTIVE) {
 						update_loop_entry(cur, &sl->state);
+						if (env->log.level & BPF_LOG_LEVEL2)
+							verbose(env, "checkpoint-exact: %04x -> %04x\n",
+								debug_ptr_sig(cur->parent),
+								debug_ptr_sig(&sl->state));
 						goto hit;
 					}
 				}
 				goto skip_inf_loop_check;
 			}
 			if (calls_callback(env, insn_idx)) {
-				if (states_equal(env, &sl->state, cur, true))
+				if (states_equal(env, &sl->state, cur, true)) {
+					if (env->log.level & BPF_LOG_LEVEL2)
+						verbose(env, "checkpoint-exact: %04x -> %04x\n",
+							debug_ptr_sig(cur->parent),
+							debug_ptr_sig(&sl->state));
 					goto hit;
+				}
 				goto skip_inf_loop_check;
 			}
 			/* attempt to detect infinite loop to avoid unnecessary doomed work */
@@ -17099,7 +17131,30 @@ skip_inf_loop_check:
 		if (states_equal(env, &sl->state, cur, force_exact)) {
 			if (force_exact)
 				update_loop_entry(cur, loop_entry);
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "checkpoint-%s: %04x -> %04x\n",
+					force_exact ? "exact" : "inexact",
+					debug_ptr_sig(cur->parent),
+					debug_ptr_sig(&sl->state));
 hit:
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				debug_print_verifier_state(env, "hit", insn_idx, cur);
+				debug_print_verifier_state(env, "old", insn_idx, &sl->state);
+				verbose(env, "old branches: %d\n", sl->state.branches);
+				verbose(env, "callback_depth: old=");
+				for (int i = 0; i <= sl->state.curframe; ++i) {
+					verbose(env, "%s%d",
+						i == 0 ? "" : ", ",
+						sl->state.frame[i]->callback_depth);
+				}
+				verbose(env, ", cur=");
+				for (int i = 0; i <= cur->curframe; ++i) {
+					verbose(env, "%s%d",
+						i == 0 ? "" : ", ",
+						cur->frame[i]->callback_depth);
+				}
+				verbose(env, "\n");
+			}
 			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
@@ -17253,6 +17308,11 @@ next:
 						&newframe->stack[i].spilled_ptr;
 		}
 	}
+	debug_print_verifier_state(env, "checkpoint", insn_idx, &new_sl->state);
+	if (env->log.level & BPF_LOG_LEVEL2)
+		verbose(env, "checkpoint-tree: %04x -> %04x\n",
+			debug_ptr_sig(&new_sl->state),
+			debug_ptr_sig(new_sl->state.parent));
 	return 0;
 }
 
@@ -17504,6 +17564,14 @@ static int do_check(struct bpf_verifier_env *env)
 			err = save_aux_ptr_type(env, dst_reg_type, false);
 			if (err)
 				return err;
+			if ((env->log.level & BPF_LOG_LEVEL2) && dst_reg_type == PTR_TO_STACK) {
+				int i = 0;
+
+				for (i = env->cur_state->curframe; i >= 0; --i) {
+					verbose(env, "bpf_stx frame #%d: ", i);
+					print_verifier_state(env, env->cur_state->frame[i], true);
+				}
+			}
 		} else if (class == BPF_ST) {
 			enum bpf_reg_type dst_reg_type;
 
@@ -17529,6 +17597,14 @@ static int do_check(struct bpf_verifier_env *env)
 			err = save_aux_ptr_type(env, dst_reg_type, false);
 			if (err)
 				return err;
+			if ((env->log.level & BPF_LOG_LEVEL2) && dst_reg_type == PTR_TO_STACK) {
+				int i = 0;
+
+				for (i = env->cur_state->curframe; i >= 0; --i) {
+					verbose(env, "bpf_st frame #%d: ", i);
+					print_verifier_state(env, env->cur_state->frame[i], true);
+				}
+			}
 		} else if (class == BPF_JMP || class == BPF_JMP32) {
 			u8 opcode = BPF_OP(insn->code);
 
