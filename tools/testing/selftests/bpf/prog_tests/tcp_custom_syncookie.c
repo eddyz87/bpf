@@ -119,17 +119,27 @@ close_server:
 	close(server);
 }
 
+extern int extra_prog_load_log_flags;
+
 void test_tcp_custom_syncookie(void)
 {
 	struct test_tcp_custom_syncookie *skel;
-	int i;
+	LIBBPF_OPTS(bpf_object_open_opts, opts,
+		.kernel_log_level = extra_prog_load_log_flags,
+	);
+	int i, err;
+
 
 	if (setup_netns())
 		return;
 
-	skel = test_tcp_custom_syncookie__open_and_load();
-	if (!ASSERT_OK_PTR(skel, "open_and_load"))
+	skel = test_tcp_custom_syncookie__open_opts(&opts);
+	if (!ASSERT_OK_PTR(skel, "open"))
 		return;
+
+	err = test_tcp_custom_syncookie__load(skel);
+	if (!ASSERT_OK(err, "load"))
+		goto destroy_skel;
 
 	if (setup_tc(skel))
 		goto destroy_skel;
