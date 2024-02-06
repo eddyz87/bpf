@@ -627,7 +627,8 @@ TRUNNER_EXTRA_SOURCES := test_progs.c		\
 			 disasm.c		\
 			 json_writer.c 		\
 			 flow_dissector_load.h	\
-			 ip_check_defrag_frags.h
+			 ip_check_defrag_frags.h \
+			 arena_simple_common.h
 TRUNNER_EXTRA_FILES := $(OUTPUT)/urandom_read $(OUTPUT)/bpf_testmod.ko	\
 		       $(OUTPUT)/liburandom_read.so			\
 		       $(OUTPUT)/xdp_synproxy				\
