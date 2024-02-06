@@ -25,9 +25,9 @@ typedef struct arena_list_head __arena arena_list_head_t;
 	 })
 
 #ifndef __BPF__
-static inline void *bpf_iter_num_new(struct bpf_iter_num *, int, int) {	return NULL; }
-static inline void bpf_iter_num_destroy(struct bpf_iter_num *) {}
-static inline bool bpf_iter_num_next(struct bpf_iter_num *) { return true; }
+static inline void *bpf_iter_num_new(struct bpf_iter_num *a, int b, int c) {	return NULL; }
+static inline void bpf_iter_num_destroy(struct bpf_iter_num *a) {}
+static inline bool bpf_iter_num_next(struct bpf_iter_num *a) { return true; }
 #endif
 
 /* Safely walk link list of up to 1M elements. Deletion of elements is allowed. */
