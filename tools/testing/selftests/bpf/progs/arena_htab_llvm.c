@@ -23,7 +23,7 @@ bool skip = false;
 SEC("syscall")
 int arena_htab_llvm(void *ctx)
 {
-#if __has_builtin(__builtin_bpf_arena_cast) || defined(BPF_ARENA_FORCE_ASM)
+#if defined(__BPF_FEATURE_ARENA_CAST) || defined(BPF_ARENA_FORCE_ASM)
 	struct htab __arena *htab;
 	__u64 i;
 

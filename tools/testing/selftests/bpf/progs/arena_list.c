@@ -31,7 +31,7 @@ bool skip = false;
 SEC("syscall")
 int arena_list_add(void *ctx)
 {
-#if __has_builtin(__builtin_bpf_arena_cast)
+#if defined(__BPF_FEATURE_ARENA_CAST)
 	__u64 i;
 
 	list_head = bpf_alloc(sizeof(*list_head));
@@ -51,7 +51,7 @@ int arena_list_add(void *ctx)
 SEC("syscall")
 int arena_list_del(void *ctx)
 {
-#if __has_builtin(__builtin_bpf_arena_cast)
+#if defined(__BPF_FEATURE_ARENA_CAST)
 	struct elem __arena *n;
 	int sum = 0;
 
