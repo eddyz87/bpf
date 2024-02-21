@@ -5,6 +5,7 @@
  */
 #include <uapi/linux/btf.h>
 #include <linux/bpf-cgroup.h>
+#include <linux/debugfs.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/slab.h>
@@ -14839,7 +14840,8 @@ static bool try_match_pkt_pointers(const struct bpf_insn *insn,
 	return true;
 }
 
-static void __find_equal_scalars(u64 *equal_scalars,
+static void __find_equal_scalars(u32 *num,
+				 u64 *equal_scalars,
 				 struct bpf_reg_state *reg,
 				 u32 id, u32 frameno, u32 spi_or_reg, bool is_reg)
 {
@@ -14848,6 +14850,7 @@ static void __find_equal_scalars(u64 *equal_scalars,
 
 	if (!equal_scalars_push(equal_scalars, frameno, spi_or_reg, is_reg))
 		reg->id = 0;
+	(*num)++;
 }
 
 /* For all R being scalar registers or spilled scalar registers
@@ -14861,20 +14864,23 @@ static void find_equal_scalars(struct bpf_verifier_env *env,
 	struct bpf_func_state *func;
 	struct bpf_reg_state *reg;
 	int i, j;
+	u32 num = 0;
 
 	for (i = vstate->curframe; i >= 0; i--) {
 		func = vstate->frame[i];
 		for (j = 0; j < BPF_REG_FP; j++) {
 			reg = &func->regs[j];
-			__find_equal_scalars(equal_scalars, reg, id, i, j, true);
+			__find_equal_scalars(&num, equal_scalars, reg, id, i, j, true);
 		}
 		for (j = 0; j < func->allocated_stack / BPF_REG_SIZE; j++) {
 			if (!is_spilled_reg(&func->stack[j]))
 				continue;
 			reg = &func->stack[j].spilled_ptr;
-			__find_equal_scalars(equal_scalars, reg, id, i, j, false);
+			__find_equal_scalars(&num, equal_scalars, reg, id, i, j, false);
 		}
 	}
+
+	env->max_equal_scalars = max(env->max_equal_scalars, num);
 }
 
 /* For all R in equal_scalars, copy known_reg range into R
@@ -20947,6 +20953,56 @@ struct btf *bpf_get_btf_vmlinux(void)
 	return btf_vmlinux;
 }
 
+static atomic_t max_equal_scalars_hist[16];
+
+static void update_equal_scalars_hist(u32 val) {
+	u32 idx;
+
+	idx = min(val, ARRAY_SIZE(max_equal_scalars_hist) - 1);
+	atomic_inc(&max_equal_scalars_hist[idx]);
+}
+
+static ssize_t find_equal_scalars_read(struct file *file, char __user *user_buf,
+				       size_t count, loff_t *ppos)
+{
+	char buf[256];
+	int len = 0;
+
+	for (int i = 0; i < ARRAY_SIZE(max_equal_scalars_hist); ++i) {
+		int val = atomic_read(&max_equal_scalars_hist[i]);
+		int avail = ARRAY_SIZE(buf) - len - 1;
+		int res;
+
+		if (avail <= 0)
+			break;
+		if (i < ARRAY_SIZE(max_equal_scalars_hist) - 1)
+			res = snprintf(&buf[len], avail, "[%d] = ", i);
+		else
+			res = snprintf(&buf[len], avail, "[other] = ");
+		len += max(res, 0);
+		res = snprintf(&buf[len], avail, "%d\n", val);
+		len += max(res, 0);
+	}
+	buf[ARRAY_SIZE(buf) - 1] = 0;
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static const struct file_operations find_equal_scalars_fops = {
+	.read		= find_equal_scalars_read,
+	.llseek		= default_llseek,
+};
+
+static __init int init_find_equal_scalars_stats(void)
+{
+	struct dentry *d;
+
+	d = debugfs_create_file("find_equal_scalars_stats", 0444, NULL, NULL,
+				&find_equal_scalars_fops);
+	return d ? 0 : -1;
+}
+
+late_initcall(init_find_equal_scalars_stats);
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
@@ -21063,6 +21119,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 
 	ret = do_check_main(env);
 	ret = ret ?: do_check_subprogs(env);
+
+	update_equal_scalars_hist(env->max_equal_scalars);
 
 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
 		ret = bpf_prog_offload_finalize(env);
