@@ -575,6 +575,7 @@ struct bpf_insn_aux_data {
 	 * accepts callback function as a parameter.
 	 */
 	bool calls_callback;
+	u32 dist_to_exit;
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */

@@ -15100,13 +15100,16 @@ static void find_equal_scalars(struct bpf_verifier_state *vstate,
 static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			     struct bpf_insn *insn, int *insn_idx)
 {
-	struct bpf_verifier_state *this_branch = env->cur_state;
-	struct bpf_verifier_state *other_branch;
-	struct bpf_reg_state *regs = this_branch->frame[this_branch->curframe]->regs;
-	struct bpf_reg_state *dst_reg, *other_branch_regs, *src_reg = NULL;
+	struct bpf_verifier_state *false_branch = env->cur_state;
+	struct bpf_verifier_state *true_branch, *tmp;
+	struct bpf_reg_state *regs = false_branch->frame[false_branch->curframe]->regs;
+	struct bpf_reg_state *false_dst_reg, *false_src_reg = NULL;
+	struct bpf_reg_state *true_dst_reg = NULL, *true_src_reg = NULL;
+	struct bpf_reg_state *true_branch_regs, *false_branch_regs;
 	struct bpf_reg_state *eq_branch_regs;
 	struct bpf_reg_state fake_reg = {};
 	u8 opcode = BPF_OP(insn->code);
+	u32 jmp_target;
 	bool is_jmp32;
 	int pred = -1;
 	int err;
@@ -15147,7 +15150,7 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	if (err)
 		return err;
 
-	dst_reg = &regs[insn->dst_reg];
+	false_dst_reg = &regs[insn->dst_reg];
 	if (BPF_SRC(insn->code) == BPF_X) {
 		if (insn->imm != 0) {
 			verbose(env, "BPF_JMP/JMP32 uses reserved fields\n");
@@ -15159,8 +15162,8 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		if (err)
 			return err;
 
-		src_reg = &regs[insn->src_reg];
-		if (!(reg_is_pkt_pointer_any(dst_reg) && reg_is_pkt_pointer_any(src_reg)) &&
+		false_src_reg = &regs[insn->src_reg];
+		if (!(reg_is_pkt_pointer_any(false_dst_reg) && reg_is_pkt_pointer_any(false_src_reg)) &&
 		    is_pointer_value(env, insn->src_reg)) {
 			verbose(env, "R%d pointer comparison prohibited\n",
 				insn->src_reg);
@@ -15171,21 +15174,21 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			verbose(env, "BPF_JMP/JMP32 uses reserved fields\n");
 			return -EINVAL;
 		}
-		src_reg = &fake_reg;
-		src_reg->type = SCALAR_VALUE;
-		__mark_reg_known(src_reg, insn->imm);
+		false_src_reg = &fake_reg;
+		false_src_reg->type = SCALAR_VALUE;
+		__mark_reg_known(false_src_reg, insn->imm);
 	}
 
 	is_jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
-	pred = is_branch_taken(dst_reg, src_reg, opcode, is_jmp32);
+	pred = is_branch_taken(false_dst_reg, false_src_reg, opcode, is_jmp32);
 	if (pred >= 0) {
 		/* If we get here with a dst_reg pointer type it is because
 		 * above is_branch_taken() special cased the 0 comparison.
 		 */
-		if (!__is_pointer_value(false, dst_reg))
+		if (!__is_pointer_value(false, false_dst_reg))
 			err = mark_chain_precision(env, insn->dst_reg);
 		if (BPF_SRC(insn->code) == BPF_X && !err &&
-		    !__is_pointer_value(false, src_reg))
+		    !__is_pointer_value(false, false_src_reg))
 			err = mark_chain_precision(env, insn->src_reg);
 		if (err)
 			return err;
@@ -15201,7 +15204,7 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 					       *insn_idx))
 			return -EFAULT;
 		if (env->log.level & BPF_LOG_LEVEL)
-			print_insn_state(env, this_branch->frame[this_branch->curframe]);
+			print_insn_state(env, false_branch->frame[false_branch->curframe]);
 		*insn_idx += insn->off;
 		return 0;
 	} else if (pred == 0) {
@@ -15215,41 +15218,62 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 					       *insn_idx))
 			return -EFAULT;
 		if (env->log.level & BPF_LOG_LEVEL)
-			print_insn_state(env, this_branch->frame[this_branch->curframe]);
+			print_insn_state(env, false_branch->frame[false_branch->curframe]);
 		return 0;
 	}
 
-	other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx,
-				  false);
-	if (!other_branch)
-		return -EFAULT;
-	other_branch_regs = other_branch->frame[other_branch->curframe]->regs;
+	jmp_target = *insn_idx + insn->off + 1;
+	if (env->insn_aux_data[*insn_idx + 1].dist_to_exit <=
+	    env->insn_aux_data[jmp_target].dist_to_exit) {
+		tmp = push_stack(env, jmp_target, *insn_idx, false);
+		if (!tmp)
+			return -EFAULT;
+		true_branch = tmp;
+		false_branch = env->cur_state;
+	} else {
+		tmp = push_stack(env, *insn_idx + 1, *insn_idx, false);
+		if (!tmp)
+			return -EFAULT;
+		*insn_idx = jmp_target - 1;
+		true_branch = env->cur_state;
+		false_branch = tmp;
+	}
+	/* true_branch = push_stack(env, jmp_target, *insn_idx, false); */
+	/* if (!true_branch) */
+	/* 	return -EFAULT; */
+
+	true_branch_regs = true_branch->frame[true_branch->curframe]->regs;
+	true_dst_reg = &true_branch_regs[insn->dst_reg];
+	true_src_reg = &true_branch_regs[insn->src_reg];
+
+	false_branch_regs = false_branch->frame[false_branch->curframe]->regs;
+	false_dst_reg = &false_branch_regs[insn->dst_reg];
+	if (false_src_reg != &fake_reg)
+		false_src_reg = &false_branch_regs[insn->src_reg];
 
 	if (BPF_SRC(insn->code) == BPF_X) {
-		err = reg_set_min_max(env,
-				      &other_branch_regs[insn->dst_reg],
-				      &other_branch_regs[insn->src_reg],
-				      dst_reg, src_reg, opcode, is_jmp32);
+		err = reg_set_min_max(env, true_dst_reg, true_src_reg,
+				      false_dst_reg, false_src_reg, opcode, is_jmp32);
 	} else /* BPF_SRC(insn->code) == BPF_K */ {
 		err = reg_set_min_max(env,
-				      &other_branch_regs[insn->dst_reg],
-				      src_reg /* fake one */,
-				      dst_reg, src_reg /* same fake one */,
+				      true_dst_reg,
+				      false_src_reg /* fake one */,
+				      false_dst_reg, false_src_reg /* same fake one */,
 				      opcode, is_jmp32);
 	}
 	if (err)
 		return err;
 
 	if (BPF_SRC(insn->code) == BPF_X &&
-	    src_reg->type == SCALAR_VALUE && src_reg->id &&
-	    !WARN_ON_ONCE(src_reg->id != other_branch_regs[insn->src_reg].id)) {
-		find_equal_scalars(this_branch, src_reg);
-		find_equal_scalars(other_branch, &other_branch_regs[insn->src_reg]);
+	    false_src_reg->type == SCALAR_VALUE && false_src_reg->id &&
+	    !WARN_ON_ONCE(false_src_reg->id != true_src_reg->id)) {
+		find_equal_scalars(false_branch, false_src_reg);
+		find_equal_scalars(true_branch, true_src_reg);
 	}
-	if (dst_reg->type == SCALAR_VALUE && dst_reg->id &&
-	    !WARN_ON_ONCE(dst_reg->id != other_branch_regs[insn->dst_reg].id)) {
-		find_equal_scalars(this_branch, dst_reg);
-		find_equal_scalars(other_branch, &other_branch_regs[insn->dst_reg]);
+	if (false_dst_reg->type == SCALAR_VALUE && false_dst_reg->id &&
+	    !WARN_ON_ONCE(false_dst_reg->id != true_dst_reg->id)) {
+		find_equal_scalars(false_branch, false_dst_reg);
+		find_equal_scalars(true_branch, true_dst_reg);
 	}
 
 	/* if one pointer register is compared to another pointer
@@ -15265,24 +15289,24 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	 * only propagate nullness when neither reg is that type.
 	 */
 	if (!is_jmp32 && BPF_SRC(insn->code) == BPF_X &&
-	    __is_pointer_value(false, src_reg) && __is_pointer_value(false, dst_reg) &&
-	    type_may_be_null(src_reg->type) != type_may_be_null(dst_reg->type) &&
-	    base_type(src_reg->type) != PTR_TO_BTF_ID &&
-	    base_type(dst_reg->type) != PTR_TO_BTF_ID) {
+	    __is_pointer_value(false, false_src_reg) && __is_pointer_value(false, false_dst_reg) &&
+	    type_may_be_null(false_src_reg->type) != type_may_be_null(false_dst_reg->type) &&
+	    base_type(false_src_reg->type) != PTR_TO_BTF_ID &&
+	    base_type(false_dst_reg->type) != PTR_TO_BTF_ID) {
 		eq_branch_regs = NULL;
 		switch (opcode) {
 		case BPF_JEQ:
-			eq_branch_regs = other_branch_regs;
+			eq_branch_regs = true_branch_regs;
 			break;
 		case BPF_JNE:
-			eq_branch_regs = regs;
+			eq_branch_regs = false_branch_regs;
 			break;
 		default:
 			/* do nothing */
 			break;
 		}
 		if (eq_branch_regs) {
-			if (type_may_be_null(src_reg->type))
+			if (type_may_be_null(false_src_reg->type))
 				mark_ptr_not_null_reg(&eq_branch_regs[insn->src_reg]);
 			else
 				mark_ptr_not_null_reg(&eq_branch_regs[insn->dst_reg]);
@@ -15295,23 +15319,23 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	 */
 	if (!is_jmp32 && BPF_SRC(insn->code) == BPF_K &&
 	    insn->imm == 0 && (opcode == BPF_JEQ || opcode == BPF_JNE) &&
-	    type_may_be_null(dst_reg->type)) {
+	    type_may_be_null(false_dst_reg->type)) {
 		/* Mark all identical registers in each branch as either
 		 * safe or unknown depending R == 0 or R != 0 conditional.
 		 */
-		mark_ptr_or_null_regs(this_branch, insn->dst_reg,
+		mark_ptr_or_null_regs(false_branch, insn->dst_reg,
 				      opcode == BPF_JNE);
-		mark_ptr_or_null_regs(other_branch, insn->dst_reg,
+		mark_ptr_or_null_regs(true_branch, insn->dst_reg,
 				      opcode == BPF_JEQ);
-	} else if (!try_match_pkt_pointers(insn, dst_reg, &regs[insn->src_reg],
-					   this_branch, other_branch) &&
+	} else if (!try_match_pkt_pointers(insn, false_dst_reg, false_src_reg,
+					   false_branch, true_branch) &&
 		   is_pointer_value(env, insn->dst_reg)) {
 		verbose(env, "R%d pointer comparison prohibited\n",
 			insn->dst_reg);
 		return -EACCES;
 	}
 	if (env->log.level & BPF_LOG_LEVEL)
-		print_insn_state(env, this_branch->frame[this_branch->curframe]);
+		print_insn_state(env, false_branch->frame[false_branch->curframe]);
 	return 0;
 }
 
@@ -16030,6 +16054,374 @@ err_free:
 	kvfree(insn_stack);
 	env->cfg.insn_state = env->cfg.insn_stack = NULL;
 	return ret;
+}
+
+static bool can_fallthrough(struct bpf_insn *insn)
+{
+	__u8 class = BPF_CLASS(insn->code);
+	__u8 opcode = BPF_OP(insn->code);
+
+	if (class != BPF_JMP && class != BPF_JMP32)
+		return true;
+
+	if (opcode == BPF_EXIT || opcode == BPF_JA)
+		return false;
+
+	return true;
+}
+
+static bool can_jump(struct bpf_insn *insn)
+{
+	__u8 class = BPF_CLASS(insn->code);
+	__u8 opcode = BPF_OP(insn->code);
+
+	if (class != BPF_JMP && class != BPF_JMP32)
+		return false;
+
+	switch (opcode) {
+	case BPF_JA:
+	case BPF_JEQ:
+	case BPF_JNE:
+	case BPF_JLT:
+	case BPF_JLE:
+	case BPF_JGT:
+	case BPF_JGE:
+	case BPF_JSGT:
+	case BPF_JSGE:
+	case BPF_JSLT:
+	case BPF_JSLE:
+		return true;
+	}
+
+	return false;
+}
+
+struct ibb {
+	struct bpf_insn *insns;
+	int *predecessors;
+	int insns_cnt;
+	int predecessors_cnt;
+};
+
+struct icfg {
+	struct ibb *bbs;
+	int *predecessors;
+	int bb_cnt;
+};
+
+static int insn_successors(struct bpf_prog *prog, __u32 id, __u32 succ[2])
+{
+	struct bpf_insn *insn = &prog->insnsi[id];
+	int i = 0;
+
+	succ[0] = prog->len;
+	succ[1] = prog->len;
+
+	if (can_fallthrough(insn) && id + 1 < prog->len)
+		succ[i++] = id + 1;
+
+	if (can_jump(insn)) {
+		__u32 dst = id + insn->off + 1;
+		if (i == 0 || succ[0] != dst)
+			succ[i++] = dst;
+	}
+
+	return i;
+}
+
+static struct icfg *alloc_cfg(int bb_cnt, int total_predecessors)
+{
+	int bbs_off, predecessors_off;
+	int total = 0;
+	total = sizeof(struct icfg);
+	bbs_off = total;
+	total += bb_cnt * sizeof(struct ibb);
+	total += sizeof(void *) - total % sizeof(void *);
+	predecessors_off = total;
+	total += total_predecessors * sizeof(int);
+	void *mem = kvcalloc(total, 1, GFP_KERNEL | __GFP_NOWARN);
+	if (!mem)
+		return NULL;
+	struct icfg *cfg = mem;
+	cfg->bbs = mem + bbs_off;
+	cfg->bb_cnt = bb_cnt;
+	cfg->predecessors = mem + predecessors_off;
+	return cfg;
+}
+
+static struct icfg *build_cfg(struct bpf_prog *prog)
+{
+	int *entry_edges_cnt = NULL;
+	struct icfg *cfg = NULL;
+	struct ibb **insn2bb = NULL;
+	__u8 *bb_marks = NULL;
+	int bb_cnt;
+	int total_predecessors = 0;
+        __u32 succ[2];
+
+	entry_edges_cnt = kvcalloc(prog->len, sizeof(*entry_edges_cnt), GFP_KERNEL | __GFP_NOWARN);
+	insn2bb = kvcalloc(prog->len, sizeof(struct ibb *), GFP_KERNEL | __GFP_NOWARN);
+	bb_marks = kvcalloc(prog->len, sizeof(*bb_marks), GFP_KERNEL | __GFP_NOWARN);
+	if (!entry_edges_cnt || !insn2bb)
+		goto out;
+
+        if (prog->len)
+		bb_marks[0] = 1;
+	for (int i = 0; i < prog->len; ++i) {
+		if (can_jump(&prog->insnsi[i])) {
+			int succ_cnt = insn_successors(prog, i, succ);
+			for (int j = 0; j < succ_cnt; ++j)
+				bb_marks[succ[j]] = 1;
+		}
+		if (i > 0 && !can_fallthrough(&prog->insnsi[i - 1]))
+			bb_marks[i] = 1;
+	}
+	for (int i = 0; i < prog->len; ++i) {
+		int succ_cnt = insn_successors(prog, i, succ);
+		for (int j = 0; j < succ_cnt; ++j)
+			if (bb_marks[succ[j]])
+				entry_edges_cnt[succ[j]] += 1;
+	}
+
+	bb_cnt = 0;
+	for (int i = 0; i < prog->len; ++i) {
+		if (bb_marks[i])
+			bb_cnt += 1;
+		total_predecessors += entry_edges_cnt[i];
+	}
+	cfg = alloc_cfg(bb_cnt, total_predecessors);
+	if (!cfg)
+		goto out;
+
+	struct ibb *bb = cfg->bbs;
+	int *predecessors = cfg->predecessors;
+	int i;
+	for (i = 0; i < prog->len; ++i) {
+		if (!bb_marks[i])
+			continue;
+		if (i != 0) {
+			bb->insns_cnt = &prog->insnsi[i] - bb->insns;
+			//printk("build_cfg: #1 bb->insns_cnt=%d\n", bb->insns_cnt);
+			bb += 1;
+		}
+		insn2bb[i] = bb;
+		bb->insns = &prog->insnsi[i];
+		bb->predecessors = predecessors;
+		predecessors += entry_edges_cnt[i];
+	}
+	if (i > 0) {
+		bb->insns_cnt = &prog->insnsi[i] - bb->insns;
+		//printk("build_cfg: #2 bb->insns_cnt=%d\n", bb->insns_cnt);
+	}
+
+	for (i = 0; i < cfg->bb_cnt; ++i) {
+		struct ibb *bb = &cfg->bbs[i];
+		if (!bb->insns_cnt)
+			continue;
+		int last_insn_idx = &bb->insns[bb->insns_cnt - 1] - prog->insnsi;
+		int succ_cnt = insn_successors(prog, last_insn_idx, succ);
+		for (int j = 0; j < succ_cnt; ++j) {
+			struct ibb *succ_bb = insn2bb[succ[j]];
+			succ_bb->predecessors[succ_bb->predecessors_cnt++] = i;
+		}
+	}
+
+out:
+	kvfree(entry_edges_cnt);
+	kvfree(bb_marks);
+	kvfree(insn2bb);
+	return cfg;
+}
+
+struct heap_entry {
+	int priority;
+	int value;
+};
+
+struct heap {
+	int capacity;
+	int count;
+	struct heap_entry *elements;
+};
+
+static int heap_init(struct heap *heap, int capacity)
+{
+	struct heap_entry *elements = realloc_array(NULL, 0, capacity, sizeof(*elements));
+
+	if (!elements)
+		return -ENOMEM;
+	heap->capacity = capacity;
+	heap->count = 0;
+	heap->elements = elements;
+	return 0;
+}
+
+static void heap_free(struct heap *heap)
+{
+	kvfree(heap->elements);
+	heap->elements = NULL;
+	heap->capacity = 0;
+	heap->count = 0;
+}
+
+static inline int left_child(int i) { return 2 * i + 1; }
+static inline int right_child(int i) { return 2 * i + 2; }
+static inline int parent(int i) { return (i - 1) / 2; }
+
+static inline int compare(struct heap_entry a, struct heap_entry b)
+{
+	int diff;
+
+	if ((diff = a.priority - b.priority) || (diff = a.value - b.value))
+		return diff;
+
+	return 0;
+}
+
+static void bubble_up(struct heap *heap, int i)
+{
+	struct heap_entry *elements = heap->elements;
+
+	while (i != 0 && compare(elements[parent(i)], elements[i]) > 0) {
+		swap(elements[i], elements[parent(i)]);
+		i = parent(i);
+	}
+}
+
+static int heap_push(struct heap *heap, struct heap_entry elt)
+{
+	if (heap->count == heap->capacity) {
+		void *mem = realloc_array(heap->elements, heap->capacity, heap->capacity * 2, sizeof(*heap->elements));
+		if (!mem)
+			return -ENOMEM;
+
+		heap->elements = mem;
+		heap->capacity *= 2;
+	}
+
+	struct heap_entry *elements = heap->elements;
+	int i = heap->count;
+	elements[i] = elt;
+	heap->count++;
+	bubble_up(heap, i);
+	return 0;
+}
+
+static void sink_root(struct heap *heap)
+{
+	struct heap_entry *elements = heap->elements;
+	int i = 0;
+
+	while ((left_child(i)  < heap->count && compare(elements[i], elements[left_child(i)]) > 0) ||
+	       (right_child(i) < heap->count && compare(elements[i], elements[right_child(i)]) > 0)) {
+		if (right_child(i) >= heap->count || compare(elements[right_child(i)], elements[left_child(i)]) > 0) {
+			swap(elements[i], elements[left_child(i)]);
+			i = left_child(i);
+		} else {
+			swap(elements[i], elements[right_child(i)]);
+			i = right_child(i);
+		}
+	}
+}
+
+static int heap_pop(struct heap *heap, struct heap_entry *elt)
+{
+	if (heap->count == 0)
+		return -ESRCH;
+
+	struct heap_entry *elements = heap->elements;
+	if (elt)
+		*elt = elements[0];
+	elements[0] = elements[heap->count - 1];
+	--heap->count;
+	if (heap->count == 0)
+		return 0;
+
+	sink_root(heap);
+	return 0;
+}
+
+static bool is_exit(struct bpf_insn *insn)
+{
+	return BPF_OP(insn->code) == BPF_EXIT;
+}
+
+static int *compute_distance_to_exit(struct icfg *cfg)
+{
+	struct heap heap = {};
+	int *dist = NULL;
+	int err;
+
+	err = heap_init(&heap, cfg->bb_cnt);
+	if (err)
+		goto out;
+
+	dist = kvcalloc(cfg->bb_cnt, sizeof(*dist), GFP_KERNEL | __GFP_NOWARN);
+	if (!dist)
+		goto out;
+
+	for (int i = 0; i < cfg->bb_cnt; ++i) {
+		struct ibb *bb = &cfg->bbs[i];
+
+		dist[i] = S32_MAX;
+		//printk("compute_distance_to_exit: i=%d, bb->insns_cnt=%d\n", i, bb->insns_cnt);
+		if (bb->insns_cnt > 0 && is_exit(&bb->insns[bb->insns_cnt - 1])) {
+			dist[i] = 0;
+			heap_push(&heap, (struct heap_entry){ dist[i], i });
+		}
+	}
+
+	struct heap_entry elt;
+	while (heap_pop(&heap, &elt) == 0) {
+		struct ibb *bb = &cfg->bbs[elt.value];
+
+		if (dist[elt.value] < elt.priority)
+			continue;
+
+		for (int i = 0; i < bb->predecessors_cnt; ++i) {
+			int pred = bb->predecessors[i];
+			int d = dist[elt.value] + 1;
+
+			if (d >= dist[pred])
+				continue;
+
+			dist[pred] = d;
+			heap_push(&heap, (struct heap_entry){ d, pred });
+		}
+	}
+
+out:
+	heap_free(&heap);
+	return dist;
+}
+
+static int mark_distance_to_exit(struct bpf_verifier_env *env)
+{
+	struct icfg *cfg = NULL;
+	int *dist = NULL;
+	int i = 0;
+
+	cfg = build_cfg(env->prog);
+	if (!cfg)
+		return -EINVAL;
+
+	dist = compute_distance_to_exit(cfg);
+	if (!dist) {
+		kvfree(cfg);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < cfg->bb_cnt; ++i) {
+		struct ibb *bb = &cfg->bbs[i];
+		int idx = bb->insns - env->prog->insnsi;
+
+		//printk("__mark_distance_to_exit(start=%d, len=%d): idx=%d, i=%d\n", start, len, idx, i);
+		env->insn_aux_data[idx].dist_to_exit = dist[i];
+	}
+
+	kvfree(cfg);
+	kvfree(dist);
+	return 0;
 }
 
 static int check_abnormal_return(struct bpf_verifier_env *env)
@@ -21590,6 +21982,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	}
 
 	ret = check_cfg(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = mark_distance_to_exit(env);
 	if (ret < 0)
 		goto skip_full_check;
 
