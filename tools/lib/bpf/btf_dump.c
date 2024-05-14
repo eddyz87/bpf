@@ -93,7 +93,7 @@ struct btf_dump {
 	size_t cached_names_cap;
 
 	/* topo-sorted list of dependent type definitions */
-	__u32 *emit_queue;
+	struct btf_dump_emit_queue_item *emit_queue;
 	int emit_queue_cap;
 	int emit_queue_cnt;
 
@@ -256,7 +256,7 @@ void btf_dump__free(struct btf_dump *d)
 }
 
 static int btf_dump_order_type(struct btf_dump *d, __u32 id, bool through_ptr);
-static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id);
+static int btf_dump_finalize_emit_queue(struct btf_dump *d);
 
 /*
  * Dump BTF type in a compilable C syntax, including all the necessary
@@ -290,10 +290,44 @@ int btf_dump__dump_type(struct btf_dump *d, __u32 id)
 	if (err < 0)
 		return libbpf_err(err);
 
-	for (i = 0; i < d->emit_queue_cnt; i++)
-		btf_dump_emit_type(d, d->emit_queue[i], 0 /*top-level*/);
+	err = btf_dump_finalize_emit_queue(d);
+	if (err < 0)
+		return libbpf_err(err);
+
+	for (i = 0; i < d->emit_queue_cnt; i++) {
+		err = btf_dump__dump_one_type(d, d->emit_queue[i].id, d->emit_queue[i].fwd);
+		if (err < 0)
+			return err;
+		if (err > 0)
+			btf_dump_printf(d, ";\n\n");
+	}
 
 	return 0;
+}
+
+int btf_dump__order_type(struct btf_dump *d, __u32 id)
+{
+	int err;
+
+	err = btf_dump_order_type(d, id, false);
+	if (err < 0)
+		return err;
+	return 0;
+}
+
+struct btf_dump_emit_queue_item *btf_dump__emit_queue(struct btf_dump *d)
+{
+	int err;
+
+	err = btf_dump_finalize_emit_queue(d);
+	if (err < 0)
+		return libbpf_err_ptr(err);
+	return d->emit_queue;
+}
+
+__u32 btf_dump__emit_queue_cnt(struct btf_dump *d)
+{
+	return d->emit_queue_cnt;
 }
 
 /*
@@ -374,9 +408,9 @@ static int btf_dump_mark_referenced(struct btf_dump *d)
 	return 0;
 }
 
-static int btf_dump_add_emit_queue_id(struct btf_dump *d, __u32 id)
+static int __btf_dump_add_emit_queue_id(struct btf_dump *d, __u32 id, bool fwd)
 {
-	__u32 *new_queue;
+	struct btf_dump_emit_queue_item *new_queue = NULL;
 	size_t new_cap;
 
 	if (d->emit_queue_cnt >= d->emit_queue_cap) {
@@ -388,8 +422,26 @@ static int btf_dump_add_emit_queue_id(struct btf_dump *d, __u32 id)
 		d->emit_queue_cap = new_cap;
 	}
 
-	d->emit_queue[d->emit_queue_cnt++] = id;
+	d->emit_queue[d->emit_queue_cnt].id = id;
+	d->emit_queue[d->emit_queue_cnt].fwd = fwd;
+	d->emit_queue_cnt++;
 	return 0;
+}
+
+static int btf_dump_add_emit_queue_id(struct btf_dump *d, __u32 id)
+{
+	return __btf_dump_add_emit_queue_id(d, id, false);
+}
+
+static int btf_dump_add_emit_queue_fwd(struct btf_dump *d, __u32 id)
+{
+	struct btf_dump_type_aux_state *tstate = &d->type_states[id];
+
+	if (tstate->fwd_emitted)
+		return 0;
+
+	tstate->fwd_emitted = 1;
+	return __btf_dump_add_emit_queue_id(d, id, true);
 }
 
 /*
@@ -613,8 +665,8 @@ static int btf_dump_order_type(struct btf_dump *d, __u32 id, bool through_ptr)
 	}
 }
 
-static void btf_dump_emit_missing_aliases(struct btf_dump *d, __u32 id,
-					  const struct btf_type *t);
+static bool btf_dump_is_missing_alias(struct btf_dump *d, __u32 id);
+static bool btf_dump_emit_missing_aliases(struct btf_dump *d, __u32 id);
 
 static void btf_dump_emit_struct_fwd(struct btf_dump *d, __u32 id,
 				     const struct btf_type *t);
@@ -665,39 +717,28 @@ static bool btf_dump_is_blacklisted(struct btf_dump *d, __u32 id)
 }
 
 /*
- * Emit C-syntax definitions of types from chains of BTF types.
- *
- * High-level handling of determining necessary forward declarations are handled
- * by btf_dump_emit_type() itself, but all nitty-gritty details of emitting type
- * declarations/definitions in C syntax  are handled by a combo of
- * btf_dump_emit_type_decl()/btf_dump_emit_type_chain() w/ delegation to
- * corresponding btf_dump_emit_*_{def,fwd}() functions.
- *
- * We also keep track of "containing struct/union type ID" to determine when
+ * Rebuild emit queue to include necessary forward declarations.
+ * Keep track of "containing struct/union type ID" to determine when
  * we reference it from inside and thus can avoid emitting unnecessary forward
  * declaration.
- *
- * This algorithm is designed in such a way, that even if some error occurs
- * (either technical, e.g., out of memory, or logical, i.e., malformed BTF
- * that doesn't comply to C rules completely), algorithm will try to proceed
- * and produce as much meaningful output as possible.
  */
-static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
+static int btf_dump_add_fwd_decls(struct btf_dump *d, __u32 id, __u32 cont_id)
 {
 	struct btf_dump_type_aux_state *tstate = &d->type_states[id];
 	bool top_level_def = cont_id == 0;
 	const struct btf_type *t;
 	__u16 kind;
+	int err;
 
 	if (tstate->emit_state == EMITTED)
-		return;
+		return 0;
 
 	t = btf__type_by_id(d->btf, id);
 	kind = btf_kind(t);
 
 	if (tstate->emit_state == EMITTING) {
 		if (tstate->fwd_emitted)
-			return;
+			return 0;
 
 		switch (kind) {
 		case BTF_KIND_STRUCT:
@@ -707,47 +748,44 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 			 * part of - then no need for fwd declaration
 			 */
 			if (id == cont_id)
-				return;
+				return 0;
 			if (t->name_off == 0) {
 				pr_warn("anonymous struct/union loop, id:[%u]\n",
 					id);
-				return;
+				return -EINVAL;
 			}
-			btf_dump_emit_struct_fwd(d, id, t);
-			btf_dump_printf(d, ";\n\n");
-			tstate->fwd_emitted = 1;
-			break;
+			return btf_dump_add_emit_queue_fwd(d, id);
 		case BTF_KIND_TYPEDEF:
 			/*
 			 * for typedef fwd_emitted means typedef definition
 			 * was emitted, but it can be used only for "weak"
 			 * references through pointer only, not for embedding
 			 */
-			if (!btf_dump_is_blacklisted(d, id)) {
-				btf_dump_emit_typedef_def(d, id, t, 0);
-				btf_dump_printf(d, ";\n\n");
-			}
-			tstate->fwd_emitted = 1;
+			if (!btf_dump_is_blacklisted(d, id))
+				return btf_dump_add_emit_queue_id(d, id);
 			break;
 		default:
 			break;
 		}
 
-		return;
+		return 0;
 	}
 
 	switch (kind) {
 	case BTF_KIND_INT:
-		/* Emit type alias definitions if necessary */
-		btf_dump_emit_missing_aliases(d, id, t);
-
+		if (btf_dump_is_missing_alias(d, id)) {
+			err = btf_dump_add_emit_queue_id(d, id);
+			if (err)
+				return err;
+		}
 		tstate->emit_state = EMITTED;
 		break;
 	case BTF_KIND_ENUM:
 	case BTF_KIND_ENUM64:
 		if (top_level_def) {
-			btf_dump_emit_enum_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n\n");
+			err = btf_dump_add_emit_queue_id(d, id);
+			if (err)
+				return err;
 		}
 		tstate->emit_state = EMITTED;
 		break;
@@ -756,30 +794,20 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 	case BTF_KIND_CONST:
 	case BTF_KIND_RESTRICT:
 	case BTF_KIND_TYPE_TAG:
-		btf_dump_emit_type(d, t->type, cont_id);
+		btf_dump_add_fwd_decls(d, t->type, cont_id);
 		break;
 	case BTF_KIND_ARRAY:
-		btf_dump_emit_type(d, btf_array(t)->type, cont_id);
+		btf_dump_add_fwd_decls(d, btf_array(t)->type, cont_id);
 		break;
 	case BTF_KIND_FWD:
-		btf_dump_emit_fwd_def(d, id, t);
-		btf_dump_printf(d, ";\n\n");
+		btf_dump_add_emit_queue_id(d, id);
 		tstate->emit_state = EMITTED;
 		break;
 	case BTF_KIND_TYPEDEF:
 		tstate->emit_state = EMITTING;
-		btf_dump_emit_type(d, t->type, id);
-		/*
-		 * typedef can server as both definition and forward
-		 * declaration; at this stage someone depends on
-		 * typedef as a forward declaration (refers to it
-		 * through pointer), so unless we already did it,
-		 * emit typedef as a forward declaration
-		 */
-		if (!tstate->fwd_emitted && !btf_dump_is_blacklisted(d, id)) {
-			btf_dump_emit_typedef_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n\n");
-		}
+		btf_dump_add_fwd_decls(d, t->type, id);
+		if (!tstate->fwd_emitted && !btf_dump_is_blacklisted(d, id))
+			btf_dump_add_emit_queue_id(d, id);
 		tstate->emit_state = EMITTED;
 		break;
 	case BTF_KIND_STRUCT:
@@ -799,16 +827,17 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 
 			new_cont_id = t->name_off == 0 ? cont_id : id;
 			for (i = 0; i < vlen; i++, m++)
-				btf_dump_emit_type(d, m->type, new_cont_id);
+				btf_dump_add_fwd_decls(d, m->type, new_cont_id);
 		} else if (!tstate->fwd_emitted && id != cont_id) {
-			btf_dump_emit_struct_fwd(d, id, t);
-			btf_dump_printf(d, ";\n\n");
-			tstate->fwd_emitted = 1;
+			err = btf_dump_add_emit_queue_fwd(d, id);
+			if (err < 0)
+				return err;
 		}
 
 		if (top_level_def) {
-			btf_dump_emit_struct_def(d, id, t, 0);
-			btf_dump_printf(d, ";\n\n");
+			err = btf_dump_add_emit_queue_id(d, id);
+			if (err < 0)
+				return err;
 			tstate->emit_state = EMITTED;
 		} else {
 			tstate->emit_state = NOT_EMITTED;
@@ -819,14 +848,109 @@ static void btf_dump_emit_type(struct btf_dump *d, __u32 id, __u32 cont_id)
 		__u16 n = btf_vlen(t);
 		int i;
 
-		btf_dump_emit_type(d, t->type, cont_id);
+		btf_dump_add_fwd_decls(d, t->type, cont_id);
 		for (i = 0; i < n; i++, p++)
-			btf_dump_emit_type(d, p->type, cont_id);
+			btf_dump_add_fwd_decls(d, p->type, cont_id);
 
 		break;
 	}
 	default:
 		break;
+	}
+
+	return 0;
+};
+
+static int btf_dump_finalize_emit_queue(struct btf_dump *d)
+{
+	struct btf_dump_emit_queue_item *item, *initial_queue = d->emit_queue;
+	int initial_queue_cnt = d->emit_queue_cnt;
+	int i, err = 0;
+
+	d->emit_queue = NULL;
+	d->emit_queue_cnt = 0;
+	d->emit_queue_cap = 0;
+
+	for (i = 0; i < initial_queue_cnt; ++i) {
+		item = &initial_queue[i];
+		if (item->fwd)
+			continue;
+
+		err = btf_dump_add_fwd_decls(d, item->id, 0);
+		if (err < 0)
+			goto out;
+	}
+
+out:
+	free(initial_queue);
+	return err;
+}
+
+/*
+ * Emit C-syntax definitions of types from chains of BTF types.
+ *
+ * All nitty-gritty details of emitting type
+ * declarations/definitions in C syntax  are handled by a combo of
+ * btf_dump_emit_type_decl()/btf_dump_emit_type_chain() w/ delegation to
+ * corresponding btf_dump_emit_*_{def,fwd}() functions.
+ *
+ * This algorithm is designed in such a way, that even if some error occurs
+ * (either technical, e.g., out of memory, or logical, i.e., malformed BTF
+ * that doesn't comply to C rules completely), algorithm will try to proceed
+ * and produce as much meaningful output as possible.
+ */
+int btf_dump__dump_one_type(struct btf_dump *d, __u32 id, bool fwd)
+{
+	const struct btf_type *t;
+	__u16 kind;
+
+	t = btf__type_by_id(d->btf, id);
+	kind = btf_kind(t);
+
+	if (fwd) {
+		switch (kind) {
+		case BTF_KIND_STRUCT:
+		case BTF_KIND_UNION:
+			btf_dump_emit_struct_fwd(d, id, t);
+			return 1;
+		case BTF_KIND_TYPEDEF:
+			btf_dump_emit_typedef_def(d, id, t, 0);
+			return 1;
+		default:
+			return 0;
+		}
+	}
+
+	switch (kind) {
+	case BTF_KIND_INT:
+		/* Emit type alias definitions if necessary */
+		return btf_dump_emit_missing_aliases(d, id);
+	case BTF_KIND_ENUM:
+	case BTF_KIND_ENUM64:
+		btf_dump_emit_enum_def(d, id, t, 0);
+		return 1;
+	case BTF_KIND_FWD:
+		btf_dump_emit_fwd_def(d, id, t);
+		return 1;
+	case BTF_KIND_TYPEDEF:
+		/*
+		 * typedef can server as both definition and forward
+		 * declaration; at this stage someone depends on
+		 * typedef as a forward declaration (refers to it
+		 * through pointer), so unless we already did it,
+		 * emit typedef as a forward declaration
+		 */
+		if (btf_dump_is_blacklisted(d, id))
+			return 0;
+
+		btf_dump_emit_typedef_def(d, id, t, 0);
+		return 1;
+	case BTF_KIND_STRUCT:
+	case BTF_KIND_UNION:
+		btf_dump_emit_struct_def(d, id, t, 0);
+		return 1;
+	default:
+		return 0;
 	}
 }
 
@@ -1037,19 +1161,36 @@ static const char *missing_base_types[][2] = {
 	{ "__Poly128_t",	"unsigned __int128" },
 };
 
-static void btf_dump_emit_missing_aliases(struct btf_dump *d, __u32 id,
-					  const struct btf_type *t)
+static int btf_dump_missing_alias_idx(struct btf_dump *d, __u32 id)
 {
 	const char *name = btf_dump_type_name(d, id);
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(missing_base_types); i++) {
-		if (strcmp(name, missing_base_types[i][0]) == 0) {
-			btf_dump_printf(d, "typedef %s %s;\n\n",
-					missing_base_types[i][1], name);
-			break;
-		}
+		if (strcmp(name, missing_base_types[i][0]) == 0)
+			return i;
 	}
+
+	return -1;
+}
+
+static bool btf_dump_is_missing_alias(struct btf_dump *d, __u32 id)
+{
+	return btf_dump_missing_alias_idx(d, id) >= 0;
+}
+
+static bool btf_dump_emit_missing_aliases(struct btf_dump *d, __u32 id)
+{
+	const char *name = btf_dump_type_name(d, id);
+	int i;
+
+	i = btf_dump_missing_alias_idx(d, id);
+	if (i < 0)
+		return false;
+
+	btf_dump_printf(d, "typedef %s %s;\n\n",
+			missing_base_types[i][1], name);
+	return true;
 }
 
 static void btf_dump_emit_enum_fwd(struct btf_dump *d, __u32 id,
