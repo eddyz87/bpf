@@ -285,6 +285,80 @@ LIBBPF_API void btf_dump__free(struct btf_dump *d);
 
 LIBBPF_API int btf_dump__dump_type(struct btf_dump *d, __u32 id);
 
+struct btf_dump_emit_type_opts {
+	size_t sz;
+	/** omit full definition, print forward declaration instead */
+	bool fwd;
+	size_t :0;
+};
+#define	btf_dump_emit_type_opts__last_field fwd
+
+/**
+ * @brief prints either a full definition or a forward declaration
+ * of type **id** in C language syntax.
+ *
+ * Does not print semicolon at the end (thus allowing to add some
+ * attributes after the definition). Some of the types might be
+ * non-printable, return value indicates if something was printed.
+ *
+ * @return
+ * - >0 if type is printable;
+ * -  0 if type is non-printable;
+ * - <0 upon error
+ */
+LIBBPF_API int btf_dump__emit_type_def(struct btf_dump *d, __u32 id,
+				       struct btf_dump_emit_type_opts *opts);
+
+enum btf_dump_emit_flags {
+	/**
+	 * when set, indicates that dump queue item represents a
+	 * forward declaration, otherwise it is a full definition.
+	 */
+	BTF_DUMP_FWD_DECL = 0x1,
+};
+
+/**
+ * @brief represents a single entry of the btf_dump emit queue.
+ *
+ * **btf_dump** tracks a list of types that should be dumped,
+ * these types are sorted in topological order satisfying
+ * C language semantics:
+ * - if type A includes type B (e.g. A is a struct with a field of type B),
+ *   then B comes before A;
+ * - if type A references type B via a pointer
+ *   (e.g. A is a struct with a field of type pointer to B),
+ *   then B's forward declaration comes before A.
+ *
+ * **btf_dump_queue_item** is used for elements of this queue.
+ */
+struct btf_dump_queue_item {
+	/** BTF id of the type to be printed */
+	__u32 id;
+	/** a bit mask of values of type **enum btf_dump_emit_flags** */
+	__u32 flags;
+};
+
+/**
+ * @brief adds type specified by **id** and its dependencies to the
+ * emit queue of **d**.
+ *
+ * @return 0 on success, <0 on error
+ */
+LIBBPF_API int btf_dump__order_type(struct btf_dump *d, __u32 id);
+
+/**
+ * Provides access to the emit queue currently accumulated in **d**.
+ *
+ * @param d dump object owning the emit queue.
+ * @param cnt
+ * out parameter set to the current length of the emit queue.
+ *
+ * @return a pointer to the queue owned by **d**, the pointer should
+ * not be freed explicitly. The pointer might be invalidated by calls
+ * to **btf_dump__order_type()**.
+ */
+LIBBPF_API struct btf_dump_queue_item *btf_dump__get_emit_queue(struct btf_dump *d, __u32 *cnt);
+
 struct btf_dump_emit_type_decl_opts {
 	/* size of this struct, for forward/backward compatiblity */
 	size_t sz;
