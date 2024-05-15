@@ -255,6 +255,93 @@ err_out:
 	btf__free(btf);
 }
 
+static void test_btf_dump_emit_queue(void)
+{
+	LIBBPF_OPTS(btf_dump_emit_type_opts, opts);
+	struct btf_dump_queue_item *items;
+	struct btf_dump *d = NULL;
+	struct btf *btf = NULL;
+	u32 union_simple, cnt;
+	int err, i;
+
+	btf = btf__parse_elf("btf_dump_test_case_syntax.bpf.o", NULL);
+	if (!ASSERT_OK_PTR(btf, "btf_parse_elf")) {
+		err = -PTR_ERR(btf);
+		btf = NULL;
+		goto err_out;
+	}
+
+	union_simple = btf__find_by_name_kind(btf, "union_simple", BTF_KIND_UNION);
+	ASSERT_GT(union_simple, 0, "'union_simple' id");
+
+	dump_buf_file = open_memstream(&dump_buf, &dump_buf_sz);
+	if (!ASSERT_OK_PTR(dump_buf_file, "dump_memstream"))
+		return;
+	d = btf_dump__new(btf, btf_dump_printf, dump_buf_file, NULL);
+	if (!ASSERT_OK(libbpf_get_error(d), "btf_dump__new"))
+		goto err_out;
+
+	err = btf_dump__order_type(d, union_simple);
+	ASSERT_OK(err, "order type 'union_simple'");
+	items = btf_dump__get_emit_queue(d, &cnt);
+	for (i = 1; i < cnt; i++) {
+		opts.fwd = items[i].flags & BTF_DUMP_FWD_DECL;
+		err = btf_dump__emit_type_def(d, items[i].id, &opts);
+		if (err > 0)
+			fprintf(dump_buf_file, ";\n\n");
+	}
+
+	fflush(dump_buf_file);
+	dump_buf[dump_buf_sz] = 0;
+
+	ASSERT_STREQ(dump_buf,
+"union union_empty {};\n"
+"\n"
+"union union_simple {\n"
+"	void *ptr;\n"
+"	int num;\n"
+"	int_t num2;\n"
+"	union union_empty u;\n"
+"};\n\n", "c_dump1");
+
+	btf_dump__free(d);
+	d = btf_dump__new(btf, btf_dump_printf, dump_buf_file, NULL);
+	if (!ASSERT_OK(libbpf_get_error(d), "btf_dump__new")) {
+		d = NULL;
+		goto err_out;
+	}
+	err = btf_dump__order_type(d, union_simple);
+	ASSERT_OK(err, "order type 'union_simple'");
+
+	rewind(dump_buf_file);
+	opts.fwd = true;
+	btf_dump__emit_type_def(d, union_simple, &opts);
+	fflush(dump_buf_file);
+	dump_buf[dump_buf_sz] = 0;
+
+	ASSERT_STREQ(dump_buf, "union union_simple", "c_dump2");
+
+	rewind(dump_buf_file);
+	opts.fwd = false;
+	btf_dump__emit_type_def(d, union_simple, &opts);
+	fflush(dump_buf_file);
+	dump_buf[dump_buf_sz] = 0;
+
+	ASSERT_STREQ(dump_buf,
+"union union_simple {\n"
+"	void *ptr;\n"
+"	int num;\n"
+"	int_t num2;\n"
+"	union union_empty u;\n"
+"}", "c_dump3");
+
+err_out:
+	fclose(dump_buf_file);
+	free(dump_buf);
+	btf_dump__free(d);
+	btf__free(btf);
+}
+
 #define STRSIZE				4096
 
 static void btf_dump_snprintf(void *ctx, const char *fmt, va_list args)
@@ -873,6 +960,8 @@ void test_btf_dump() {
 	}
 	if (test__start_subtest("btf_dump: incremental"))
 		test_btf_dump_incremental();
+	if (test__start_subtest("btf_dump: emit queue"))
+		test_btf_dump_emit_queue();
 
 	btf = libbpf_find_kernel_btf();
 	if (!ASSERT_OK_PTR(btf, "no kernel BTF found"))
