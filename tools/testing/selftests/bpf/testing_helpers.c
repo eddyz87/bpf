@@ -500,3 +500,65 @@ bool is_jit_enabled(void)
 
 	return enabled;
 }
+
+__weak void test__fail(void) {}
+
+/* Compare strings 'a' and 'b':
+ * - if strings are equal, return zero;
+ * - if strings are not equal:
+ *   - return non-zero;
+ *   - when env.verbosity >= VERBOSE_SUPER print 'diff' output
+ *     with strings 'a' and 'b' being 'diff' input.
+ *
+ * The 'pfx' is used for temporary file names and could be NULL.
+ */
+int diff_assert_streq(const char *a, const char *b, const char *pfx)
+{
+	char a_name[64], b_name[64], buf[256];
+	int err = 0, a_fd = -1, b_fd = -1;
+	FILE *diff_out = NULL;
+
+	if (strcmp(a, b) == 0)
+		return 0;
+	PRINT_FAIL("%s: inputs differ\n", pfx);
+	if (!pfx)
+		pfx = "diff_assert_streq";
+	snprintf(a_name, sizeof(a_name), "/tmp/%s_a_XXXXXX", pfx);
+	snprintf(b_name, sizeof(b_name), "/tmp/%s_b_XXXXXX", pfx);
+	a_fd = mkstemp(a_name);
+	if (!ASSERT_GE(a_fd, 0, "diff_assert_streq(mkstemp(a))")) {
+		err = a_fd;
+		goto out;
+	}
+	b_fd = mkstemp(b_name);
+	if (!ASSERT_GE(b_fd, 0, "diff_assert_streq(mkstemp(b))")) {
+		err = b_fd;
+		goto out;
+	}
+	err = dprintf(a_fd, "%s", a);
+	if (!ASSERT_GE(err, 0, "diff_assert_streq(dprintf(a))"))
+		goto out;
+	err = dprintf(b_fd, "%s", b);
+	if (!ASSERT_GE(err, 0, "diff_assert_streq(dprintf(b))"))
+		goto out;
+	snprintf(buf, sizeof(buf), "diff -u '%s' '%s'",
+		 a_name, b_name);
+	/* redirect 'diff' output to the current 'stdout' */
+	diff_out = popen(buf, "r");
+	if (!ASSERT_OK_PTR(diff_out, "popen(diff)"))
+		goto out;
+	while ((err = fread(buf, 1, sizeof(buf), diff_out)) > 0)
+		fwrite(buf, 1, err, stdout);
+	ASSERT_FALSE(ferror(diff_out), "ferror(diff_out)");
+	pclose(diff_out);
+out:
+	if (a_fd >= 0) {
+		close(a_fd);
+		remove(a_name);
+	}
+	if (b_fd >= 0) {
+		close(b_fd);
+		remove(b_name);
+	}
+	return err;
+}
