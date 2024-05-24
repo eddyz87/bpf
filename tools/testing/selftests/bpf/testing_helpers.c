@@ -490,3 +490,56 @@ bool is_jit_enabled(void)
 
 	return enabled;
 }
+
+__weak void test__fail(void) {}
+
+/* Compare strings 'a' and 'b' using 'diff' command.
+ * If strings are equal, no output is produced and zero is returned.
+ * If strings are not equal, 'diff' prints details to stderr,
+ * non-zero error code is returned, current test is marked as failed.
+ * The 'pfx' is used for temporary file names and could be NULL.
+ */
+int diff_assert_streq(const char *a, const char *b, const char *pfx)
+{
+	int err = 0, a_fd = -1, b_fd = -1;
+	char diff_cmd[256];
+	char a_name[64];
+	char b_name[64];
+
+	if (!pfx)
+		pfx = "diff_assert_streq";
+	snprintf(a_name, sizeof(a_name), "/tmp/%s_a_XXXXXX", pfx);
+	snprintf(b_name, sizeof(b_name), "/tmp/%s_b_XXXXXX", pfx);
+	a_fd = mkstemp(a_name);
+	if (!ASSERT_GE(a_fd, 0, "diff_assert_streq(mkstemp(a))")) {
+		err = a_fd;
+		goto out;
+	}
+	b_fd = mkstemp(b_name);
+	if (!ASSERT_GE(b_fd, 0, "diff_assert_streq(mkstemp(b))")) {
+		err = b_fd;
+		goto out;
+	}
+	err = dprintf(a_fd, "%s", a);
+	if (!ASSERT_GE(err, 0, "diff_assert_streq(dprintf(a))"))
+		goto out;
+	err = dprintf(b_fd, "%s", b);
+	if (!ASSERT_GE(err, 0, "diff_assert_streq(dprintf(b))"))
+		goto out;
+	snprintf(diff_cmd, sizeof(diff_cmd), "diff -u '%s' '%s'",
+		 a_name, b_name);
+	err = system(diff_cmd);
+	if (err)
+		PRINT_FAIL("diff command failed: %s\n", diff_cmd);
+
+out:
+	if (a_fd >= 0) {
+		close(a_fd);
+		remove(a_name);
+	}
+	if (b_fd >= 0) {
+		close(b_fd);
+		remove(b_name);
+	}
+	return err;
+}

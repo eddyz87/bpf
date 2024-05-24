@@ -55,5 +55,6 @@ struct bpf_insn;
 int get_xlated_program(int fd_prog, struct bpf_insn **buf, __u32 *cnt);
 int testing_prog_flags(void);
 bool is_jit_enabled(void);
+int diff_assert_streq(const char *a, const char *b, const char *pfx);
 
 #endif /* __TESTING_HELPERS_H */
