@@ -2952,6 +2952,8 @@ bool __weak bpf_jit_inlines_helper_call(s32 imm)
 	return false;
 }
 
+ALLOW_ERROR_INJECTION(bpf_jit_inlines_helper_call, ERRNO);
+
 /* Return TRUE if the JIT backend supports mixing bpf2bpf and tailcalls. */
 bool __weak bpf_jit_supports_subprog_tailcalls(void)
 {
