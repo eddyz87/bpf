@@ -10253,6 +10253,36 @@ static int get_helper_proto(struct bpf_verifier_env *env, int func_id,
 /* Bitmask with 1s for all caller saved registers */
 #define ALL_CALLER_SAVED_REGS ((1u << CALLER_SAVED_REGS) - 1)
 
+/* Return a bitmask specifying which caller saved registers are
+ * modified by a call to a helper.
+ * (Either as a return value or as scratch registers).
+ *
+ * For normal helpers registers R0-R5 are scratched.
+ * For helpers marked as no_csr:
+ * - scratch R0 if function is non-void;
+ * - scratch R1-R5 if corresponding parameter type is set
+ *   in the function prototype.
+ */
+static u8 get_helper_reg_mask(const struct bpf_func_proto *fn)
+{
+	u8 mask;
+	int i;
+
+	if (!fn->no_csr)
+		return ALL_CALLER_SAVED_REGS;
+
+	mask = 0;
+	mask |= fn->ret_type == RET_VOID ? 0 : BIT(BPF_REG_0);
+	for (i = 0; i < ARRAY_SIZE(fn->arg_type); ++i)
+		mask |= fn->arg_type[i] == ARG_DONTCARE ? 0 : BIT(BPF_REG_1 + i);
+	return mask;
+}
+
+static bool helper_scratches_reg(u8 reg_mask, int regno)
+{
+	return !!(reg_mask & BIT(regno));
+}
+
 static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			     int *insn_idx_p)
 {
@@ -10266,6 +10296,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	int insn_idx = *insn_idx_p;
 	bool changes_data;
 	int i, err, func_id;
+	u8 scratched_regs;
 
 	/* find function prototype */
 	func_id = insn->imm;
@@ -10564,13 +10595,18 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		return err;
 
 	/* reset caller saved regs */
+	scratched_regs = get_helper_reg_mask(fn);
 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
+		if (!helper_scratches_reg(scratched_regs, i))
+			continue;
+
 		mark_reg_not_init(env, regs, caller_saved[i]);
 		check_reg_arg(env, caller_saved[i], DST_OP_NO_MARK);
 	}
 
-	/* helper call returns 64-bit value. */
-	regs[BPF_REG_0].subreg_def = DEF_NOT_SUBREG;
+	if (helper_scratches_reg(scratched_regs, BPF_REG_0))
+		/* helper call returns 64-bit value. */
+		regs[BPF_REG_0].subreg_def = DEF_NOT_SUBREG;
 
 	/* update return register (already marked as written above) */
 	ret_type = fn->ret_type;
@@ -10582,7 +10618,8 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		mark_reg_unknown(env, regs, BPF_REG_0);
 		break;
 	case RET_VOID:
-		regs[BPF_REG_0].type = NOT_INIT;
+		if (helper_scratches_reg(scratched_regs, BPF_REG_0))
+			regs[BPF_REG_0].type = NOT_INIT;
 		break;
 	case RET_PTR_TO_MAP_VALUE:
 		/* There is no offset yet applied, variable or fixed */
@@ -20717,6 +20754,146 @@ static int optimize_bpf_loop(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/* Compute which registers need to be saved before the call to the
+ * no_caller_saved_registers function and restored after such call.
+ * Return a bitmask where bit #0 means that R0 has to be
+ * saved/restored, bit #1 stands for R1 and so forth.
+ */
+static u8 get_nocsr_fixup_mask(struct bpf_verifier_env *env,
+			       struct bpf_insn *insn,
+			       struct bpf_insn_aux_data *aux)
+{
+	u8 live_regs = aux->live_regs & ALL_CALLER_SAVED_REGS;
+	const struct bpf_func_proto *fn;
+
+	if (bpf_helper_call(insn)) {
+		if (bpf_jit_inlines_helper_call(insn->imm))
+			return 0;
+		if (get_helper_proto(env, insn->imm, &fn) != 0)
+			return 0;
+		/* if (!fn->no_csr) */
+		/*	return 0; */
+		return live_regs & ~get_helper_reg_mask(fn);
+	}
+	return 0;
+}
+
+/* Suppose there is a call to a helper function F, annotated with
+ * no_caller_saved_registers attribute.
+ * C compiler is allowed to reuse some caller saved registers after
+ * the call to such function without saving them before the call
+ * (see the comment in get_helper_reg_mask() for specific rules).
+ *
+ * For such functions verifier assumes that two situations are
+ * possible:
+ * (a) current jit inlines the calls to F;
+ * (b) calls to F and F is jitted as a regular function calls.
+ *
+ * For (a) verifier assumes that the jit takes care of preserving
+ * caller saved registers (e.g., by replacing the function call
+ * with instructions that do not modify registers in question).
+ *
+ * For (b) verifier needs to take care of saving and restoring caller
+ * saved registers. The function insert_missing_nocsr_spills_fills()
+ * is responsible for handling such situations.
+ *
+ * Here is an example of the transformation applied by
+ * insert_missing_nocsr_spills_fills():
+ *
+ *                       r1 = 1
+ *     r1 = 1            *(u64 *)(r10 - X) = r1
+ *     call F   ------>  call F
+ *     r1 += 1           r1 = *(u64 *)(r10 - X)
+ *                       r1 += 1
+ *
+ * Where X stands for a free stack slot.
+ */
+static int insert_missing_nocsr_spills_fills(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *subprogs = env->subprog_info;
+	int i, cur_subprog = 0, delta = 0;
+	struct bpf_insn insn_buf[16];
+	struct bpf_insn *insn = env->prog->insnsi;
+	int insn_cnt = env->prog->len;
+	int spill_stack_offs[CALLER_SAVED_REGS] = {};
+	u16 stack_depth = subprogs[cur_subprog].stack_depth;
+	u16 stack_depth_roundup = round_up(stack_depth, 8) - stack_depth;
+	u16 stack_depth_extra = 0;
+	struct bpf_prog *new_prog;
+
+	for (i = 0; i < insn_cnt; i++, insn++) {
+		struct bpf_insn_aux_data *aux = &env->insn_aux_data[i + delta];
+		struct bpf_insn_aux_data tmp;
+		int stack_off, call_off, regno, cnt = 0;
+		u8 reg_mask;
+
+		reg_mask = get_nocsr_fixup_mask(env, insn, aux);
+		if (!reg_mask)
+			goto next_insn;
+
+		/* Auxiliary data associated with call instruction has
+		 * to be assigned to call instruction after rewrite.
+		 * bpf_patch_insn_data() zeroes auxiliary data within
+		 * the patch, thus save the data in a temporary.
+		 */
+		memcpy(&tmp, aux, sizeof(tmp));
+
+		/* Generate a series of stack spills */
+		for (int ri = 0, spill = 0; ri < CALLER_SAVED_REGS; ++ri) {
+			if ((BIT(ri) & reg_mask) == 0)
+				continue;
+
+			if (spill_stack_offs[spill] == 0) {
+				stack_depth_extra += 8;
+				spill_stack_offs[spill] = -stack_depth - stack_depth_extra;
+				stack_off = spill_stack_offs[spill];
+				++spill;
+			} else {
+				stack_off = spill_stack_offs[spill];
+			}
+			regno = BPF_REG_0 + ri;
+			insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, regno, stack_off);
+		}
+
+		/* Copy the call instruction itself */
+		call_off = cnt++;
+		insn_buf[call_off] = *insn;
+
+		/* Generate a series of register fills */
+		for (int ri = 0, spill = 0; ri < CALLER_SAVED_REGS; ++ri) {
+			if ((BIT(ri) & reg_mask) == 0)
+				continue;
+
+			stack_off = spill_stack_offs[spill++];
+			regno = BPF_REG_0 + ri;
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, regno, BPF_REG_10, stack_off);
+		}
+		new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+		if (!new_prog)
+			return -ENOMEM;
+
+		/* Restore the auxiliary instruction data */
+		memcpy(&env->insn_aux_data[i + call_off], &tmp, sizeof(tmp));
+
+		delta    += cnt - 1;
+		env->prog = new_prog;
+		insn      = new_prog->insnsi + i + delta;
+
+next_insn:
+		if (subprogs[cur_subprog + 1].start == i + delta + 1) {
+			subprogs[cur_subprog].stack_depth += stack_depth_extra;
+			cur_subprog++;
+			stack_depth = subprogs[cur_subprog].stack_depth;
+			stack_depth_roundup = round_up(stack_depth, 8) - stack_depth;
+			stack_depth_extra = 0;
+		}
+	}
+
+	env->prog->aux->stack_depth = env->subprog_info[0].stack_depth;
+
+	return 0;
+}
+
 static void free_states(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state_list *sl, *sln;
@@ -21580,8 +21757,19 @@ static void compute_call_live_regs(struct bpf_verifier_env *env,
 				   struct bpf_insn *insn,
 				   u16 *use, u16 *def)
 {
+	const struct bpf_func_proto *fn;
+	int err;
+
 	*def = ALL_CALLER_SAVED_REGS;
 	*use = *def & ~BIT(BPF_REG_0);
+
+	if (bpf_helper_call(insn)) {
+		err = get_helper_proto(env, insn->imm, &fn);
+		if (err)
+			return;
+		*def = get_helper_reg_mask(fn);
+		*use = *def & ~BIT(BPF_REG_0);
+	}
 }
 
 /* Compute info->{use,def} fields for the instruction */
@@ -21898,6 +22086,9 @@ skip_full_check:
 	/* instruction rewrites happen after this point */
 	if (ret == 0)
 		ret = optimize_bpf_loop(env);
+
+	if (ret == 0)
+		ret = insert_missing_nocsr_spills_fills(env);
 
 	if (is_priv) {
 		if (ret == 0)

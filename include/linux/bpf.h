@@ -807,6 +807,7 @@ struct bpf_func_proto {
 	bool gpl_only;
 	bool pkt_access;
 	bool might_sleep;
+	bool no_csr; /* stands for __attribute__((no_caller_saved_registers)) */
 	enum bpf_return_type ret_type;
 	union {
 		struct {
