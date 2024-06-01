@@ -342,6 +342,54 @@ err_out:
 	btf__free(btf);
 }
 
+static void test_btf_dump_missing_aliases(void)
+{
+	struct btf_dump *d = NULL;
+	struct btf *btf = NULL;
+	int err, poly8, foo;
+
+	/* Create a BTF object with __Poly8_t type:
+	 * [1] INT '__Poly8_t'
+	 * [2] STRUCT 'foo'
+	 * 	'x' type_id=1
+	 */
+	btf = btf__new_empty();
+	if (!ASSERT_OK_PTR(btf, "btf__new_empty"))
+		goto out;
+	poly8 = btf__add_int(btf, "__Poly8_t", 1, 0);
+	ASSERT_GT(poly8, 0, "add __Poly8_t");
+	foo = btf__add_struct(btf, "foo", 1);
+	ASSERT_GT(foo, 0, "add struct foo");
+	ASSERT_OK(btf__add_field(btf, "x", poly8, 0, 0), "add foo::x");
+
+	dump_buf_file = open_memstream(&dump_buf, &dump_buf_sz);
+	if (!ASSERT_OK_PTR(dump_buf_file, "dump_memstream"))
+		goto out;
+	d = btf_dump__new(btf, btf_dump_printf, dump_buf_file, NULL);
+	if (!ASSERT_OK_PTR(d, "btf_dump__new"))
+		goto out;
+	err = btf_dump__dump_type(d, foo);
+	if (!ASSERT_OK(err, "dump __Poly8_t"))
+		goto out;
+	fflush(dump_buf_file);
+	/* Make sure that 'typedef' is generated for __Poly8_t */
+	ASSERT_STREQ(dump_buf,
+"typedef unsigned char __Poly8_t;\n"
+"\n"
+"struct foo {\n"
+"	__Poly8_t x;\n"
+"};\n"
+"\n", "dump foo");
+
+out:
+	if (dump_buf_file) {
+		fclose(dump_buf_file);
+		free(dump_buf);
+	}
+	btf_dump__free(d);
+	btf__free(btf);
+}
+
 #define STRSIZE				4096
 
 static void btf_dump_snprintf(void *ctx, const char *fmt, va_list args)
@@ -962,6 +1010,8 @@ void test_btf_dump() {
 		test_btf_dump_incremental();
 	if (test__start_subtest("btf_dump: emit queue"))
 		test_btf_dump_emit_queue();
+	if (test__start_subtest("btf_dump: missing_aliases"))
+		test_btf_dump_missing_aliases();
 
 	btf = libbpf_find_kernel_btf();
 	if (!ASSERT_OK_PTR(btf, "no kernel BTF found"))
