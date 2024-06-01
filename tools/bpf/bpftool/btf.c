@@ -624,12 +624,35 @@ static struct sort_datum *sort_btf_c(const struct btf *btf)
 	return datums;
 }
 
+static bool needs_preserve_access_index(const struct btf *btf, __u32 id)
+{
+	const struct btf_type *t = btf__type_by_id(btf, id);
+
+	/* Special case for definitions like:
+	 *
+	 *   typedef struct { int x; } foo;
+	 *
+	 * anonymous struct or union as t->type of the typedef.
+	 */
+	if (btf_is_typedef(t)) {
+		t = btf__type_by_id(btf, t->type);
+		while (btf_is_mod(t))
+			t = btf__type_by_id(btf, t->type);
+		return btf_is_composite(t) && t->name_off == 0;
+	}
+
+	return btf_is_composite(t);
+}
+
 static int dump_btf_c(const struct btf *btf,
 		      __u32 *root_type_ids, int root_type_cnt, bool sort_dump)
 {
+	LIBBPF_OPTS(btf_dump_emit_type_opts, opts);
+	struct btf_dump_queue_item *queue;
 	struct sort_datum *datums = NULL;
 	struct btf_dump *d;
 	int err = 0, i;
+	__u32 cnt;
 
 	d = btf_dump__new(btf, btf_dump_printf, NULL, NULL);
 	if (!d)
@@ -638,8 +661,10 @@ static int dump_btf_c(const struct btf *btf,
 	printf("#ifndef __VMLINUX_H__\n");
 	printf("#define __VMLINUX_H__\n");
 	printf("\n");
-	printf("#ifndef BPF_NO_PRESERVE_ACCESS_INDEX\n");
-	printf("#pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)\n");
+	printf("#ifdef BPF_NO_PRESERVE_ACCESS_INDEX\n");
+	printf("#define __pai\n");
+	printf("#else\n");
+	printf("#define __pai __attribute__((preserve_access_index))\n");
 	printf("#endif\n\n");
 	printf("#ifndef __ksym\n");
 	printf("#define __ksym __attribute__((section(\".ksyms\")))\n");
@@ -650,19 +675,18 @@ static int dump_btf_c(const struct btf *btf,
 
 	if (root_type_cnt) {
 		for (i = 0; i < root_type_cnt; i++) {
-			err = btf_dump__dump_type(d, root_type_ids[i]);
+			err = btf_dump__order_type(d, root_type_ids[i]);
 			if (err)
 				goto done;
 		}
 	} else {
-		int cnt = btf__type_cnt(btf);
-
+		cnt = btf__type_cnt(btf);
 		if (sort_dump)
 			datums = sort_btf_c(btf);
-		for (i = 1; i < cnt; i++) {
+		for (i = 1; i < (int)cnt; i++) {
 			int idx = datums ? datums[i].index : i;
 
-			err = btf_dump__dump_type(d, idx);
+			err = btf_dump__order_type(d, idx);
 			if (err)
 				goto done;
 		}
@@ -672,9 +696,21 @@ static int dump_btf_c(const struct btf *btf,
 			goto done;
 	}
 
-	printf("#ifndef BPF_NO_PRESERVE_ACCESS_INDEX\n");
-	printf("#pragma clang attribute pop\n");
-	printf("#endif\n");
+	queue = btf_dump__get_emit_queue(d, &cnt);
+	for (i = 0; i < (int)cnt; i++) {
+		opts.fwd = queue[i].flags & BTF_DUMP_FWD_DECL;
+		err = btf_dump__emit_type_def(d, queue[i].id, &opts);
+		if (err < 0)
+			goto done;
+		if (err > 0) {
+			if (needs_preserve_access_index(btf, queue[i].id))
+				printf(" __pai");
+			printf(";\n\n");
+			err = 0;
+		}
+	}
+
+	printf("#undef __pai\n");
 	printf("\n");
 	printf("#endif /* __VMLINUX_H__ */\n");
 
