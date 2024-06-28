@@ -15,7 +15,8 @@ MANAGED_REPOS: Final[Set[str]] = {
 # We need to run on ubuntu 20.04 because our rootfs is based on debian buster and we
 # otherwise get library versioning issue such as
 # `./test_verifier: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by ./test_verifier)`
-DEFAULT_RUNNER: Final[str] = "ubuntu-20.04"
+#DEFAULT_RUNNER: Final[str] = "ubuntu-20.04"
+DEFAULT_RUNNER: Final[str] = "self-hosted"
 DEFAULT_LLVM_VERSION: Final[int] = 17
 
 
