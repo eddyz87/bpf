@@ -8,7 +8,8 @@ fi
 
 echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
 
-upstream="${branch//_base/}"
+#upstream="${branch//_base/}"
+upstream="bpf-next"
 commit="$(
   git rev-parse "origin/${upstream}" &> /dev/null \
     || (
