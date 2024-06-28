@@ -8,10 +8,9 @@ fi
 
 echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
 
-#upstream="${branch//_base/}"
-upstream="bpf-next"
+upstream="${branch//_base/}"
 commit="$(
-  git rev-parse "origin/${upstream}" &> /dev/null \
+  git rev-parse "origin/${upstream}" 2> /dev/null \
     || (
       git fetch --quiet --prune --no-tags --depth=1 --no-recurse-submodules origin "+refs/heads/${upstream}:refs/remotes/origin/${upstream}" && \
       git rev-parse "origin/${upstream}"
@@ -22,3 +21,7 @@ timestamp_utc="$(TZ=utc git show --format='%cd' --no-patch --date=iso-strict-loc
 echo "timestamp=${timestamp_utc}" >> "${GITHUB_OUTPUT}"
 echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
 echo "Most recent upstream commit is ${commit}"
+
+if [ "${commit}" == "" ]; then
+    exit 1
+fi

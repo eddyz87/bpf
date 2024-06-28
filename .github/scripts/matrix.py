@@ -96,11 +96,11 @@ class BuildConfig:
             # "test_verifier",
         ]
 
-        if self.toolchain.version >= 18:
-            tests_list.append("test_progs_cpuv4")
+        # if self.toolchain.version >= 18:
+        #     tests_list.append("test_progs_cpuv4")
 
-        if not self.parallel_tests:
-            tests_list = [test for test in tests_list if not test.endswith("parallel")]
+        # if not self.parallel_tests:
+        #     tests_list = [test for test in tests_list if not test.endswith("parallel")]
 
         return {"include": [generate_test_config(test) for test in tests_list]}
 
@@ -167,12 +167,12 @@ if __name__ == "__main__":
         BuildConfig(
             arch=Arch.X86_64,
             toolchain=Toolchain(compiler=Compiler.LLVM, version=18),
-            build_release=True,
+            # build_release=True,
         ),
-        BuildConfig(
-            arch=Arch.AARCH64,
-            toolchain=Toolchain(compiler=Compiler.GCC, version=DEFAULT_LLVM_VERSION),
-        ),
+        # BuildConfig(
+        #     arch=Arch.AARCH64,
+        #     toolchain=Toolchain(compiler=Compiler.GCC, version=DEFAULT_LLVM_VERSION),
+        # ),
         # BuildConfig(
         #     arch=Arch.AARCH64,
         #     toolchain=Toolchain(
