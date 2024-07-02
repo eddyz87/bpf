@@ -3560,7 +3560,7 @@ static inline int bt_subprog_exit(struct backtrack_state *bt)
 	return 0;
 }
 
-static inline void bt_set_frame_reg(struct backtrack_state *bt, u32 frame, u32 reg)
+static inline void __bt_set_frame_reg(struct backtrack_state *bt, u32 frame, u32 reg)
 {
 	bt->reg_masks[frame] |= 1 << reg;
 }
@@ -3570,17 +3570,12 @@ static inline void bt_clear_frame_reg(struct backtrack_state *bt, u32 frame, u32
 	bt->reg_masks[frame] &= ~(1 << reg);
 }
 
-static inline void bt_set_reg(struct backtrack_state *bt, u32 reg)
-{
-	bt_set_frame_reg(bt, bt->frame, reg);
-}
-
 static inline void bt_clear_reg(struct backtrack_state *bt, u32 reg)
 {
 	bt_clear_frame_reg(bt, bt->frame, reg);
 }
 
-static inline void bt_set_frame_slot(struct backtrack_state *bt, u32 frame, u32 slot)
+static inline void __bt_set_frame_slot(struct backtrack_state *bt, u32 frame, u32 slot)
 {
 	bt->stack_masks[frame] |= 1ull << slot;
 }
@@ -3625,6 +3620,86 @@ static inline bool bt_is_frame_slot_set(struct backtrack_state *bt, u32 frame, u
 	return bt->stack_masks[frame] & (1ull << slot);
 }
 
+static inline void bt_set_from_linked_regs(struct backtrack_state *bt, struct linked_regs *linked_regs)
+{
+	int i;
+
+	for (i = 0; i < linked_regs->cnt; ++i) {
+		struct reg_or_spill *e = &linked_regs->entries[i];
+
+		if (e->is_reg)
+			__bt_set_frame_reg(bt, e->frameno, e->regno);
+		else
+			__bt_set_frame_slot(bt, e->frameno, e->spi);
+	}
+}
+
+/* If any register R in linked_regs is marked as precise in bt,
+ * do __bt_set_frame_{reg,slot}(bt, R) for all registers in linked_regs.
+ */
+static inline void bt_set_linked_to(struct backtrack_state *bt, struct linked_regs *linked_regs,
+				    u32 frame, u32 reg_or_spi, bool is_reg)
+{
+	bool some_precise = false;
+	int i;
+
+	for (i = 0; i < linked_regs->cnt; ++i) {
+		struct reg_or_spill *e = &linked_regs->entries[i];
+
+		if (e->is_reg == is_reg &&
+		    e->frameno == frame &&
+		    ((is_reg && e->regno == reg_or_spi) || (!is_reg && e->spi == reg_or_spi))) {
+			some_precise = true;
+			break;
+		}
+	}
+
+	if (some_precise)
+		bt_set_from_linked_regs(bt, linked_regs);
+}
+
+static inline void bt_set_frame_reg(struct backtrack_state *bt, struct linked_regs *linked_regs,
+				    u32 frame, u32 reg)
+{
+	__bt_set_frame_reg(bt, frame, reg);
+	bt_set_linked_to(bt, linked_regs, frame, reg, true);
+}
+
+static inline void bt_set_reg(struct backtrack_state *bt, struct linked_regs *linked_regs, u32 reg)
+{
+	__bt_set_frame_reg(bt, bt->frame, reg);
+	bt_set_linked_to(bt, linked_regs, bt->frame, reg, true);
+}
+
+static inline void bt_set_frame_slot(struct backtrack_state *bt, struct linked_regs *linked_regs,
+				     u32 frame, u32 slot)
+{
+	__bt_set_frame_slot(bt, frame, slot);
+	bt_set_linked_to(bt, linked_regs, frame, slot, false);
+}
+
+/* If any register R in hist->linked_regs is marked as precise in bt,
+ * do bt_set_frame_{reg,slot}(bt, R) for all registers in hist->linked_regs.
+ */
+static void bt_set_linked(struct backtrack_state *bt, struct linked_regs *linked_regs)
+{
+	bool some_precise = false;
+	int i;
+
+	for (i = 0; i < linked_regs->cnt; ++i) {
+		struct reg_or_spill *e = &linked_regs->entries[i];
+
+		if ((e->is_reg && bt_is_frame_reg_set(bt, e->frameno, e->regno)) ||
+		    (!e->is_reg && bt_is_frame_slot_set(bt, e->frameno, e->spi))) {
+			some_precise = true;
+			break;
+		}
+	}
+
+	if (some_precise)
+		bt_set_from_linked_regs(bt, linked_regs);
+}
+
 /* format registers bitmask, e.g., "r0,r2,r4" for 0x15 mask */
 static void fmt_reg_mask(char *buf, ssize_t buf_sz, u32 reg_mask)
 {
@@ -3664,42 +3739,6 @@ static void fmt_stack_mask(char *buf, ssize_t buf_sz, u64 stack_mask)
 	}
 }
 
-/* If any register R in hist->linked_regs is marked as precise in bt,
- * do bt_set_frame_{reg,slot}(bt, R) for all registers in hist->linked_regs.
- */
-static void bt_set_link_registers(struct backtrack_state *bt, struct bpf_jmp_history_entry *hist)
-{
-	struct linked_regs linked_regs;
-	bool some_precise = false;
-	int i;
-
-	if (!hist || hist->linked_regs == 0)
-		return;
-
-	linked_regs_unpack(hist->linked_regs, &linked_regs);
-	for (i = 0; i < linked_regs.cnt; ++i) {
-		struct reg_or_spill *e = &linked_regs.entries[i];
-
-		if ((e->is_reg && bt_is_frame_reg_set(bt, e->frameno, e->regno)) ||
-		    (!e->is_reg && bt_is_frame_slot_set(bt, e->frameno, e->spi))) {
-			some_precise = true;
-			break;
-		}
-	}
-
-	if (!some_precise)
-		return;
-
-	for (i = 0; i < linked_regs.cnt; ++i) {
-		struct reg_or_spill *e = &linked_regs.entries[i];
-
-		if (e->is_reg)
-			bt_set_frame_reg(bt, e->frameno, e->regno);
-		else
-			bt_set_frame_slot(bt, e->frameno, e->spi);
-	}
-}
-
 static bool calls_callback(struct bpf_verifier_env *env, int insn_idx);
 
 /* For given verifier state backtrack_insn() is called from the last insn to
@@ -3719,6 +3758,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 		.cb_print	= verbose,
 		.private_data	= env,
 	};
+	struct linked_regs linked_regs = { .cnt = 0 };
 	struct bpf_insn *insn = env->prog->insnsi + idx;
 	u8 class = BPF_CLASS(insn->code);
 	u8 opcode = BPF_OP(insn->code);
@@ -3739,11 +3779,14 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 		print_bpf_insn(&cbs, insn, env->allow_ptr_leaks);
 	}
 
+	if (hist && hist->linked_regs != 0)
+		linked_regs_unpack(hist->linked_regs, &linked_regs);
+
 	/* If there is a history record that some registers gained range at this insn,
 	 * propagate precision marks to those registers, so that bt_is_reg_set()
 	 * accounts for these registers.
 	 */
-	bt_set_link_registers(bt, hist);
+	bt_set_linked(bt, &linked_regs);
 
 	if (class == BPF_ALU || class == BPF_ALU64) {
 		if (!bt_is_reg_set(bt, dreg))
@@ -3761,7 +3804,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				 */
 				bt_clear_reg(bt, dreg);
 				if (sreg != BPF_REG_FP)
-					bt_set_reg(bt, sreg);
+					bt_set_reg(bt, &linked_regs, sreg);
 			} else {
 				/* dreg = K
 				 * dreg needs precision after this insn.
@@ -3778,7 +3821,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				 * before this insn
 				 */
 				if (sreg != BPF_REG_FP)
-					bt_set_reg(bt, sreg);
+					bt_set_reg(bt, &linked_regs, sreg);
 			} /* else dreg += K
 			   * dreg still needs precision before this insn
 			   */
@@ -3802,7 +3845,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 		 */
 		spi = insn_stack_access_spi(hist->flags);
 		fr = insn_stack_access_frameno(hist->flags);
-		bt_set_frame_slot(bt, fr, spi);
+		bt_set_frame_slot(bt, &linked_regs, fr, spi);
 	} else if (class == BPF_STX || class == BPF_ST) {
 		if (bt_is_reg_set(bt, dreg))
 			/* stx & st shouldn't be using _scalar_ dst_reg
@@ -3819,7 +3862,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			return 0;
 		bt_clear_frame_slot(bt, fr, spi);
 		if (class == BPF_STX)
-			bt_set_reg(bt, sreg);
+			bt_set_reg(bt, &linked_regs, sreg);
 	} else if (class == BPF_JMP || class == BPF_JMP32) {
 		if (bpf_pseudo_call(insn)) {
 			int subprog_insn_idx, subprog;
@@ -3873,7 +3916,8 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				for (i = BPF_REG_1; i <= BPF_REG_5; i++) {
 					if (bt_is_reg_set(bt, i)) {
 						bt_clear_reg(bt, i);
-						bt_set_frame_reg(bt, bt->frame - 1, i);
+						bt_set_frame_reg(bt, &linked_regs,
+								 bt->frame - 1, i);
 					}
 				}
 				if (bt_subprog_exit(bt))
@@ -3935,7 +3979,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			if (subseq_idx >= 0 && calls_callback(env, subseq_idx))
 				for (i = BPF_REG_1; i <= BPF_REG_5; i++)
 					bt_clear_reg(bt, i);
-			if (bt_reg_mask(bt) & BPF_REGMASK_ARGS) {
+ 			if (bt_reg_mask(bt) & BPF_REGMASK_ARGS) {
 				verbose(env, "BUG regs %x\n", bt_reg_mask(bt));
 				WARN_ONCE(1, "verifier backtracking bug");
 				return -EFAULT;
@@ -3958,7 +4002,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				return -EFAULT;
 
 			if (r0_precise)
-				bt_set_reg(bt, BPF_REG_0);
+				bt_set_reg(bt, &linked_regs, BPF_REG_0);
 			/* r6-r9 and stack slots will stay set in caller frame
 			 * bitmasks until we return back from callee(s)
 			 */
@@ -3972,8 +4016,8 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			 * before it would be equally necessary to
 			 * propagate it to dreg.
 			 */
-			bt_set_reg(bt, dreg);
-			bt_set_reg(bt, sreg);
+			bt_set_reg(bt, &linked_regs, dreg);
+			bt_set_reg(bt, &linked_regs, sreg);
 		} else if (BPF_SRC(insn->code) == BPF_K) {
 			 /* else dreg <cond> K
 			  * Only dreg still needs precision before
@@ -3993,10 +4037,6 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			/* to be analyzed */
 			return -ENOTSUPP;
 	}
-	/* Propagate precision marks to linked registers, to account for
-	 * registers marked as precise in this function.
-	 */
-	bt_set_link_registers(bt, hist);
 	return 0;
 }
 
@@ -4124,6 +4164,9 @@ static void mark_all_scalars_imprecise(struct bpf_verifier_env *env, struct bpf_
 	}
 }
 
+static void find_equal_scalars(struct bpf_verifier_state *vstate, u32 id,
+			       struct linked_regs *reg_set);
+
 /*
  * __mark_chain_precision() backtracks BPF program instruction sequence and
  * chain of verifier states making sure that register *regno* (if regno >= 0)
@@ -4240,7 +4283,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 			WARN_ONCE(1, "backtracing misuse");
 			return -EFAULT;
 		}
-		bt_set_reg(bt, regno);
+		__bt_set_frame_reg(bt, bt->frame, regno);
 	}
 
 	if (bt_empty(bt))
@@ -17373,7 +17416,7 @@ static int propagate_precision(struct bpf_verifier_env *env,
 				else
 					verbose(env, ",r%d", i);
 			}
-			bt_set_frame_reg(&env->bt, fr, i);
+			__bt_set_frame_reg(&env->bt, fr, i);
 			first = false;
 		}
 
@@ -17392,7 +17435,7 @@ static int propagate_precision(struct bpf_verifier_env *env,
 				else
 					verbose(env, ",fp%d", (-i - 1) * BPF_REG_SIZE);
 			}
-			bt_set_frame_slot(&env->bt, fr, i);
+			__bt_set_frame_slot(&env->bt, fr, i);
 			first = false;
 		}
 		if (!first)
