@@ -77,6 +77,8 @@
 #define __auxiliary		__attribute__((btf_decl_tag("comment:test_auxiliary")))
 #define __auxiliary_unpriv	__attribute__((btf_decl_tag("comment:test_auxiliary_unpriv")))
 #define __btf_path(path)	__attribute__((btf_decl_tag("comment:test_btf_path=" path)))
+#define __jited_x86(basic_regex)	__attribute__((btf_decl_tag("comment:test_jited_x86=" basic_regex)))
+#define __jited_x86_unpriv(basic_regex)	__attribute__((btf_decl_tag("comment:test_jited_x86_unpriv=" basic_regex)))
 
 /* Convenience macro for use with 'asm volatile' blocks */
 #define __naked __attribute__((naked))
