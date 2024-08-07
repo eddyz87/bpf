@@ -102,7 +102,7 @@ jobs:
           max-make-jobs: 32
           llvm-version: ${{ inputs.llvm-version }}
       - name: Build selftests
-        uses: libbpf/ci/build-selftests@main
+        uses: eddyz87/libbpf-ci/build-selftests@selftests-disasm-support
         with:
           arch: ${{ inputs.arch }}
           toolchain: ${{ inputs.toolchain }}
