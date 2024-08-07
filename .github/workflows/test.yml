@@ -3,9 +3,6 @@ name: bpf-ci
 on:
   pull_request:
   push:
-    branches:
-      - bpf_base
-      - bpf-next_base
 
 concurrency:
   group: ci-test-${{ github.ref_name }}
