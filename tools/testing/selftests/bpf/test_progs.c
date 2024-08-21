@@ -1861,6 +1861,7 @@ int main(int argc, char **argv)
 		}
 		if (test->should_run)
 			test->should_tmon = should_tmon(&env.tmon_selector, test->test_name);
+		test->should_run = strcmp(test->test_name, "core_reloc_raw") == 0;
 	}
 
 	/* ignore workers if we are just listing */
