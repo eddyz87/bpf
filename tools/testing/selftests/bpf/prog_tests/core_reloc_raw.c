@@ -89,7 +89,8 @@ static void test_bad_local_id(void)
 
 	btf_fd = bpf_btf_load(&raw_btf, sizeof(raw_btf), &opts);
 	saved_errno = errno;
-	if (btf_fd < 0 || env.verbosity > VERBOSE_NORMAL) {
+	printf("bpf_btf_load() -> %d\n", saved_errno);
+	if (1/* btf_fd < 0 || env.verbosity > VERBOSE_NORMAL */) {
 		printf("-------- BTF load log start --------\n");
 		printf("%s", log);
 		printf("-------- BTF load log end ----------\n");
@@ -103,7 +104,8 @@ static void test_bad_local_id(void)
 	attr.prog_btf_fd = btf_fd;
 	prog_fd = sys_bpf_prog_load(&attr, sizeof(attr), 1);
 	saved_errno = errno;
-	if (prog_fd < 0 || env.verbosity > VERBOSE_NORMAL) {
+	printf("sys_bpf_prog_load() -> %d\n", saved_errno);
+	if (1/* prog_fd < 0 || env.verbosity > VERBOSE_NORMAL */) {
 		printf("-------- program load log start --------\n");
 		printf("%s", log);
 		printf("-------- program load log end ----------\n");
