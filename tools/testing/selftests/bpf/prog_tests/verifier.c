@@ -79,6 +79,7 @@
 #include "verifier_spill_fill.skel.h"
 #include "verifier_spin_lock.skel.h"
 #include "verifier_stack_ptr.skel.h"
+#include "verifier_inlinable_kfuncs.skel.h"
 #include "verifier_subprog_precision.skel.h"
 #include "verifier_subreg.skel.h"
 #include "verifier_tailcall_jit.skel.h"
@@ -277,4 +278,10 @@ void test_verifier_value_ptr_arith(void)
 	run_tests_aux("verifier_value_ptr_arith",
 		      verifier_value_ptr_arith__elf_bytes,
 		      init_value_ptr_arith_maps);
+}
+
+/* Do not drop CAP_SYS_ADMIN for these tests */
+void test_verifier_inlinable_kfuncs(void)
+{
+	RUN_TESTS(verifier_inlinable_kfuncs);
 }
