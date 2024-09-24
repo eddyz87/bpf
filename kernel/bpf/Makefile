@@ -53,3 +53,25 @@ obj-$(CONFIG_BPF_SYSCALL) += relo_core.o
 obj-$(CONFIG_BPF_SYSCALL) += btf_iter.o
 obj-$(CONFIG_BPF_SYSCALL) += btf_relocate.o
 obj-$(CONFIG_BPF_SYSCALL) += kmem_cache_iter.o
+obj-$(CONFIG_BPF_SYSCALL) += inlinable_kfuncs.o
+
+ifdef CONFIG_CC_IS_CLANG
+
+LLC ?= $(LLVM_PREFIX)llc$(LLVM_SUFFIX)
+
+# -mfentry -pg is $(CC_FLAGS_FTRACE)
+# -fpatchable-function-entry=16,16 is $(PADDING_CFLAGS)
+CFLAGS_REMOVE_inlinable_kfuncs.bpf.bc.o += $(CC_FLAGS_FTRACE)
+CFLAGS_REMOVE_inlinable_kfuncs.bpf.bc.o += $(PADDING_CFLAGS)
+$(obj)/inlinable_kfuncs.bpf.bc.o: $(src)/inlinable_kfuncs.c
+	$(Q)$(CC) $(c_flags) -emit-llvm -c $< -o $@
+
+$(obj)/inlinable_kfuncs.bpf.o: $(obj)/inlinable_kfuncs.bpf.bc.o
+	$(Q)$(LLC) -mcpu=v3 --mtriple=bpf --filetype=obj $< -o $@
+
+$(obj)/inlinable_kfuncs.bpf.linked.o: $(obj)/inlinable_kfuncs.bpf.o
+	$(Q)$(STRIP) --strip-debug --remove-section=.*BTF* -o $@ $<
+
+$(obj)/verifier.o: $(obj)/inlinable_kfuncs.bpf.linked.o
+
+endif
