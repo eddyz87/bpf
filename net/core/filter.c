@@ -11902,21 +11902,6 @@ bpf_sk_base_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 }
 
 __bpf_kfunc_start_defs();
-__bpf_kfunc int bpf_dynptr_from_skb(struct __sk_buff *s, u64 flags,
-				    struct bpf_dynptr *ptr__uninit)
-{
-	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)ptr__uninit;
-	struct sk_buff *skb = (struct sk_buff *)s;
-
-	if (flags) {
-		bpf_dynptr_set_null(ptr);
-		return -EINVAL;
-	}
-
-	bpf_dynptr_init(ptr, skb, BPF_DYNPTR_TYPE_SKB, 0, skb->len);
-
-	return 0;
-}
 
 __bpf_kfunc int bpf_dynptr_from_xdp(struct xdp_md *x, u64 flags,
 				    struct bpf_dynptr *ptr__uninit)
@@ -12053,21 +12038,6 @@ __bpf_kfunc int bpf_sk_assign_tcp_reqsk(struct __sk_buff *s, struct sock *sk,
 }
 
 __bpf_kfunc_end_defs();
-
-int bpf_dynptr_from_skb_rdonly(struct __sk_buff *skb, u64 flags,
-			       struct bpf_dynptr *ptr__uninit)
-{
-	struct bpf_dynptr_kern *ptr = (struct bpf_dynptr_kern *)ptr__uninit;
-	int err;
-
-	err = bpf_dynptr_from_skb(skb, flags, ptr__uninit);
-	if (err)
-		return err;
-
-	bpf_dynptr_set_rdonly(ptr);
-
-	return 0;
-}
 
 BTF_KFUNCS_START(bpf_kfunc_check_set_skb)
 BTF_ID_FLAGS(func, bpf_dynptr_from_skb, KF_TRUSTED_ARGS)
