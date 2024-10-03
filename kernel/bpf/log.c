@@ -814,6 +814,11 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 				verbose_a("id=%d", slot->dynptr.id);
 			if (slot->ref_obj_id)
 				verbose_a("ref_id=%d", slot->ref_obj_id);
+			if (slot->spilled_ptr.umax_value != U64_MAX ||
+			    slot->spilled_ptr.umin_value != 0) {
+				verbose_a("val=");
+				print_reg_state(env, state, &slot->spilled_ptr);
+			}
 			verbose(env, ")");
 			break;
 		case STACK_OBJ_ITER:
