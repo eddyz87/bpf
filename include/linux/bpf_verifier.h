@@ -368,8 +368,12 @@ static_assert(INSN_F_FRAMENO_MASK + 1 >= MAX_CALL_FRAMES);
 static_assert(INSN_F_SPI_MASK + 1 >= MAX_BPF_STACK / 8);
 
 struct bpf_jmp_history_entry {
-	u32 idx;
 	/* insn idx can't be bigger than 1 million */
+	u32 idx : 22;
+	/* bitmask of registers that should be marked precise at 'idx'
+	 * when mark_chain_precision() walks back instructions history.
+	 */
+	u32 precise_regs : 10;
 	u32 prev_idx : 22;
 	/* special flags, e.g., whether insn is doing register stack spill/load */
 	u32 flags : 10;
@@ -782,6 +786,7 @@ struct bpf_verifier_env {
 	 * e.g., in reg_type_str() to generate reg_type string
 	 */
 	char tmp_str_buf[TMP_STR_BUF_LEN];
+	//char tmp_str_buf2[TMP_STR_BUF_LEN];
 	struct bpf_insn insn_buf[INSN_BUF_SIZE];
 	struct bpf_insn epilogue_buf[INSN_BUF_SIZE];
 };
