@@ -3532,6 +3532,7 @@ static int push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_st
 	p->precise_regs = precise_regs;
 	cur->jmp_history_cnt = cnt;
 	env->cur_hist_ent = p;
+	env->total_jmp_hist_entries += 1;
 
 	return 0;
 }
@@ -21724,10 +21725,11 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		verbose(env, "\n");
 	}
 	verbose(env, "processed %d insns (limit %d) max_states_per_insn %d "
-		"total_states %d peak_states %d mark_read %d\n",
+		"total_states %d peak_states %d mark_read %d jmp_hist_entries %lld\n",
 		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
 		env->max_states_per_insn, env->total_states,
-		env->peak_states, env->longest_mark_read_walk);
+		env->peak_states, env->longest_mark_read_walk,
+		env->total_jmp_hist_entries);
 }
 
 static int check_struct_ops_btf_id(struct bpf_verifier_env *env)

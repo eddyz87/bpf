@@ -771,6 +771,7 @@ struct bpf_verifier_env {
 	u32 peak_states;
 	/* longest register parentage chain walked for liveness marking */
 	u32 longest_mark_read_walk;
+	u64 total_jmp_hist_entries;
 	bpfptr_t fd_array;
 
 	/* bit mask to keep track of whether a register has been accessed

@@ -31,6 +31,7 @@ enum stat_id {
 	TOTAL_INSNS,
 	TOTAL_STATES,
 	PEAK_STATES,
+	JMP_HIST,
 	MAX_STATES_PER_INSN,
 	MARK_READ_MAX_LEN,
 
@@ -639,19 +640,20 @@ cleanup:
 }
 
 static const struct stat_specs default_output_spec = {
-	.spec_cnt = 7,
+	.spec_cnt = 8,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
-		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
+		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES, JMP_HIST,
 	},
 };
 
 static const struct stat_specs default_csv_output_spec = {
-	.spec_cnt = 9,
+	.spec_cnt = 10,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
 		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
 		MAX_STATES_PER_INSN, MARK_READ_MAX_LEN,
+		JMP_HIST,
 	},
 };
 
@@ -687,6 +689,7 @@ static struct stat_def {
 	[PEAK_STATES] = { "Peak states", {"peak_states"}, },
 	[MAX_STATES_PER_INSN] = { "Max states per insn", {"max_states_per_insn"}, },
 	[MARK_READ_MAX_LEN] = { "Max mark read length", {"max_mark_read_len", "mark_read"}, },
+	[JMP_HIST] = { "JMP hist entries", {"jmp_hist_entries"}, },
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -852,12 +855,13 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 
 		if (1 == sscanf(cur, "verification time %ld usec\n", &s->stats[DURATION]))
 			continue;
-		if (6 == sscanf(cur, "processed %ld insns (limit %*d) max_states_per_insn %ld total_states %ld peak_states %ld mark_read %ld",
+		if (6 == sscanf(cur, "processed %ld insns (limit %*d) max_states_per_insn %ld total_states %ld peak_states %ld mark_read %ld jmp_hist_entries %ld",
 				&s->stats[TOTAL_INSNS],
 				&s->stats[MAX_STATES_PER_INSN],
 				&s->stats[TOTAL_STATES],
 				&s->stats[PEAK_STATES],
-				&s->stats[MARK_READ_MAX_LEN]))
+				&s->stats[MARK_READ_MAX_LEN],
+				&s->stats[JMP_HIST]))
 			continue;
 	}
 
@@ -1284,6 +1288,7 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case TOTAL_INSNS:
 	case TOTAL_STATES:
 	case PEAK_STATES:
+	case JMP_HIST:
 	case MAX_STATES_PER_INSN:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
@@ -1497,6 +1502,7 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case TOTAL_INSNS:
 	case TOTAL_STATES:
 	case PEAK_STATES:
+	case JMP_HIST:
 	case MAX_STATES_PER_INSN:
 	case MARK_READ_MAX_LEN:
 		*val = s ? s->stats[id] : 0;
@@ -1581,6 +1587,7 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case TOTAL_INSNS:
 	case TOTAL_STATES:
 	case PEAK_STATES:
+	case JMP_HIST:
 	case MAX_STATES_PER_INSN:
 	case MARK_READ_MAX_LEN: {
 		long val;
