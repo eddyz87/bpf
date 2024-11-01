@@ -2369,6 +2369,12 @@ static void mark_reg_unknown(struct bpf_verifier_env *env,
 	__mark_reg_unknown(env, regs + regno);
 }
 
+static void mark_reg_kernel_value(struct bpf_reg_state *reg)
+{
+	__mark_reg_unknown_imprecise(reg);
+	reg->type = KERNEL_VALUE;
+}
+
 static int __mark_reg_s32_range(struct bpf_verifier_env *env,
 				struct bpf_reg_state *regs,
 				u32 regno,
@@ -4513,6 +4519,9 @@ static bool __is_pointer_value(bool allow_ptr_leaks,
 			       const struct bpf_reg_state *reg)
 {
 	if (allow_ptr_leaks)
+		return false;
+
+	if (reg->type == KERNEL_VALUE)
 		return false;
 
 	return reg->type != SCALAR_VALUE;
@@ -7169,6 +7178,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 	} else if (reg->type == PTR_TO_ARENA) {
 		if (t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown(env, regs, value_regno);
+	} else if (reg->type == KERNEL_VALUE) {
+		if (t == BPF_READ && value_regno >= 0)
+			mark_reg_kernel_value(regs + value_regno);
 	} else {
 		verbose(env, "R%d invalid mem access '%s'\n", regno,
 			reg_type_str(env, reg->type));
@@ -14229,6 +14241,13 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 
 	if (BPF_SRC(insn->code) == BPF_X) {
 		src_reg = &regs[insn->src_reg];
+
+		if (src_reg->type == KERNEL_VALUE || dst_reg->type == KERNEL_VALUE) {
+			mark_reg_kernel_value(src_reg);
+			mark_reg_kernel_value(dst_reg);
+			return 0;
+		}
+
 		if (src_reg->type != SCALAR_VALUE) {
 			if (dst_reg->type != SCALAR_VALUE) {
 				/* Combining two pointers by any ALU op yields
@@ -14268,6 +14287,9 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 				return err;
 		}
 	} else {
+		if (dst_reg->type == KERNEL_VALUE)
+			return 0;
+
 		/* Pretend the src is a reg with a known value, since we only
 		 * need to be able to read from this state.
 		 */
@@ -15785,6 +15807,11 @@ static int check_ld_abs(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		return -EINVAL;
 	}
 
+	if (inside_inlinable_kfunc(env, env->insn_idx)) {
+		verbose(env, "BPF_LD_[ABS|IND] instructions not allowed for inlinable kfuncs\n");
+		return -EINVAL;
+	}
+
 	/* check whether implicit source operand (register R6) is readable */
 	err = check_reg_arg(env, ctx_reg, SRC_OP);
 	if (err)
@@ -15903,7 +15930,7 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 	}
 
 	if (is_subprog && !frame->in_exception_callback_fn) {
-		if (reg->type != SCALAR_VALUE) {
+		if (reg->type != SCALAR_VALUE && reg->type != KERNEL_VALUE) {
 			verbose(env, "At subprogram exit the register R%d is not a scalar value (%s)\n",
 				regno, reg_type_str(env, reg->type));
 			return -EINVAL;
