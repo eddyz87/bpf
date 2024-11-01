@@ -16,9 +16,13 @@ static void sigusr1_siginfo_handler(int s, siginfo_t *i, void *v)
 	sigusr1_received = (int)(long long)i->si_value.sival_ptr;
 }
 
+static char log_buf[64 * 1024];
+
 static void test_send_signal_common(struct perf_event_attr *attr,
 				    bool signal_thread, bool remote)
 {
+	LIBBPF_OPTS(bpf_object_open_opts, opts, .kernel_log_buf = log_buf,
+						.kernel_log_size = sizeof(log_buf));
 	struct test_send_signal_kern *skel;
 	struct sigaction sa;
 	int pipe_c2p[2], pipe_p2c[2];
@@ -107,8 +111,15 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 	close(pipe_c2p[1]); /* close write */
 	close(pipe_p2c[0]); /* close read */
 
-	skel = test_send_signal_kern__open_and_load();
-	if (!ASSERT_OK_PTR(skel, "skel_open_and_load"))
+	if (env.verbosity >= VERBOSE_SUPER)
+		opts.kernel_log_level = 2;
+	skel = test_send_signal_kern__open_opts(&opts);
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		goto skel_open_load_failure;
+	err = test_send_signal_kern__load(skel);
+	if (env.verbosity >= VERBOSE_SUPER)
+		fprintf(stdout, "VERIFIER LOG:\n=============\n%s=============\n", log_buf);
+	if (!ASSERT_OK(err, "skel_load"))
 		goto skel_open_load_failure;
 
 	/* boost with a high priority so we got a higher chance

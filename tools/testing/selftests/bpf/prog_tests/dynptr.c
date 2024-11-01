@@ -32,26 +32,37 @@ static struct {
 	{"test_dynptr_skb_tp_btf", SETUP_SKB_PROG_TP},
 };
 
+static char log_buf[64 * 1024];
+
 static void verify_success(const char *prog_name, enum test_setup_type setup_type)
 {
+	LIBBPF_OPTS(bpf_object_open_opts, opts, .kernel_log_buf = log_buf,
+						.kernel_log_size = sizeof(log_buf));
 	struct dynptr_success *skel;
 	struct bpf_program *prog;
 	struct bpf_link *link;
+	bool should_load;
 	int err;
 
-	skel = dynptr_success__open();
+	if (env.verbosity >= VERBOSE_SUPER)
+		opts.kernel_log_level = 2;
+	skel = dynptr_success__open_opts(&opts);
 	if (!ASSERT_OK_PTR(skel, "dynptr_success__open"))
 		return;
 
 	skel->bss->pid = getpid();
 
+	bpf_object__for_each_program(prog, skel->obj) {
+		should_load = strcmp(bpf_program__name(prog), prog_name) == 0;
+		bpf_program__set_autoload(prog, should_load);
+	}
 	prog = bpf_object__find_program_by_name(skel->obj, prog_name);
 	if (!ASSERT_OK_PTR(prog, "bpf_object__find_program_by_name"))
 		goto cleanup;
 
-	bpf_program__set_autoload(prog, true);
-
 	err = dynptr_success__load(skel);
+	if (env.verbosity >= VERBOSE_SUPER)
+		fprintf(stdout, "VERIFIER LOG:\n=============\n%s=============\n", log_buf);
 	if (!ASSERT_OK(err, "dynptr_success__load"))
 		goto cleanup;
 
