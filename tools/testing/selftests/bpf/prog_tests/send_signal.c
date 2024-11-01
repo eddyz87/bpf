@@ -18,6 +18,38 @@ static void sigusr1_siginfo_handler(int s, siginfo_t *i, void *v)
 
 static char log_buf[64 * 1024];
 
+static ssize_t read_with_timeout(int fd, void *buf, size_t count)
+{
+	struct timeval tv = { 1, 0 };
+	fd_set fds;
+	int err;
+
+	FD_ZERO(&fds);
+	FD_SET(fd, &fds);
+	err = select(fd + 1, &fds, NULL, NULL, &tv);
+	if (!ASSERT_GE(err, 0, "read select"))
+		return err;
+	if (FD_ISSET(fd, &fds))
+		return read(fd, buf, count);
+	return -EAGAIN;
+}
+
+static ssize_t write_with_timeout(int fd, void *buf, size_t count)
+{
+	struct timeval tv = { 1, 0 };
+	fd_set fds;
+	int err;
+
+	FD_ZERO(&fds);
+	FD_SET(fd, &fds);
+	err = select(fd + 1, NULL, &fds, NULL, &tv);
+	if (!ASSERT_GE(err, 0, "write select"))
+		return err;
+	if (FD_ISSET(fd, &fds))
+		return write(fd, buf, count);
+	return -EAGAIN;
+}
+
 static void test_send_signal_common(struct perf_event_attr *attr,
 				    bool signal_thread, bool remote)
 {
@@ -75,10 +107,10 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 		}
 
 		/* notify parent signal handler is installed */
-		ASSERT_EQ(write(pipe_c2p[1], buf, 1), 1, "pipe_write");
+		ASSERT_EQ(write_with_timeout(pipe_c2p[1], buf, 1), 1, "pipe_write");
 
 		/* make sure parent enabled bpf program to send_signal */
-		ASSERT_EQ(read(pipe_p2c[0], buf, 1), 1, "pipe_read");
+		ASSERT_EQ(read_with_timeout(pipe_p2c[0], buf, 1), 1, "pipe_read");
 
 		/* wait a little for signal handler */
 		for (int i = 0; i < 1000000000 && !sigusr1_received; i++) {
@@ -94,10 +126,10 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 		buf[0] = sigusr1_received;
 
 		ASSERT_EQ(sigusr1_received, 8, "sigusr1_received");
-		ASSERT_EQ(write(pipe_c2p[1], buf, 1), 1, "pipe_write");
+		ASSERT_EQ(write_with_timeout(pipe_c2p[1], buf, 1), 1, "pipe_write");
 
 		/* wait for parent notification and exit */
-		ASSERT_EQ(read(pipe_p2c[0], buf, 1), 1, "pipe_read");
+		ASSERT_EQ(read_with_timeout(pipe_p2c[0], buf, 1), 1, "pipe_read");
 
 		/* restore the old priority */
 		if (!remote)
@@ -158,7 +190,7 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 	}
 
 	/* wait until child signal handler installed */
-	ASSERT_EQ(read(pipe_c2p[0], buf, 1), 1, "pipe_read");
+	ASSERT_EQ(read_with_timeout(pipe_c2p[0], buf, 1), 1, "pipe_read");
 
 	/* trigger the bpf send_signal */
 	skel->bss->signal_thread = signal_thread;
@@ -172,7 +204,7 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 	}
 
 	/* notify child that bpf program can send_signal now */
-	ASSERT_EQ(write(pipe_p2c[1], buf, 1), 1, "pipe_write");
+	ASSERT_EQ(write_with_timeout(pipe_p2c[1], buf, 1), 1, "pipe_write");
 
 	/* For the remote test, the BPF program is triggered from this
 	 * process but the other process/thread is signaled.
@@ -188,7 +220,7 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 	}
 
 	/* wait for result */
-	err = read(pipe_c2p[0], buf, 1);
+	err = read_with_timeout(pipe_c2p[0], buf, 1);
 	if (!ASSERT_GE(err, 0, "reading pipe"))
 		goto disable_pmu;
 	if (!ASSERT_GT(err, 0, "reading pipe error: size 0")) {
@@ -199,7 +231,7 @@ static void test_send_signal_common(struct perf_event_attr *attr,
 	ASSERT_EQ(buf[0], 8, "incorrect result");
 
 	/* notify child safe to exit */
-	ASSERT_EQ(write(pipe_p2c[1], buf, 1), 1, "pipe_write");
+	ASSERT_EQ(write_with_timeout(pipe_p2c[1], buf, 1), 1, "pipe_write");
 
 disable_pmu:
 	close(pmu_fd);
