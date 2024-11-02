@@ -3495,4 +3495,7 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 	return prog->aux->func_idx != 0;
 }
 
+void bpf_unregister_inlinable_kfuncs(struct module *module);
+int bpf_register_inlinable_kfuncs(void *elf_bin, u32 size, struct module *module);
+
 #endif /* _LINUX_BPF_H */

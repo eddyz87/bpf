@@ -672,4 +672,6 @@ static inline bool btf_type_is_struct_ptr(struct btf *btf, const struct btf_type
 	return btf_type_is_struct(t);
 }
 
+struct btf *btf_get_module_btf(const struct module *module);
+
 #endif
