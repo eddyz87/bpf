@@ -763,7 +763,7 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_st
 		verbose(env, " frame%d:", state->frameno);
 	for (i = 0; i < MAX_BPF_REG; i++) {
 		reg = &state->regs[i];
-		if (reg->type == NOT_INIT)
+		if (!print_all && reg->type == NOT_INIT)
 			continue;
 		if (!print_all && !reg_scratched(env, i))
 			continue;

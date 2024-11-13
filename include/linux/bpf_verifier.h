@@ -452,6 +452,7 @@ struct bpf_verifier_state {
 	u32 dfs_depth;
 	u32 callback_unroll_depth;
 	u32 may_goto_depth;
+	u32 id;
 };
 
 #define bpf_get_spilled_reg(slot, frame, mask)				\
@@ -768,6 +769,13 @@ struct bpf_verifier_env {
 	char tmp_str_buf[TMP_STR_BUF_LEN];
 	struct bpf_insn insn_buf[INSN_BUF_SIZE];
 	struct bpf_insn epilogue_buf[INSN_BUF_SIZE];
+	u32 state_id_counter;
+	struct {
+		int frame;
+		int spi;
+		int reg;
+		int not_refsafe;
+	} states_equal_mismatch;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
