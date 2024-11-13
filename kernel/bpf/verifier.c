@@ -1659,6 +1659,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->used_as_loop_entry = src->used_as_loop_entry;
 	dst_state->may_goto_depth = src->may_goto_depth;
 	dst_state->loop_entry = src->loop_entry;
+	dst_state->id = src->id;
 	for (i = 0; i <= src->curframe; i++) {
 		dst = dst_state->frame[i];
 		if (!dst) {
@@ -1933,11 +1934,16 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 	err = copy_verifier_state(&elem->st, cur);
 	if (err)
 		goto err;
+	elem->st.id = env->state_id_counter++;
 	elem->st.speculative |= speculative;
 	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
 		verbose(env, "The sequence of %d jumps is too complex.\n",
 			env->stack_size);
 		goto err;
+	}
+	if (env->log.level & BPF_LOG_LEVEL2) {
+		verbose(env, "push_stack (%d / %d) -> (%d / %d)\n",
+			insn_idx, cur->id, env->insn_idx, elem->st.id);
 	}
 	if (elem->st.parent) {
 		++elem->st.parent->branches;
@@ -17941,6 +17947,8 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 
 		spi = i / BPF_REG_SIZE;
 
+		env->states_equal_mismatch.spi = spi;
+
 		if (exact != NOT_EXACT &&
 		    (i >= cur->allocated_stack ||
 		     old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
@@ -18054,6 +18062,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			return false;
 		}
 	}
+	env->states_equal_mismatch.spi = -1;
 	return true;
 }
 
@@ -18133,11 +18142,18 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	if (old->callback_depth > cur->callback_depth)
 		return false;
 
-	for (i = 0; i < MAX_BPF_REG; i++)
+	env->states_equal_mismatch.spi = -1;
+	env->states_equal_mismatch.reg = -1;
+	env->states_equal_mismatch.not_refsafe = -1;
+
+	for (i = 0; i < MAX_BPF_REG; i++) {
+		env->states_equal_mismatch.reg = i;
 		if (((1 << i) & live_regs) &&
 		    !regsafe(env, &old->regs[i], &cur->regs[i],
 			     &env->idmap_scratch, exact))
 			return false;
+	}
+	env->states_equal_mismatch.reg = -1;
 
 	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact))
 		return false;
@@ -18173,13 +18189,17 @@ static bool states_equal(struct bpf_verifier_env *env,
 	if (old->in_sleepable != cur->in_sleepable)
 		return false;
 
-	if (!refsafe(old, cur, &env->idmap_scratch))
+	if (!refsafe(old, cur, &env->idmap_scratch)) {
+		env->states_equal_mismatch.not_refsafe = 1;
 		return false;
+	}
 
 	/* for states to be equal callsites have to be the same
 	 * and all frame states need to be equivalent
 	 */
+	env->states_equal_mismatch.frame = -1;
 	for (i = 0; i <= old->curframe; i++) {
+		env->states_equal_mismatch.frame = i;
 		insn_idx = i == old->curframe
 			   ? env->insn_idx
 			   : old->frame[i + 1]->callsite;
@@ -18188,6 +18208,7 @@ static bool states_equal(struct bpf_verifier_env *env,
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
+	env->states_equal_mismatch.frame = -1;
 	return true;
 }
 
@@ -18525,6 +18546,13 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 			 * => unsafe memory access at 11 would not be caught.
 			 */
 			if (is_iter_next_insn(env, insn_idx)) {
+				if (cur->curframe == sl->state.curframe) {
+					verbose(env, "is_state_visited, is_iter_next_insn (%d):\n", insn_idx);
+					verbose(env, "cur    (%d / %d): ", insn_idx, cur->id);
+					print_verifier_state(env, cur, cur->curframe, true);
+					verbose(env, "cached (%d / %d): ", insn_idx, sl->state.id);
+					print_verifier_state(env, &sl->state, cur->curframe, true);
+				}
 				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
 					struct bpf_func_state *cur_frame;
 					struct bpf_reg_state *iter_state, *iter_reg;
@@ -18545,6 +18573,12 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 						update_loop_entry(cur, &sl->state);
 						goto hit;
 					}
+				} else if (cur->curframe == sl->state.curframe) {
+					verbose(env, "states not equal: frame=%d, spi=%d, reg=%d, not_refsafe=%d\n",
+						env->states_equal_mismatch.frame,
+						env->states_equal_mismatch.spi,
+						env->states_equal_mismatch.reg,
+						env->states_equal_mismatch.not_refsafe);
 				}
 				goto skip_inf_loop_check;
 			}
@@ -18671,6 +18705,7 @@ miss:
 			/* the state is unlikely to be useful. Remove it to
 			 * speed up verification
 			 */
+			verbose(env, "evicting state (%d / %d)\n", insn_idx, sl->state.id);
 			*pprev = sl->next;
 			if (sl->state.frame[0]->regs[0].live & REG_LIVE_DONE &&
 			    !sl->state.used_as_loop_entry) {
@@ -18744,6 +18779,14 @@ next:
 	cur->first_insn_idx = insn_idx;
 	cur->insn_hist_start = cur->insn_hist_end;
 	cur->dfs_depth = new->dfs_depth + 1;
+	cur->id = env->state_id_counter++;
+	if (env->log.level & BPF_LOG_LEVEL2) {
+		int jmps_delta = env->jmps_processed - env->prev_jmps_processed;
+		int insn_delta = env->insn_processed - env->prev_insn_processed;
+
+		verbose(env, "new state (%d / %d) -> (%d / %d) jd=%d id=%d fn=%d\n",
+			insn_idx, new->id, insn_idx, cur->id, jmps_delta, insn_delta, force_new_state);
+	}
 	new_sl->next = *explored_state(env, insn_idx);
 	*explored_state(env, insn_idx) = new_sl;
 	/* connect new state to parentage chain. Current frame needs all
