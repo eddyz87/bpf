@@ -536,7 +536,6 @@ static char slot_type_char[] = {
 	[STACK_MISC]	= 'm',
 	[STACK_ZERO]	= '0',
 	[STACK_DYNPTR]	= 'd',
-	[STACK_ITER]	= 'i',
 	[STACK_IRQ_FLAG] = 'f'
 };
 
@@ -776,6 +775,7 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 	}
 	for (i = 0; i < state->allocated_stack / BPF_REG_SIZE; i++) {
 		char types_buf[BPF_REG_SIZE + 1];
+		struct bpf_stack_state *slot;
 		const char *sep = "";
 		bool valid = false;
 		u8 slot_type;
@@ -784,17 +784,36 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 		if (!print_all && !stack_slot_scratched(env, i))
 			continue;
 
-		for (j = 0; j < BPF_REG_SIZE; j++) {
-			slot_type = state->stack[i].slot_type[j];
-			if (slot_type != STACK_INVALID)
-				valid = true;
-			types_buf[j] = slot_type_char[slot_type];
+		slot = &state->stack[i];
+		reg = &slot->spilled_ptr;
+		switch (slot->type) {
+		case STACK_OBJ_NONE:
+			for (j = 0; j < BPF_REG_SIZE; j++) {
+				slot_type = slot->slot_type[j];
+				if (slot_type != STACK_INVALID)
+					valid = true;
+				types_buf[j] = slot_type_char[slot_type];
+			}
+			if (!valid)
+				continue;
+			break;
+		case STACK_OBJ_ITER:
+			for (j = 0; j < BPF_REG_SIZE; j++)
+				types_buf[j] = 'i';
+			/* only main slot has ref_obj_id set; skip others */
+			if (!slot->ref_obj_id)
+				continue;
+
+			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
+			print_liveness(env, reg->live);
+			verbose(env, "=iter_%s(ref_id=%d,state=%s,depth=%u)",
+				iter_type_str(slot->iter.btf, slot->iter.btf_id),
+				slot->ref_obj_id, iter_state_str(slot->iter.state),
+				slot->iter.depth);
+			continue;
 		}
 		types_buf[BPF_REG_SIZE] = 0;
-		if (!valid)
-			continue;
 
-		reg = &state->stack[i].spilled_ptr;
 		switch (state->stack[i].slot_type[BPF_REG_SIZE - 1]) {
 		case STACK_SPILL:
 			/* print MISC/ZERO/INVALID slots above subreg spill */
@@ -823,18 +842,6 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 			if (reg->dynptr_id)
 				verbose_a("dynptr_id=%d", reg->dynptr_id);
 			verbose(env, ")");
-			break;
-		case STACK_ITER:
-			/* only main slot has ref_obj_id set; skip others */
-			if (!reg->ref_obj_id)
-				continue;
-
-			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
-			print_liveness(env, reg->live);
-			verbose(env, "=iter_%s(ref_id=%d,state=%s,depth=%u)",
-				iter_type_str(reg->iter.btf, reg->iter.btf_id),
-				reg->ref_obj_id, iter_state_str(reg->iter.state),
-				reg->iter.depth);
 			break;
 		case STACK_MISC:
 		case STACK_ZERO:

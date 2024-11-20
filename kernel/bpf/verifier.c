@@ -1053,7 +1053,7 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 				 struct btf *btf, u32 btf_id, int nr_slots)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int spi, i, j, id;
+	int spi, i, id;
 
 	spi = iter_get_spi(env, reg, nr_slots);
 	if (spi < 0)
@@ -1070,18 +1070,16 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 		__mark_reg_known_zero(st);
 		st->type = PTR_TO_STACK; /* we don't have dedicated reg type */
 		if (is_kfunc_rcu_protected(meta)) {
-			st->iter.rcu_protected = 1;
-			st->iter.rcu_expired = !in_rcu_cs(env);
+			slot->iter.rcu_protected = 1;
+			slot->iter.rcu_expired = !in_rcu_cs(env);
 		}
 		st->live |= REG_LIVE_WRITTEN;
-		st->ref_obj_id = i == 0 ? id : 0;
-		st->iter.btf = btf;
-		st->iter.btf_id = btf_id;
-		st->iter.state = BPF_ITER_STATE_ACTIVE;
-		st->iter.depth = 0;
-
-		for (j = 0; j < BPF_REG_SIZE; j++)
-			slot->slot_type[j] = STACK_ITER;
+		slot->type = STACK_OBJ_ITER;
+		slot->ref_obj_id = i == 0 ? id : 0;
+		slot->iter.btf = btf;
+		slot->iter.btf_id = btf_id;
+		slot->iter.state = BPF_ITER_STATE_ACTIVE;
+		slot->iter.depth = 0;
 
 		mark_stack_slot_scratched(env, spi - i);
 	}
@@ -1104,13 +1102,14 @@ static int unmark_stack_slots_iter(struct bpf_verifier_env *env,
 		struct bpf_reg_state *st = &slot->spilled_ptr;
 
 		if (i == 0)
-			WARN_ON_ONCE(release_reference(env, st->ref_obj_id));
+			WARN_ON_ONCE(release_reference(env, slot->ref_obj_id));
 
 		__mark_reg_not_init(env, st);
 
 		/* see unmark_stack_slots_dynptr() for why we need to set REG_LIVE_WRITTEN */
 		st->live |= REG_LIVE_WRITTEN;
 
+		slot->type = STACK_OBJ_NONE;
 		for (j = 0; j < BPF_REG_SIZE; j++)
 			slot->slot_type[j] = STACK_INVALID;
 
@@ -1124,7 +1123,7 @@ static bool is_iter_reg_valid_uninit(struct bpf_verifier_env *env,
 				     struct bpf_reg_state *reg, int nr_slots)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int spi, i, j;
+	int spi, i;
 
 	/* For -ERANGE (i.e. spi not falling into allocated stack slots), we
 	 * will do check_mem_access to check and update stack bounds later, so
@@ -1136,13 +1135,9 @@ static bool is_iter_reg_valid_uninit(struct bpf_verifier_env *env,
 	if (spi < 0)
 		return false;
 
-	for (i = 0; i < nr_slots; i++) {
-		struct bpf_stack_state *slot = &state->stack[spi - i];
-
-		for (j = 0; j < BPF_REG_SIZE; j++)
-			if (slot->slot_type[j] == STACK_ITER)
-				return false;
-	}
+	for (i = 0; i < nr_slots; i++)
+		if (state->stack[spi - i].type == STACK_OBJ_ITER)
+			return false;
 
 	return true;
 }
@@ -1151,7 +1146,7 @@ static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_s
 				   struct btf *btf, u32 btf_id, int nr_slots)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int spi, i, j;
+	int spi, i;
 
 	spi = iter_get_spi(env, reg, nr_slots);
 	if (spi < 0)
@@ -1159,24 +1154,39 @@ static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_s
 
 	for (i = 0; i < nr_slots; i++) {
 		struct bpf_stack_state *slot = &state->stack[spi - i];
-		struct bpf_reg_state *st = &slot->spilled_ptr;
 
-		if (st->iter.rcu_expired)
+		if (slot->type != STACK_OBJ_ITER)
+			return -EINVAL;
+		if (slot->iter.rcu_expired)
 			return -EPROTO;
 		/* only main (first) slot has ref_obj_id set */
-		if (i == 0 && !st->ref_obj_id)
+		if (i == 0 && !slot->ref_obj_id)
 			return -EINVAL;
-		if (i != 0 && st->ref_obj_id)
+		if (i != 0 && slot->ref_obj_id)
 			return -EINVAL;
-		if (st->iter.btf != btf || st->iter.btf_id != btf_id)
+		if (slot->iter.btf != btf || slot->iter.btf_id != btf_id)
 			return -EINVAL;
-
-		for (j = 0; j < BPF_REG_SIZE; j++)
-			if (slot->slot_type[j] != STACK_ITER)
-				return -EINVAL;
 	}
 
 	return 0;
+}
+
+static void destroy_if_iter_stack_slot(struct bpf_verifier_env *env,
+				       struct bpf_func_state *state, int spi)
+{
+	struct bpf_stack_state *slot;
+
+	slot = &state->stack[spi];
+	if (slot->type != STACK_OBJ_ITER)
+		return;
+
+	/* do not destroy all spi's belonging to this iterator,
+	 * rely on is_iter_reg_valid_init() to check every slot instead.
+	 */
+	memset(&slot->raw, 0, sizeof(slot->raw));
+	slot->spilled_ptr.live |= REG_LIVE_WRITTEN;
+	slot->type = STACK_OBJ_NONE;
+	slot->ref_obj_id = 0;
 }
 
 static int acquire_irq_state(struct bpf_verifier_env *env, int insn_idx);
@@ -1307,17 +1317,18 @@ static int is_irq_flag_reg_valid_init(struct bpf_verifier_env *env, struct bpf_r
 /* Check if given stack slot is "special":
  *   - spilled register state (STACK_SPILL);
  *   - dynptr state (STACK_DYNPTR);
- *   - iter state (STACK_ITER).
  *   - irq flag state (STACK_IRQ_FLAG)
  */
 static bool is_stack_slot_special(const struct bpf_stack_state *stack)
 {
 	enum bpf_stack_slot_type type = stack->slot_type[BPF_REG_SIZE - 1];
 
+	if (stack->type != STACK_OBJ_NONE)
+		return true;
+
 	switch (type) {
 	case STACK_SPILL:
 	case STACK_DYNPTR:
-	case STACK_ITER:
 	case STACK_IRQ_FLAG:
 		return true;
 	case STACK_INVALID:
@@ -4925,6 +4936,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	if (err)
 		return err;
 
+	destroy_if_iter_stack_slot(env, state, spi);
 	check_fastcall_stack_contract(env, state, insn_idx, off);
 	mark_stack_slot_scratched(env, spi);
 	if (reg && !(off % BPF_REG_SIZE) && reg->type == SCALAR_VALUE && env->bpf_capable) {
@@ -5058,6 +5070,7 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 		err = destroy_if_dynptr_stack_slot(env, state, spi);
 		if (err)
 			return err;
+		destroy_if_iter_stack_slot(env, state, spi);
 	}
 
 	check_fastcall_stack_contract(env, state, insn_idx, min_off);
@@ -5197,6 +5210,11 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 
 	stype = reg_state->stack[spi].slot_type;
 	reg = &reg_state->stack[spi].spilled_ptr;
+
+	if (reg_state->stack[spi].type != STACK_OBJ_NONE) {
+		verbose(env, "invalid read from stack off %d size %d\n", off, size);
+		return -EINVAL;
+	}
 
 	mark_stack_slot_scratched(env, spi);
 	check_fastcall_stack_contract(env, state, env->insn_idx, off);
@@ -7776,6 +7794,8 @@ static int check_stack_range_initialized(
 			return -EFAULT;
 		}
 
+		if (state->stack[spi].type != STACK_OBJ_NONE)
+			goto eaccess;
 		stype = &state->stack[spi].slot_type[slot % BPF_REG_SIZE];
 		if (*stype == STACK_MISC)
 			goto mark;
@@ -7799,6 +7819,7 @@ static int check_stack_range_initialized(
 			goto mark;
 		}
 
+eaccess:
 		if (tnum_is_const(reg->var_off)) {
 			verbose(env, "invalid%s read from stack R%d off %d+%d size %d\n",
 				err_extra, regno, min_off, i - min_off, access_size);
@@ -8343,7 +8364,7 @@ static u32 iter_ref_obj_id(struct bpf_verifier_env *env, struct bpf_reg_state *r
 {
 	struct bpf_func_state *state = func(env, reg);
 
-	return state->stack[spi].spilled_ptr.ref_obj_id;
+	return state->stack[spi].ref_obj_id;
 }
 
 static bool is_iter_kfunc(struct bpf_kfunc_call_arg_meta *meta)
@@ -8540,13 +8561,13 @@ static int widen_imprecise_scalars(struct bpf_verifier_env *env,
 	return 0;
 }
 
-static struct bpf_reg_state *get_iter_from_state(struct bpf_verifier_state *cur_st,
+static struct bpf_stack_state *get_iter_from_state(struct bpf_verifier_state *cur_st,
 						 struct bpf_kfunc_call_arg_meta *meta)
 {
 	int iter_frameno = meta->iter.frameno;
 	int iter_spi = meta->iter.spi;
 
-	return &cur_st->frame[iter_frameno]->stack[iter_spi].spilled_ptr;
+	return &cur_st->frame[iter_frameno]->stack[iter_spi];
 }
 
 /* process_iter_next_call() is called when verifier gets to iterator's next
@@ -8632,7 +8653,7 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 {
 	struct bpf_verifier_state *cur_st = env->cur_state, *queued_st, *prev_st;
 	struct bpf_func_state *cur_fr = cur_st->frame[cur_st->curframe], *queued_fr;
-	struct bpf_reg_state *cur_iter, *queued_iter;
+	struct bpf_stack_state *cur_iter, *queued_iter;
 
 	BTF_TYPE_EMIT(struct bpf_iter);
 
@@ -13083,9 +13104,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				}
 			}));
 			while ((slot = stack_iter_next(env->cur_state, &stack_iter))) {
-				if (slot->slot_type[0] == STACK_ITER &&
-				    slot->spilled_ptr.iter.rcu_protected)
-					slot->spilled_ptr.iter.rcu_expired = 1;
+				if (slot->type == STACK_OBJ_ITER &&
+				    slot->iter.rcu_protected)
+					slot->iter.rcu_expired = 1;
 			}
 			env->cur_state->active_rcu_lock = false;
 		} else if (sleepable) {
@@ -13395,7 +13416,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				regs[BPF_REG_0].type |= PTR_UNTRUSTED;
 
 			if (is_iter_next_kfunc(&meta)) {
-				struct bpf_reg_state *cur_iter;
+				struct bpf_stack_state *cur_iter;
 
 				cur_iter = get_iter_from_state(env->cur_state, &meta);
 				/* check_kfunc_args() ensures this */
@@ -17962,6 +17983,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 	 * didn't use them
 	 */
 	for (i = 0; i < old->allocated_stack; i++) {
+		struct bpf_stack_state *old_slot, *cur_slot;
 		struct bpf_reg_state *old_reg, *cur_reg;
 
 		spi = i / BPF_REG_SIZE;
@@ -18023,6 +18045,33 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			return false;
 		if (i % BPF_REG_SIZE != BPF_REG_SIZE - 1)
 			continue;
+
+		if (old->stack[spi].type != cur->stack[spi].type)
+			return false;
+
+		switch (old->stack[spi].type) {
+		case STACK_OBJ_NONE:
+			break;
+		case STACK_OBJ_ITER:
+			old_slot = &old->stack[spi];
+			cur_slot = &cur->stack[spi];
+			/* iter.depth is not compared between states as it
+			 * doesn't matter for correctness and would otherwise
+			 * prevent convergence; we maintain it only to prevent
+			 * infinite loop check triggering, see
+			 * iter_active_depths_differ()
+			 */
+			if (old_slot->iter.btf != cur_slot->iter.btf ||
+			    old_slot->iter.btf_id != cur_slot->iter.btf_id ||
+			    old_slot->iter.state != cur_slot->iter.state ||
+			    /* ignore {old_slot,cur_slot}->iter.depth, see above */
+			    !check_ids(old_slot->ref_obj_id, cur_slot->ref_obj_id, idmap))
+				return false;
+			break;
+		default:
+			return false;
+		}
+
 		/* Both old and cur are having same slot_type */
 		switch (old->stack[spi].slot_type[BPF_REG_SIZE - 1]) {
 		case STACK_SPILL:
@@ -18045,22 +18094,6 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			cur_reg = &cur->stack[spi].spilled_ptr;
 			if (old_reg->dynptr.type != cur_reg->dynptr.type ||
 			    old_reg->dynptr.first_slot != cur_reg->dynptr.first_slot ||
-			    !check_ids(old_reg->ref_obj_id, cur_reg->ref_obj_id, idmap))
-				return false;
-			break;
-		case STACK_ITER:
-			old_reg = &old->stack[spi].spilled_ptr;
-			cur_reg = &cur->stack[spi].spilled_ptr;
-			/* iter.depth is not compared between states as it
-			 * doesn't matter for correctness and would otherwise
-			 * prevent convergence; we maintain it only to prevent
-			 * infinite loop check triggering, see
-			 * iter_active_depths_differ()
-			 */
-			if (old_reg->iter.btf != cur_reg->iter.btf ||
-			    old_reg->iter.btf_id != cur_reg->iter.btf_id ||
-			    old_reg->iter.state != cur_reg->iter.state ||
-			    /* ignore {old_reg,cur_reg}->iter.depth, see above */
 			    !check_ids(old_reg->ref_obj_id, cur_reg->ref_obj_id, idmap))
 				return false;
 			break;
@@ -18432,21 +18465,21 @@ static bool is_iter_next_insn(struct bpf_verifier_env *env, int insn_idx)
  */
 static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf_verifier_state *cur)
 {
-	struct bpf_reg_state *slot, *cur_slot;
+	struct bpf_stack_state *slot, *cur_slot;
 	struct bpf_func_state *state;
 	int i, fr;
 
 	for (fr = old->curframe; fr >= 0; fr--) {
 		state = old->frame[fr];
 		for (i = 0; i < state->allocated_stack / BPF_REG_SIZE; i++) {
-			if (state->stack[i].slot_type[0] != STACK_ITER)
+			if (state->stack[i].type != STACK_OBJ_ITER)
 				continue;
 
-			slot = &state->stack[i].spilled_ptr;
+			slot = &state->stack[i];
 			if (slot->iter.state != BPF_ITER_STATE_ACTIVE)
 				continue;
 
-			cur_slot = &cur->frame[fr]->stack[i].spilled_ptr;
+			cur_slot = &cur->frame[fr]->stack[i];
 			if (cur_slot->iter.depth != slot->iter.depth)
 				return true;
 		}
@@ -18545,8 +18578,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 			 */
 			if (is_iter_next_insn(env, insn_idx)) {
 				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+					struct bpf_stack_state *iter_state;
 					struct bpf_func_state *cur_frame;
-					struct bpf_reg_state *iter_state, *iter_reg;
+					struct bpf_reg_state *iter_reg;
 					int spi;
 
 					cur_frame = cur->frame[cur->curframe];
@@ -18559,7 +18593,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 					 * no need for extra (re-)validations
 					 */
 					spi = __get_spi(iter_reg->off + iter_reg->var_off.value);
-					iter_state = &func(env, iter_reg)->stack[spi].spilled_ptr;
+					iter_state = &func(env, iter_reg)->stack[spi];
 					if (iter_state->iter.state == BPF_ITER_STATE_ACTIVE) {
 						update_loop_entry(cur, &sl->state);
 						goto hit;

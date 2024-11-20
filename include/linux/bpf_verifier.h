@@ -103,20 +103,6 @@ struct bpf_reg_state {
 			bool first_slot;
 		} dynptr;
 
-		/* For bpf_iter stack slots */
-		struct {
-			/* BTF container and BTF type ID describing
-			 * struct bpf_iter_<type> of an iterator state
-			 */
-			struct btf *btf;
-			u32 btf_id;
-			/* packing following two fields to fit iter state into 16 bytes */
-			enum bpf_iter_state state:2;
-			u32 rcu_protected:1;
-			u32 rcu_expired:1;
-			int depth:28;
-		} iter;
-
 		/* Max size from any of the above. */
 		struct {
 			unsigned long raw1;
@@ -234,8 +220,12 @@ enum bpf_stack_slot_type {
 	 * is stored in bpf_stack_state->spilled_ptr.dynptr.type
 	 */
 	STACK_DYNPTR,
-	STACK_ITER,
 	STACK_IRQ_FLAG,
+};
+
+enum bpf_stack_obj_type {
+	STACK_OBJ_NONE,
+	STACK_OBJ_ITER,
 };
 
 #define BPF_REG_SIZE 8	/* size of eBPF register in bytes */
@@ -250,6 +240,29 @@ enum bpf_stack_slot_type {
 struct bpf_stack_state {
 	struct bpf_reg_state spilled_ptr;
 	u8 slot_type[BPF_REG_SIZE];
+	u32 ref_obj_id;
+	enum bpf_stack_obj_type type;
+	union {
+		/* For bpf_iter stack slots */
+		struct {
+			/* BTF container and BTF type ID describing
+			 * struct bpf_iter_<type> of an iterator state
+			 */
+			struct btf *btf;
+			u32 btf_id;
+			/* packing following two fields to fit iter state into 16 bytes */
+			enum bpf_iter_state state:2;
+			u32 rcu_protected:1;
+			u32 rcu_expired:1;
+			int depth:28;
+		} iter;
+
+		/* Max size from any of the above. */
+		struct {
+			u64 :64;
+			u64 :64;
+		} raw;
+	};
 };
 
 struct bpf_reference_state {
