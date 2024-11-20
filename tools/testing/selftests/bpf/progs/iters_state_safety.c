@@ -364,6 +364,40 @@ int __naked read_from_iter_slot_fail(void)
 	);
 }
 
+SEC("?raw_tp")
+__failure __msg("invalid read from stack")
+int __naked read_var_off_from_iter_slot_fail(void)
+{
+	asm volatile (
+		/* r6 points to struct bpf_iter_num on the stack */
+		"r6 = r10;"
+		"r6 += -24;"
+
+		/* create iterator */
+		"r1 = r6;"
+		"r2 = 0;"
+		"r3 = 1000;"
+		"call %[bpf_iter_num_new];"
+
+		/* attemp to leak bpf_iter_num state, use variable offset */
+		"call %[bpf_get_prandom_u32];"
+		"r0 &= 0x1;"
+		"r0 <<= 3;"
+		"r1 = r6;"
+		"r1 += r0;"
+		"r7 = *(u64 *)(r1 + 0);"
+
+		/* destroy iterator */
+		"r1 = r6;"
+		"call %[bpf_iter_num_destroy];"
+		"exit;"
+		:
+		: ITER_HELPERS,
+		  __imm(bpf_get_prandom_u32)
+		: __clobber_all
+	);
+}
+
 int zero;
 
 SEC("?raw_tp")
