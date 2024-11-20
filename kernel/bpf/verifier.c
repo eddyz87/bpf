@@ -344,6 +344,26 @@ struct bpf_kfunc_call_arg_meta {
 	u64 mem_size;
 };
 
+struct stack_iter {
+	u32 frame;
+	u32 spi;
+};
+
+static struct bpf_stack_state *stack_iter_next(struct bpf_verifier_state *vstate,
+					       struct stack_iter *iter)
+{
+	struct bpf_func_state *frame;
+
+	while (iter->frame <= vstate->curframe) {
+		frame = vstate->frame[iter->frame];
+		if (iter->spi < frame->allocated_stack / BPF_REG_SIZE)
+			return &frame->stack[iter->spi++];
+		iter->frame++;
+		iter->spi = 0;
+	}
+	return NULL;
+}
+
 struct btf *btf_vmlinux;
 
 static const char *btf_type_name(const struct btf *btf, u32 id)
@@ -1050,10 +1070,8 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 		__mark_reg_known_zero(st);
 		st->type = PTR_TO_STACK; /* we don't have dedicated reg type */
 		if (is_kfunc_rcu_protected(meta)) {
-			if (in_rcu_cs(env))
-				st->type |= MEM_RCU;
-			else
-				st->type |= PTR_UNTRUSTED;
+			st->iter.rcu_protected = 1;
+			st->iter.rcu_expired = !in_rcu_cs(env);
 		}
 		st->live |= REG_LIVE_WRITTEN;
 		st->ref_obj_id = i == 0 ? id : 0;
@@ -1143,7 +1161,7 @@ static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_s
 		struct bpf_stack_state *slot = &state->stack[spi - i];
 		struct bpf_reg_state *st = &slot->spilled_ptr;
 
-		if (st->type & PTR_UNTRUSTED)
+		if (st->iter.rcu_expired)
 			return -EPROTO;
 		/* only main (first) slot has ref_obj_id set */
 		if (i == 0 && !st->ref_obj_id)
@@ -13044,9 +13062,10 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	preempt_enable = is_kfunc_bpf_preempt_enable(&meta);
 
 	if (env->cur_state->active_rcu_lock) {
+		struct stack_iter stack_iter = {};
+		struct bpf_stack_state *slot;
 		struct bpf_func_state *state;
 		struct bpf_reg_state *reg;
-		u32 clear_mask = (1 << STACK_SPILL) | (1 << STACK_ITER);
 
 		if (in_rbtree_lock_required_cb(env) && (rcu_lock || rcu_unlock)) {
 			verbose(env, "Calling bpf_rcu_read_{lock,unlock} in unnecessary rbtree callback\n");
@@ -13057,12 +13076,17 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "nested rcu read lock (kernel function %s)\n", func_name);
 			return -EINVAL;
 		} else if (rcu_unlock) {
-			bpf_for_each_reg_in_vstate_mask(env->cur_state, state, reg, clear_mask, ({
+			bpf_for_each_reg_in_vstate(env->cur_state, state, reg, ({
 				if (reg->type & MEM_RCU) {
 					reg->type &= ~(MEM_RCU | PTR_MAYBE_NULL);
 					reg->type |= PTR_UNTRUSTED;
 				}
 			}));
+			while ((slot = stack_iter_next(env->cur_state, &stack_iter))) {
+				if (slot->slot_type[0] == STACK_ITER &&
+				    slot->spilled_ptr.iter.rcu_protected)
+					slot->spilled_ptr.iter.rcu_expired = 1;
+			}
 			env->cur_state->active_rcu_lock = false;
 		} else if (sleepable) {
 			verbose(env, "kernel func %s is sleepable within rcu_read_lock region\n", func_name);
@@ -13374,8 +13398,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				struct bpf_reg_state *cur_iter;
 
 				cur_iter = get_iter_from_state(env->cur_state, &meta);
+				/* check_kfunc_args() ensures this */
+				if (WARN_ON_ONCE(cur_iter->iter.rcu_expired))
+					return -EFAULT;
 
-				if (cur_iter->type & MEM_RCU) /* KF_RCU_PROTECTED */
+				if (cur_iter->iter.rcu_protected) /* KF_RCU_PROTECTED */
 					regs[BPF_REG_0].type |= MEM_RCU;
 				else
 					regs[BPF_REG_0].type |= PTR_TRUSTED;

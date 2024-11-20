@@ -112,7 +112,9 @@ struct bpf_reg_state {
 			u32 btf_id;
 			/* packing following two fields to fit iter state into 16 bytes */
 			enum bpf_iter_state state:2;
-			int depth:30;
+			u32 rcu_protected:1;
+			u32 rcu_expired:1;
+			int depth:28;
 		} iter;
 
 		/* Max size from any of the above. */
