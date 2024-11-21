@@ -723,7 +723,7 @@ static bool dynptr_type_refcounted(enum bpf_dynptr_type type)
 	return type == BPF_DYNPTR_TYPE_RINGBUF;
 }
 
-static void __mark_dynptr_reg(struct bpf_reg_state *reg,
+static void __mark_dynptr_slot(struct bpf_stack_state *slot,
 			      enum bpf_dynptr_type type,
 			      bool first_slot, int dynptr_id);
 
@@ -731,21 +731,14 @@ static void __mark_reg_not_init(const struct bpf_verifier_env *env,
 				struct bpf_reg_state *reg);
 
 static void mark_dynptr_stack_regs(struct bpf_verifier_env *env,
-				   struct bpf_reg_state *sreg1,
-				   struct bpf_reg_state *sreg2,
+				   struct bpf_stack_state *slot1,
+				   struct bpf_stack_state *slot2,
 				   enum bpf_dynptr_type type)
 {
 	int id = ++env->id_gen;
 
-	__mark_dynptr_reg(sreg1, type, true, id);
-	__mark_dynptr_reg(sreg2, type, false, id);
-}
-
-static void mark_dynptr_cb_reg(struct bpf_verifier_env *env,
-			       struct bpf_reg_state *reg,
-			       enum bpf_dynptr_type type)
-{
-	__mark_dynptr_reg(reg, type, true, ++env->id_gen);
+	__mark_dynptr_slot(slot1, type, true, id);
+	__mark_dynptr_slot(slot2, type, false, id);
 }
 
 static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
@@ -779,16 +772,15 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 		return err;
 
 	for (i = 0; i < BPF_REG_SIZE; i++) {
-		state->stack[spi].slot_type[i] = STACK_DYNPTR;
-		state->stack[spi - 1].slot_type[i] = STACK_DYNPTR;
+		state->stack[spi].slot_type[i] = STACK_INVALID;
+		state->stack[spi - 1].slot_type[i] = STACK_INVALID;
 	}
 
 	type = arg_to_dynptr_type(arg_type);
 	if (type == BPF_DYNPTR_TYPE_INVALID)
 		return -EINVAL;
 
-	mark_dynptr_stack_regs(env, &state->stack[spi].spilled_ptr,
-			       &state->stack[spi - 1].spilled_ptr, type);
+	mark_dynptr_stack_regs(env, &state->stack[spi], &state->stack[spi - 1], type);
 
 	if (dynptr_type_refcounted(type)) {
 		/* The id is used to track proper releasing */
@@ -802,8 +794,8 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 		if (id < 0)
 			return id;
 
-		state->stack[spi].spilled_ptr.ref_obj_id = id;
-		state->stack[spi - 1].spilled_ptr.ref_obj_id = id;
+		state->stack[spi].ref_obj_id = id;
+		state->stack[spi - 1].ref_obj_id = id;
 	}
 
 	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
@@ -823,6 +815,10 @@ static void invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_stat
 
 	__mark_reg_not_init(env, &state->stack[spi].spilled_ptr);
 	__mark_reg_not_init(env, &state->stack[spi - 1].spilled_ptr);
+
+	state->stack[spi].ref_obj_id = 0;
+	state->stack[spi].type = STACK_OBJ_NONE;
+	memset(&state->stack[spi].raw, 0, sizeof(state->stack[spi].raw));
 
 	/* Why do we need to set REG_LIVE_WRITTEN for STACK_INVALID slot?
 	 *
@@ -858,12 +854,12 @@ static int unmark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_re
 	if (spi < 0)
 		return spi;
 
-	if (!dynptr_type_refcounted(state->stack[spi].spilled_ptr.dynptr.type)) {
+	if (!dynptr_type_refcounted(state->stack[spi].dynptr.type)) {
 		invalidate_dynptr(env, state, spi);
 		return 0;
 	}
 
-	ref_obj_id = state->stack[spi].spilled_ptr.ref_obj_id;
+	ref_obj_id = state->stack[spi].ref_obj_id;
 
 	/* If the dynptr has a ref_obj_id, then we need to invalidate
 	 * two things:
@@ -877,18 +873,18 @@ static int unmark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_re
 
 	/* Invalidate any dynptr clones */
 	for (i = 1; i < state->allocated_stack / BPF_REG_SIZE; i++) {
-		if (state->stack[i].spilled_ptr.ref_obj_id != ref_obj_id)
+		if (state->stack[i].ref_obj_id != ref_obj_id)
 			continue;
 
 		/* it should always be the case that if the ref obj id
 		 * matches then the stack slot also belongs to a
 		 * dynptr
 		 */
-		if (state->stack[i].slot_type[0] != STACK_DYNPTR) {
+		if (state->stack[i].type != STACK_OBJ_DYNPTR) {
 			verbose(env, "verifier internal error: misconfigured ref_obj_id\n");
 			return -EFAULT;
 		}
-		if (state->stack[i].spilled_ptr.dynptr.first_slot)
+		if (state->stack[i].dynptr.first_slot)
 			invalidate_dynptr(env, state, i);
 	}
 
@@ -911,21 +907,16 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 {
 	struct bpf_func_state *fstate;
 	struct bpf_reg_state *dreg;
-	int i, dynptr_id;
+	int dynptr_id;
 
-	/* We always ensure that STACK_DYNPTR is never set partially,
-	 * hence just checking for slot_type[0] is enough. This is
-	 * different for STACK_SPILL, where it may be only set for
-	 * 1 byte, so code has to use is_spilled_reg.
-	 */
-	if (state->stack[spi].slot_type[0] != STACK_DYNPTR)
+	if (state->stack[spi].type != STACK_OBJ_DYNPTR)
 		return 0;
 
 	/* Reposition spi to first slot */
-	if (!state->stack[spi].spilled_ptr.dynptr.first_slot)
+	if (!state->stack[spi].dynptr.first_slot)
 		spi = spi + 1;
 
-	if (dynptr_type_refcounted(state->stack[spi].spilled_ptr.dynptr.type)) {
+	if (dynptr_type_refcounted(state->stack[spi].dynptr.type)) {
 		verbose(env, "cannot overwrite referenced dynptr\n");
 		return -EINVAL;
 	}
@@ -933,13 +924,7 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 	mark_stack_slot_scratched(env, spi);
 	mark_stack_slot_scratched(env, spi - 1);
 
-	/* Writing partially to one dynptr stack slot destroys both. */
-	for (i = 0; i < BPF_REG_SIZE; i++) {
-		state->stack[spi].slot_type[i] = STACK_INVALID;
-		state->stack[spi - 1].slot_type[i] = STACK_INVALID;
-	}
-
-	dynptr_id = state->stack[spi].spilled_ptr.id;
+	dynptr_id = state->stack[spi].dynptr.id;
 	/* Invalidate any slices associated with this dynptr */
 	bpf_for_each_reg_in_vstate(env->cur_state, fstate, dreg, ({
 		/* Dynptr slices are only PTR_TO_MEM_OR_NULL and PTR_TO_MEM */
@@ -950,15 +935,9 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 	}));
 
 	/* Do not release reference state, we are destroying dynptr on stack,
-	 * not using some helper to release it. Just reset register.
+	 * not using some helper to release it.
 	 */
-	__mark_reg_not_init(env, &state->stack[spi].spilled_ptr);
-	__mark_reg_not_init(env, &state->stack[spi - 1].spilled_ptr);
-
-	/* Same reason as unmark_stack_slots_dynptr above */
-	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
-	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
-
+	invalidate_dynptr(env, state, spi);
 	return 0;
 }
 
@@ -993,7 +972,7 @@ static bool is_dynptr_reg_valid_uninit(struct bpf_verifier_env *env, struct bpf_
 static bool is_dynptr_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int i, spi;
+	int spi;
 
 	/* This already represents first slot of initialized bpf_dynptr.
 	 *
@@ -1007,14 +986,12 @@ static bool is_dynptr_reg_valid_init(struct bpf_verifier_env *env, struct bpf_re
 	spi = dynptr_get_spi(env, reg);
 	if (spi < 0)
 		return false;
-	if (!state->stack[spi].spilled_ptr.dynptr.first_slot)
+	if (!state->stack[spi].dynptr.first_slot)
 		return false;
 
-	for (i = 0; i < BPF_REG_SIZE; i++) {
-		if (state->stack[spi].slot_type[i] != STACK_DYNPTR ||
-		    state->stack[spi - 1].slot_type[i] != STACK_DYNPTR)
-			return false;
-	}
+	if (state->stack[spi].type != STACK_OBJ_DYNPTR ||
+	    state->stack[spi - 1].type != STACK_OBJ_DYNPTR)
+		return false;
 
 	return true;
 }
@@ -1032,12 +1009,12 @@ static bool is_dynptr_type_expected(struct bpf_verifier_env *env, struct bpf_reg
 
 	dynptr_type = arg_to_dynptr_type(arg_type);
 	if (reg->type == CONST_PTR_TO_DYNPTR) {
-		return reg->dynptr.type == dynptr_type;
+		return reg->dynptr_type == dynptr_type;
 	} else {
 		spi = dynptr_get_spi(env, reg);
 		if (spi < 0)
 			return false;
-		return state->stack[spi].spilled_ptr.dynptr.type == dynptr_type;
+		return state->stack[spi].dynptr.type == dynptr_type;
 	}
 }
 
@@ -1316,7 +1293,8 @@ static int is_irq_flag_reg_valid_init(struct bpf_verifier_env *env, struct bpf_r
 
 /* Check if given stack slot is "special":
  *   - spilled register state (STACK_SPILL);
- *   - dynptr state (STACK_DYNPTR);
+ *   - dynptr state;
+ *   - iter state;
  *   - irq flag state (STACK_IRQ_FLAG)
  */
 static bool is_stack_slot_special(const struct bpf_stack_state *stack)
@@ -1328,7 +1306,6 @@ static bool is_stack_slot_special(const struct bpf_stack_state *stack)
 
 	switch (type) {
 	case STACK_SPILL:
-	case STACK_DYNPTR:
 	case STACK_IRQ_FLAG:
 		return true;
 	case STACK_INVALID:
@@ -2080,8 +2057,26 @@ static void mark_reg_known_zero(struct bpf_verifier_env *env,
 	__mark_reg_known_zero(regs + regno);
 }
 
-static void __mark_dynptr_reg(struct bpf_reg_state *reg, enum bpf_dynptr_type type,
-			      bool first_slot, int dynptr_id)
+static void __mark_reg_unknown_imprecise(struct bpf_reg_state *reg);
+
+static void __mark_dynptr_slot(struct bpf_stack_state *slot, enum bpf_dynptr_type type,
+			       bool first_slot, int dynptr_id)
+{
+	/* slot->type has no meaning for STACK_DYNPTR, but when we set reg for
+	 * callback arguments, it does need to be CONST_PTR_TO_DYNPTR, so simply
+	 * set it unconditionally as it is ignored for STACK_DYNPTR anyway.
+	 */
+	__mark_reg_unknown_imprecise(&slot->spilled_ptr);
+	slot->type = STACK_OBJ_DYNPTR;
+	/* Give each dynptr a unique id to uniquely associate slices to it. */
+	slot->dynptr.id = dynptr_id;
+	slot->dynptr.type = type;
+	slot->dynptr.first_slot = first_slot;
+}
+
+static void mark_ptr_to_dynptr(struct bpf_verifier_env *env,
+			       struct bpf_reg_state *reg,
+			       enum bpf_dynptr_type type)
 {
 	/* reg->type has no meaning for STACK_DYNPTR, but when we set reg for
 	 * callback arguments, it does need to be CONST_PTR_TO_DYNPTR, so simply
@@ -2089,10 +2084,8 @@ static void __mark_dynptr_reg(struct bpf_reg_state *reg, enum bpf_dynptr_type ty
 	 */
 	__mark_reg_known_zero(reg);
 	reg->type = CONST_PTR_TO_DYNPTR;
-	/* Give each dynptr a unique id to uniquely associate slices to it. */
-	reg->id = dynptr_id;
-	reg->dynptr.type = type;
-	reg->dynptr.first_slot = first_slot;
+	reg->id = ++env->id_gen;
+	reg->dynptr_type = type;
 }
 
 static void mark_ptr_not_null_reg(struct bpf_reg_state *reg)
@@ -7774,7 +7767,7 @@ static int check_stack_range_initialized(
 			/* raw_mode may write past allocated_stack */
 			if (state->allocated_stack <= stack_off)
 				continue;
-			if (state->stack[spi].slot_type[stack_off % BPF_REG_SIZE] == STACK_DYNPTR) {
+			if (state->stack[spi].type == STACK_OBJ_DYNPTR) {
 				verbose(env, "potential write to dynptr at off=%d disallowed\n", i);
 				return -EACCES;
 			}
@@ -9133,7 +9126,7 @@ static int dynptr_id(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 	spi = dynptr_get_spi(env, reg);
 	if (spi < 0)
 		return spi;
-	return state->stack[spi].spilled_ptr.id;
+	return state->stack[spi].dynptr.id;
 }
 
 static int dynptr_ref_obj_id(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
@@ -9146,7 +9139,7 @@ static int dynptr_ref_obj_id(struct bpf_verifier_env *env, struct bpf_reg_state 
 	spi = dynptr_get_spi(env, reg);
 	if (spi < 0)
 		return spi;
-	return state->stack[spi].spilled_ptr.ref_obj_id;
+	return state->stack[spi].ref_obj_id;
 }
 
 static enum bpf_dynptr_type dynptr_get_type(struct bpf_verifier_env *env,
@@ -9156,15 +9149,19 @@ static enum bpf_dynptr_type dynptr_get_type(struct bpf_verifier_env *env,
 	int spi;
 
 	if (reg->type == CONST_PTR_TO_DYNPTR)
-		return reg->dynptr.type;
+		return reg->dynptr_type;
 
 	spi = __get_spi(reg->off);
 	if (spi < 0) {
 		verbose(env, "verifier internal error: invalid spi when querying dynptr type\n");
 		return BPF_DYNPTR_TYPE_INVALID;
 	}
+	if (state->stack[spi].type != STACK_OBJ_DYNPTR) {
+		verbose(env, "verifier internal error: non dynptr slot when querying dynptr type\n");
+		return BPF_DYNPTR_TYPE_INVALID;
+	}
 
-	return state->stack[spi].spilled_ptr.dynptr.type;
+	return state->stack[spi].dynptr.type;
 }
 
 static int check_reg_const_str(struct bpf_verifier_env *env,
@@ -9288,7 +9285,7 @@ skip_type_check:
 			 */
 			if (reg->type == PTR_TO_STACK) {
 				spi = dynptr_get_spi(env, reg);
-				if (spi < 0 || !state->stack[spi].spilled_ptr.ref_obj_id) {
+				if (spi < 0 || !state->stack[spi].ref_obj_id) {
 					verbose(env, "arg %d is an unacquired reference\n", regno);
 					return -EINVAL;
 				}
@@ -10448,7 +10445,7 @@ static int set_user_ringbuf_callback_state(struct bpf_verifier_env *env,
 	 * callback_fn(const struct bpf_dynptr_t* dynptr, void *callback_ctx);
 	 */
 	__mark_reg_not_init(env, &callee->regs[BPF_REG_0]);
-	mark_dynptr_cb_reg(env, &callee->regs[BPF_REG_1], BPF_DYNPTR_TYPE_LOCAL);
+	mark_ptr_to_dynptr(env, &callee->regs[BPF_REG_1], BPF_DYNPTR_TYPE_LOCAL);
 	callee->regs[BPF_REG_2] = caller->regs[BPF_REG_3];
 
 	/* unused */
@@ -18052,6 +18049,15 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		switch (old->stack[spi].type) {
 		case STACK_OBJ_NONE:
 			break;
+		case STACK_OBJ_DYNPTR:
+			old_slot = &old->stack[spi];
+			cur_slot = &cur->stack[spi];
+			if (old_slot->dynptr.type != cur_slot->dynptr.type ||
+			    old_slot->dynptr.first_slot != cur_slot->dynptr.first_slot ||
+			    !check_ids(old_slot->dynptr.id, cur_slot->dynptr.id, idmap) ||
+			    !check_ids(old_slot->ref_obj_id, cur_slot->ref_obj_id, idmap))
+				return false;
+			break;
 		case STACK_OBJ_ITER:
 			old_slot = &old->stack[spi];
 			cur_slot = &cur->stack[spi];
@@ -18087,14 +18093,6 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			 */
 			if (!regsafe(env, &old->stack[spi].spilled_ptr,
 				     &cur->stack[spi].spilled_ptr, idmap, exact))
-				return false;
-			break;
-		case STACK_DYNPTR:
-			old_reg = &old->stack[spi].spilled_ptr;
-			cur_reg = &cur->stack[spi].spilled_ptr;
-			if (old_reg->dynptr.type != cur_reg->dynptr.type ||
-			    old_reg->dynptr.first_slot != cur_reg->dynptr.first_slot ||
-			    !check_ids(old_reg->ref_obj_id, cur_reg->ref_obj_id, idmap))
 				return false;
 			break;
 		case STACK_IRQ_FLAG:
@@ -22868,7 +22866,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 				mark_reg_unknown(env, regs, i);
 			} else if (arg->arg_type == (ARG_PTR_TO_DYNPTR | MEM_RDONLY)) {
 				/* assume unspecial LOCAL dynptr type */
-				__mark_dynptr_reg(reg, BPF_DYNPTR_TYPE_LOCAL, true, ++env->id_gen);
+				mark_ptr_to_dynptr(env, reg, BPF_DYNPTR_TYPE_LOCAL);
 			} else if (base_type(arg->arg_type) == ARG_PTR_TO_MEM) {
 				reg->type = PTR_TO_MEM;
 				if (arg->arg_type & PTR_MAYBE_NULL)

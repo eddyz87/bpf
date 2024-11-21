@@ -91,17 +91,8 @@ struct bpf_reg_state {
 			u32 dynptr_id; /* for dynptr slices */
 		};
 
-		/* For dynptr stack slots */
-		struct {
-			enum bpf_dynptr_type type;
-			/* A dynptr is 16 bytes so it takes up 2 stack slots.
-			 * We need to track which slot is the first slot
-			 * to protect against cases where the user may try to
-			 * pass in an address starting at the second slot of the
-			 * dynptr.
-			 */
-			bool first_slot;
-		} dynptr;
+		/* for CONST_PTR_TO_DYNPTR */
+		enum bpf_dynptr_type dynptr_type;
 
 		/* Max size from any of the above. */
 		struct {
@@ -219,12 +210,12 @@ enum bpf_stack_slot_type {
 	/* A dynptr is stored in this stack slot. The type of dynptr
 	 * is stored in bpf_stack_state->spilled_ptr.dynptr.type
 	 */
-	STACK_DYNPTR,
 	STACK_IRQ_FLAG,
 };
 
 enum bpf_stack_obj_type {
 	STACK_OBJ_NONE,
+	STACK_OBJ_DYNPTR,
 	STACK_OBJ_ITER,
 };
 
@@ -243,6 +234,19 @@ struct bpf_stack_state {
 	u32 ref_obj_id;
 	enum bpf_stack_obj_type type;
 	union {
+		/* For dynptr stack slots */
+		struct {
+			enum bpf_dynptr_type type;
+			/* A dynptr is 16 bytes so it takes up 2 stack slots.
+			 * We need to track which slot is the first slot
+			 * to protect against cases where the user may try to
+			 * pass in an address starting at the second slot of the
+			 * dynptr.
+			 */
+			bool first_slot;
+			u32 id;
+		} dynptr;
+
 		/* For bpf_iter stack slots */
 		struct {
 			/* BTF container and BTF type ID describing

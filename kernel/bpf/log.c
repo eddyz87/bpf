@@ -535,7 +535,6 @@ static char slot_type_char[] = {
 	[STACK_SPILL]	= 'r',
 	[STACK_MISC]	= 'm',
 	[STACK_ZERO]	= '0',
-	[STACK_DYNPTR]	= 'd',
 	[STACK_IRQ_FLAG] = 'f'
 };
 
@@ -733,8 +732,11 @@ static void print_reg_state(struct bpf_verifier_env *env,
 		verbose_a("sz=");
 		verbose_unum(env, reg->mem_size);
 	}
-	if (t == CONST_PTR_TO_DYNPTR)
-		verbose_a("type=%s",  dynptr_type_str(reg->dynptr.type));
+	if (t == CONST_PTR_TO_DYNPTR) {
+		verbose_a("type=%s",  dynptr_type_str(reg->dynptr_type));
+		if (reg->dynptr_id)
+			verbose_a("dynptr_id=%d", reg->dynptr_id);
+	}
 	if (tnum_is_const(reg->var_off)) {
 		/* a pointer register with fixed offset */
 		if (reg->var_off.value) {
@@ -797,6 +799,22 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 			if (!valid)
 				continue;
 			break;
+		case STACK_OBJ_DYNPTR:
+			for (j = 0; j < BPF_REG_SIZE; j++)
+				types_buf[j] = 'd';
+			/* skip to main dynptr slot */
+			i += BPF_DYNPTR_NR_SLOTS - 1;
+			reg = &state->stack[i].spilled_ptr;
+
+			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
+			print_liveness(env, reg->live);
+			verbose(env, "=dynptr_%s(", dynptr_type_str(slot->dynptr.type));
+			if (slot->dynptr.id)
+				verbose_a("id=%d", slot->dynptr.id);
+			if (slot->ref_obj_id)
+				verbose_a("ref_id=%d", slot->ref_obj_id);
+			verbose(env, ")");
+			break;
 		case STACK_OBJ_ITER:
 			for (j = 0; j < BPF_REG_SIZE; j++)
 				types_buf[j] = 'i';
@@ -826,22 +844,6 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 			print_liveness(env, reg->live);
 			verbose(env, "=%s", types_buf);
 			print_reg_state(env, state, reg);
-			break;
-		case STACK_DYNPTR:
-			/* skip to main dynptr slot */
-			i += BPF_DYNPTR_NR_SLOTS - 1;
-			reg = &state->stack[i].spilled_ptr;
-
-			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
-			print_liveness(env, reg->live);
-			verbose(env, "=dynptr_%s(", dynptr_type_str(reg->dynptr.type));
-			if (reg->id)
-				verbose_a("id=%d", reg->id);
-			if (reg->ref_obj_id)
-				verbose_a("ref_id=%d", reg->ref_obj_id);
-			if (reg->dynptr_id)
-				verbose_a("dynptr_id=%d", reg->dynptr_id);
-			verbose(env, ")");
 			break;
 		case STACK_MISC:
 		case STACK_ZERO:
