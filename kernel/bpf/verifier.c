@@ -7597,6 +7597,10 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 	} else if (reg->type == PTR_TO_ARENA) {
 		if (t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown(env, regs, value_regno);
+	} else if (reg->type == SCALAR_VALUE && inside_inlinable_kfunc(env, insn_idx)) {
+		if (t == BPF_READ && value_regno >= 0)
+			/* TODO: do I need to mark `regno` scalars precise? */
+			__mark_reg_unknown_imprecise(regs + value_regno);
 	} else if (reg->type == KERNEL_VALUE) {
 		if (t == BPF_READ && value_regno >= 0)
 			mark_reg_kernel_value(regs + value_regno);
@@ -13109,7 +13113,7 @@ static int setup_inlinable_kfunc_state(struct bpf_verifier_env *env,
 		    (caller_reg->type == PTR_TO_STACK && dynptr_get_spi(env, caller_reg) > 0))
 			copy_register_state(callee_reg, caller_reg);
 		else
-			mark_reg_kernel_value(callee_reg);
+			__mark_reg_unknown_imprecise(callee_reg);
 	}
 	return 0;
 }
