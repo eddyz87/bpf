@@ -385,6 +385,12 @@ __printf(2, 3) static void verbose(void *private_data, const char *fmt, ...)
 	va_start(args, fmt);
 	bpf_verifier_vlog(&env->log, fmt, args);
 	va_end(args);
+	/*
+	 * va_start(args, fmt);
+	 * vsnprintf(env->tmp_str_buf2, TMP_STR_BUF_LEN, fmt, args);
+	 * printk(KERN_CONT "%s", env->tmp_str_buf2);
+	 * va_end(args);
+	 */
 }
 
 static void verbose_invalid_scalar(struct bpf_verifier_env *env,
@@ -4223,17 +4229,6 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				}
 				/* global subprog always sets R0 */
 				bt_clear_reg(bt, BPF_REG_0);
-				return 0;
-			} else if (is_inlinable_kfunc_call(env, idx)) {
-				if (bt_reg_mask(bt) & ~BPF_REGMASK_ARGS) {
-					verbose(env, "BUG regs %x\n", bt_reg_mask(bt));
-					WARN_ONCE(1, "verifier backtracking bug");
-					return -EFAULT;
-				}
-				/* do not backtrack to the callsite, clear any precision marks
-				 * that might be present in the fake frame (e.g. dynptr type spill).
-				 */
-				bt_reset(bt);
 				return 0;
 			} else {
 				/* static subprog call instruction, which
@@ -21986,6 +21981,16 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
 	return 0;
 }
 
+__printf(2, 3) static void insn_to_buf(void *private_data, const char *fmt, ...)
+{
+	struct bpf_verifier_env *env = private_data;
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(env->tmp_str_buf, TMP_STR_BUF_LEN, fmt, args);
+	va_end(args);
+}
+
 /* For each callsite of the inlinable kfunc add a hidden subprogram
  * with a copy of kfunc body (instance). Record the number of the
  * added subprogram in bpf_insn_aux_data->kfunc_instance_subprog
@@ -22058,6 +22063,26 @@ static int instantiate_inlinable_kfuncs(struct bpf_verifier_env *env)
 			env->first_kfunc_instance = subprog;
 		env->last_kfunc_instance = subprog;
 		env->insn_aux_data[i].kfunc_instance_subprog = subprog;
+	}
+	const struct bpf_insn_cbs cbs = {
+		.cb_call	= disasm_kfunc_name,
+		.cb_print	= insn_to_buf,
+		.private_data	= env,
+	};
+	if ((env->log.level & BPF_LOG_LEVEL2) && sh != NULL) {
+		subprog = 0;
+		verbose(env, "program after instantiate_inlinable_kfuncs:\n");
+		for (i = 0; i < env->prog->len; ++i) {
+			if (env->subprog_info[subprog + 1].start == i) {
+				verbose(env, "--- subprog #%d ---\n", subprog + 1);
+				subprog += 1;
+			}
+			insn = &env->prog->insnsi[i];
+			env->tmp_str_buf[0] = 0;
+			print_bpf_insn(&cbs, insn, env->allow_ptr_leaks);
+			verbose(env, "%d: %s", i, env->tmp_str_buf);
+		}
+		verbose(env, "---------------------------------------\n");
 	}
 	return 0;
 }
