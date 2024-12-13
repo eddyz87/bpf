@@ -536,7 +536,6 @@ static char slot_type_char[] = {
 	[STACK_SPILL]	= 'r',
 	[STACK_MISC]	= 'm',
 	[STACK_ZERO]	= '0',
-	[STACK_IRQ_FLAG] = 'f'
 };
 
 static void print_liveness(struct bpf_verifier_env *env,
@@ -834,6 +833,11 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 				iter_type_str(slot->iter.btf, slot->iter.btf_id),
 				slot->ref_obj_id, iter_state_str(slot->iter.state),
 				slot->iter.depth);
+			continue;
+		case STACK_OBJ_IRQ_FLAG:
+			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
+			print_liveness(env, reg->live);
+			verbose(env, "=irq(ref_id=%d)", slot->ref_obj_id);
 			continue;
 		}
 		types_buf[BPF_REG_SIZE] = 0;

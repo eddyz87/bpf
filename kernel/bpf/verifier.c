@@ -810,21 +810,10 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 	return 0;
 }
 
-static void invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_state *state, int spi)
+static void invalidate_stack_slot(struct bpf_verifier_env *env,
+				  struct bpf_func_state *state, int spi)
 {
-	int i;
-
-	for (i = 0; i < BPF_REG_SIZE; i++) {
-		state->stack[spi].slot_type[i] = STACK_INVALID;
-		state->stack[spi - 1].slot_type[i] = STACK_INVALID;
-	}
-
-	__mark_reg_not_init(env, &state->stack[spi].spilled_ptr);
-	__mark_reg_not_init(env, &state->stack[spi - 1].spilled_ptr);
-
-	state->stack[spi].ref_obj_id = 0;
-	state->stack[spi].type = STACK_OBJ_NONE;
-	memset(&state->stack[spi].raw, 0, sizeof(state->stack[spi].raw));
+	struct bpf_stack_state *slot = &state->stack[spi];
 
 	/* Why do we need to set REG_LIVE_WRITTEN for STACK_INVALID slot?
 	 *
@@ -847,8 +836,19 @@ static void invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_stat
 	 * done later on reads or by mark_dynptr_read as well to unnecessary
 	 * mark registers in verifier state.
 	 */
-	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
-	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
+	__mark_reg_not_init(env, &slot->spilled_ptr);
+	memset(slot->slot_type, STACK_INVALID, sizeof(slot->slot_type));
+	memset(&slot->raw, 0, sizeof(slot->raw));
+	slot->spilled_ptr.live |= REG_LIVE_WRITTEN;
+	slot->type = STACK_OBJ_NONE;
+	slot->ref_obj_id = 0;
+	mark_stack_slot_scratched(env, spi);
+}
+
+static void invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_state *state, int spi)
+{
+	invalidate_stack_slot(env, state, spi);
+	invalidate_stack_slot(env, state, spi - 1);
 }
 
 static int unmark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
@@ -1074,30 +1074,15 @@ static int unmark_stack_slots_iter(struct bpf_verifier_env *env,
 				   struct bpf_reg_state *reg, int nr_slots)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int spi, i, j;
+	int spi, i;
 
 	spi = iter_get_spi(env, reg, nr_slots);
 	if (spi < 0)
 		return spi;
 
-	for (i = 0; i < nr_slots; i++) {
-		struct bpf_stack_state *slot = &state->stack[spi - i];
-		struct bpf_reg_state *st = &slot->spilled_ptr;
-
-		if (i == 0)
-			WARN_ON_ONCE(release_reference(env, slot->ref_obj_id));
-
-		__mark_reg_not_init(env, st);
-
-		/* see unmark_stack_slots_dynptr() for why we need to set REG_LIVE_WRITTEN */
-		st->live |= REG_LIVE_WRITTEN;
-
-		slot->type = STACK_OBJ_NONE;
-		for (j = 0; j < BPF_REG_SIZE; j++)
-			slot->slot_type[j] = STACK_INVALID;
-
-		mark_stack_slot_scratched(env, spi - i);
-	}
+	WARN_ON_ONCE(release_reference(env, state->stack[spi].ref_obj_id));
+	for (i = 0; i < nr_slots; i++)
+		invalidate_stack_slot(env, state, spi - i);
 
 	return 0;
 }
@@ -1154,24 +1139,6 @@ static int is_iter_reg_valid_init(struct bpf_verifier_env *env, struct bpf_reg_s
 	return 0;
 }
 
-static void destroy_if_iter_stack_slot(struct bpf_verifier_env *env,
-				       struct bpf_func_state *state, int spi)
-{
-	struct bpf_stack_state *slot;
-
-	slot = &state->stack[spi];
-	if (slot->type != STACK_OBJ_ITER)
-		return;
-
-	/* do not destroy all spi's belonging to this iterator,
-	 * rely on is_iter_reg_valid_init() to check every slot instead.
-	 */
-	memset(&slot->raw, 0, sizeof(slot->raw));
-	slot->spilled_ptr.live |= REG_LIVE_WRITTEN;
-	slot->type = STACK_OBJ_NONE;
-	slot->ref_obj_id = 0;
-}
-
 static int acquire_irq_state(struct bpf_verifier_env *env, int insn_idx);
 static int release_irq_state(struct bpf_verifier_state *state, int id);
 
@@ -1182,7 +1149,7 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 	struct bpf_func_state *state = func(env, reg);
 	struct bpf_stack_state *slot;
 	struct bpf_reg_state *st;
-	int spi, i, id;
+	int spi, id;
 
 	spi = irq_flag_get_spi(env, reg);
 	if (spi < 0)
@@ -1198,35 +1165,43 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 	__mark_reg_known_zero(st);
 	st->type = PTR_TO_STACK; /* we don't have dedicated reg type */
 	st->live |= REG_LIVE_WRITTEN;
-	st->ref_obj_id = id;
-
-	for (i = 0; i < BPF_REG_SIZE; i++)
-		slot->slot_type[i] = STACK_IRQ_FLAG;
+	slot->ref_obj_id = id;
+	slot->type = STACK_OBJ_IRQ_FLAG;
 
 	mark_stack_slot_scratched(env, spi);
 	return 0;
+}
+
+static void destroy_stack_slot_irq_flag(struct bpf_verifier_env *env,
+					struct bpf_func_state *state, int spi)
+{
+	invalidate_stack_slot(env, state, spi);
 }
 
 static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	struct bpf_func_state *state = func(env, reg);
 	struct bpf_stack_state *slot;
-	struct bpf_reg_state *st;
-	int spi, i, err;
+	int spi, err;
 
 	spi = irq_flag_get_spi(env, reg);
 	if (spi < 0)
 		return spi;
 
 	slot = &state->stack[spi];
-	st = &slot->spilled_ptr;
 
-	err = release_irq_state(env->cur_state, st->ref_obj_id);
+	verbose(env, "unmark_stack_slot_irq_flag: slot->ref_obj_id=%d\n",
+		slot->ref_obj_id);
+	verbose(env, "unmark_stack_slot_irq_flag: env->cur_state->active_irq_id=%d\n",
+		env->cur_state->active_irq_id);
+	err = release_irq_state(env->cur_state, slot->ref_obj_id);
 	WARN_ON_ONCE(err && err != -EACCES);
 	if (err) {
 		int insn_idx = 0;
 
 		for (int i = 0; i < env->cur_state->acquired_refs; i++) {
+			verbose(env, "unmark_stack_slot_irq_flag: acquired_refs[%d]=%d\n",
+				i, env->cur_state->refs[i].id);
 			if (env->cur_state->refs[i].id == env->cur_state->active_irq_id) {
 				insn_idx = env->cur_state->refs[i].insn_idx;
 				break;
@@ -1237,16 +1212,7 @@ static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_r
 			env->cur_state->active_irq_id, insn_idx);
 		return err;
 	}
-
-	__mark_reg_not_init(env, st);
-
-	/* see unmark_stack_slots_dynptr() for why we need to set REG_LIVE_WRITTEN */
-	st->live |= REG_LIVE_WRITTEN;
-
-	for (i = 0; i < BPF_REG_SIZE; i++)
-		slot->slot_type[i] = STACK_INVALID;
-
-	mark_stack_slot_scratched(env, spi);
+	destroy_stack_slot_irq_flag(env, state, spi);
 	return 0;
 }
 
@@ -1254,7 +1220,7 @@ static bool is_irq_flag_reg_valid_uninit(struct bpf_verifier_env *env, struct bp
 {
 	struct bpf_func_state *state = func(env, reg);
 	struct bpf_stack_state *slot;
-	int spi, i;
+	int spi;
 
 	/* For -ERANGE (i.e. spi not falling into allocated stack slots), we
 	 * will do check_mem_access to check and update stack bounds later, so
@@ -1267,10 +1233,8 @@ static bool is_irq_flag_reg_valid_uninit(struct bpf_verifier_env *env, struct bp
 		return false;
 
 	slot = &state->stack[spi];
-
-	for (i = 0; i < BPF_REG_SIZE; i++)
-		if (slot->slot_type[i] == STACK_IRQ_FLAG)
-			return false;
+	if (slot->type == STACK_OBJ_IRQ_FLAG)
+		return false;
 	return true;
 }
 
@@ -1278,22 +1242,19 @@ static int is_irq_flag_reg_valid_init(struct bpf_verifier_env *env, struct bpf_r
 {
 	struct bpf_func_state *state = func(env, reg);
 	struct bpf_stack_state *slot;
-	struct bpf_reg_state *st;
-	int spi, i;
+	int spi;
 
 	spi = irq_flag_get_spi(env, reg);
 	if (spi < 0)
 		return -EINVAL;
 
 	slot = &state->stack[spi];
-	st = &slot->spilled_ptr;
 
-	if (!st->ref_obj_id)
+	if (!slot->ref_obj_id)
 		return -EINVAL;
 
-	for (i = 0; i < BPF_REG_SIZE; i++)
-		if (slot->slot_type[i] != STACK_IRQ_FLAG)
-			return -EINVAL;
+	if (slot->type != STACK_OBJ_IRQ_FLAG)
+		return -EINVAL;
 	return 0;
 }
 
@@ -1301,7 +1262,7 @@ static int is_irq_flag_reg_valid_init(struct bpf_verifier_env *env, struct bpf_r
  *   - spilled register state (STACK_SPILL);
  *   - dynptr state;
  *   - iter state;
- *   - irq flag state (STACK_IRQ_FLAG)
+ *   - irq flag state.
  */
 static bool is_stack_slot_special(const struct bpf_stack_state *stack)
 {
@@ -1312,7 +1273,6 @@ static bool is_stack_slot_special(const struct bpf_stack_state *stack)
 
 	switch (type) {
 	case STACK_SPILL:
-	case STACK_IRQ_FLAG:
 		return true;
 	case STACK_INVALID:
 	case STACK_MISC:
@@ -1321,6 +1281,28 @@ static bool is_stack_slot_special(const struct bpf_stack_state *stack)
 	default:
 		WARN_ONCE(1, "unknown stack slot type %d\n", type);
 		return true;
+	}
+}
+
+static int destroy_if_stack_obj(struct bpf_verifier_env *env,
+				struct bpf_func_state *state, int spi)
+{
+	struct bpf_stack_state *slot = &state->stack[spi];
+
+	switch (slot->type) {
+	case STACK_OBJ_DYNPTR:
+		return destroy_if_dynptr_stack_slot(env, state, spi);
+	case STACK_OBJ_ITER:
+		/* do not destroy all spi's belonging to this iterator,
+		 * rely on is_iter_reg_valid_init() to check every slot instead.
+		 */
+		invalidate_stack_slot(env, state, spi);
+		return 0;
+	case STACK_OBJ_IRQ_FLAG:
+		destroy_stack_slot_irq_flag(env, state, spi);
+		return 0;
+	default:
+		return 0;
 	}
 }
 
@@ -4978,11 +4960,9 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	}
 
 	if (!inside_inlinable_kfunc(env, env->insn_idx)) {
-		err = destroy_if_dynptr_stack_slot(env, state, spi);
+		err = destroy_if_stack_obj(env, state, spi);
 		if (err)
 			return err;
-
-		destroy_if_iter_stack_slot(env, state, spi);
 	}
 	check_fastcall_stack_contract(env, state, insn_idx, off);
 	mark_stack_slot_scratched(env, spi);
@@ -5114,10 +5094,9 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 		int spi;
 
 		spi = __get_spi(i);
-		err = destroy_if_dynptr_stack_slot(env, state, spi);
+		err = destroy_if_stack_obj(env, state, spi);
 		if (err)
 			return err;
-		destroy_if_iter_stack_slot(env, state, spi);
 	}
 
 	check_fastcall_stack_contract(env, state, insn_idx, min_off);
@@ -18292,6 +18271,10 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			    !check_ids(old_slot->ref_obj_id, cur_slot->ref_obj_id, idmap))
 				return false;
 			break;
+		case STACK_OBJ_IRQ_FLAG:
+			if (!check_ids(old_slot->ref_obj_id, cur_slot->ref_obj_id, idmap))
+				return false;
+			break;
 		default:
 			return false;
 		}
@@ -18311,12 +18294,6 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			 */
 			if (!regsafe(env, &old->stack[spi].spilled_ptr,
 				     &cur->stack[spi].spilled_ptr, idmap, exact))
-				return false;
-			break;
-		case STACK_IRQ_FLAG:
-			old_reg = &old->stack[spi].spilled_ptr;
-			cur_reg = &cur->stack[spi].spilled_ptr;
-			if (!check_ids(old_reg->ref_obj_id, cur_reg->ref_obj_id, idmap))
 				return false;
 			break;
 		case STACK_MISC:

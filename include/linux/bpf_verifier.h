@@ -210,13 +210,13 @@ enum bpf_stack_slot_type {
 	/* A dynptr is stored in this stack slot. The type of dynptr
 	 * is stored in bpf_stack_state->spilled_ptr.dynptr.type
 	 */
-	STACK_IRQ_FLAG,
 };
 
 enum bpf_stack_obj_type {
 	STACK_OBJ_NONE,
 	STACK_OBJ_DYNPTR,
 	STACK_OBJ_ITER,
+	STACK_OBJ_IRQ_FLAG,
 };
 
 #define BPF_REG_SIZE 8	/* size of eBPF register in bytes */
