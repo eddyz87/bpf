@@ -13598,27 +13598,35 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	return 0;
 }
 
-static int mark_stack_as_kernel_values(struct bpf_verifier_env *env, struct bpf_func_state *func)
+static void mark_slot_as_kernel_value(struct bpf_verifier_env *env,
+				      struct bpf_func_state *func, int spi)
 {
 	struct bpf_stack_state *slot;
 	struct bpf_reg_state *spill;
-	int spi, i;
+	int i;
 
-	if (!inside_inlinable_kfunc(env, func->callsite)) {
+	slot = &func->stack[spi];
+	spill = &slot->spilled_ptr;
+	mark_reg_kernel_value(spill);
+	spill->live |= REG_LIVE_WRITTEN;
+	for (i = 0; i < BPF_REG_SIZE; i++)
+		slot->slot_type[i] = STACK_SPILL;
+	mark_stack_slot_scratched(env, spi);
+}
+
+static int mark_stack_as_kernel_values(struct bpf_verifier_env *env, struct bpf_func_state *func)
+{
+	struct bpf_subprog_info *subprog = &env->subprog_info[func->subprogno];
+	int spi;
+
+	if (!inside_inlinable_kfunc(env, subprog->start)) {
 		verbose(env, "verifier bug: shouldn't mark frame#%d as kernel values\n",
 			func->frameno);
 		return -EFAULT;
 	}
 
-	for (spi = 0; spi < func->allocated_stack / BPF_REG_SIZE; spi++) {
-		slot = &func->stack[spi];
-		spill = &slot->spilled_ptr;
-		mark_reg_kernel_value(spill);
-		spill->live |= REG_LIVE_WRITTEN;
-		for (i = 0; i < BPF_REG_SIZE; i++)
-			slot->slot_type[i] = STACK_SPILL;
-		mark_stack_slot_scratched(env, spi);
-	}
+	for (spi = 0; spi < func->allocated_stack / BPF_REG_SIZE; spi++)
+		mark_slot_as_kernel_value(env, func, spi);
 
 	return 0;
 }
@@ -13627,7 +13635,8 @@ static int check_internal_call(struct bpf_verifier_env *env, struct bpf_insn *in
 {
 	struct bpf_reg_state *reg, *regs = cur_regs(env);
 	struct bpf_kfunc_call_arg_meta meta;
-	int err, i, nargs;
+	struct bpf_func_state *fstate;
+	int err, i, j, spi, nargs;
 
 	err = fetch_kfunc_meta(env, insn, &meta, NULL);
 	if (err < 0)
@@ -13636,15 +13645,25 @@ static int check_internal_call(struct bpf_verifier_env *env, struct bpf_insn *in
 	nargs = btf_type_vlen(meta.func_proto);
 	for (i = 0; i < nargs; i++) {
 		reg = &regs[BPF_REG_1 + i];
+		fstate = func(env, reg);
 		switch (reg->type) {
 		case SCALAR_VALUE:
 		case KERNEL_VALUE:
 			break;
-		case PTR_TO_STACK:
-			err = mark_stack_as_kernel_values(env, func(env, reg));
+		case PTR_TO_STACK: {
+			spi = dynptr_get_spi(env, reg);
+			if (spi >= 0 && fstate->stack[spi].type == STACK_OBJ_DYNPTR) {
+				if (!fstate->stack[spi].dynptr.first_slot)
+					spi = spi + 1;
+				for (j = 0; j < BPF_DYNPTR_NR_SLOTS; ++j)
+					mark_slot_as_kernel_value(env, fstate, spi + j);
+				break;
+			}
+			err = mark_stack_as_kernel_values(env, fstate);
 			if (err)
 				return err;
 			break;
+		}
 		default:
 			verbose(env, "verifier bug: arg#%i unexpected register type %s\n",
 				i, reg_type_str(env, reg->type));
