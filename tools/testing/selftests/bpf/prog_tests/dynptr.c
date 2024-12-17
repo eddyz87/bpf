@@ -32,6 +32,8 @@ static struct {
 	{"test_dynptr_skb_tp_btf", SETUP_SKB_PROG_TP},
 };
 
+static char log[1024 * 1024];
+
 static void verify_success(const char *prog_name, enum test_setup_type setup_type)
 {
 	struct dynptr_success *skel;
@@ -39,7 +41,13 @@ static void verify_success(const char *prog_name, enum test_setup_type setup_typ
 	struct bpf_link *link;
 	int err;
 
-	skel = dynptr_success__open();
+	LIBBPF_OPTS(bpf_object_open_opts, oopts);
+	if (env.verbosity >= VERBOSE_SUPER) {
+		oopts.kernel_log_buf = log;
+		oopts.kernel_log_size = sizeof(log);
+		oopts.kernel_log_level = 1 | 2 | 4;
+	}
+	skel = dynptr_success__open_opts(&oopts);
 	if (!ASSERT_OK_PTR(skel, "dynptr_success__open"))
 		return;
 
@@ -52,6 +60,8 @@ static void verify_success(const char *prog_name, enum test_setup_type setup_typ
 	bpf_program__set_autoload(prog, true);
 
 	err = dynptr_success__load(skel);
+	if (env.verbosity >= VERBOSE_SUPER)
+		printf("---- VERIFIER LOG ----\n%s\n---- VERIFIER LOG END ----\n", log);
 	if (!ASSERT_OK(err, "dynptr_success__load"))
 		goto cleanup;
 
