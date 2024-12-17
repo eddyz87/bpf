@@ -23929,6 +23929,34 @@ struct btf *bpf_get_btf_vmlinux(void)
 	return btf_vmlinux;
 }
 
+static void show_program(struct bpf_verifier_env *env, const char *label)
+{
+	const struct bpf_insn_cbs cbs = {
+		.cb_call	= disasm_kfunc_name,
+		.cb_print	= insn_to_buf,
+		.private_data	= env,
+	};
+	struct bpf_insn *insn;
+	int i, subprog;
+
+	if ((env->log.level & BPF_LOG_LEVEL2) == 0)
+		return;
+
+	subprog = 0;
+	verbose(env, "program after %s:\n", label);
+	for (i = 0; i < env->prog->len; ++i) {
+		if (env->subprog_info[subprog + 1].start == i) {
+			verbose(env, "--- subprog #%d ---\n", subprog + 1);
+			subprog += 1;
+		}
+		insn = &env->prog->insnsi[i];
+		env->tmp_str_buf[0] = 0;
+		print_bpf_insn(&cbs, insn, env->allow_ptr_leaks);
+		verbose(env, "%d: %s", i, env->tmp_str_buf);
+	}
+	verbose(env, "---------------------------------------\n");
+}
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
@@ -24101,6 +24129,8 @@ skip_full_check:
 
 	if (ret == 0)
 		ret = inline_kfunc_calls(env);
+
+	show_program(env, "inline_kfunc_calls");
 
 	if (ret == 0)
 		ret = resolve_kfunc_calls(env);
