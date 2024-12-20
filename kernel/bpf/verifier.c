@@ -23002,7 +23002,7 @@ static int insn_successors(struct bpf_prog *prog, u32 idx, u32 succ[2])
 		succ[i++] = idx + insn_sz;
 
 	if (can_jump(insn)) {
-		dst = idx + jmp_ja_offset(insn) + 1;
+		dst = idx + jmp_offset(insn) + 1;
 		if (i == 0 || succ[0] != dst)
 			succ[i++] = dst;
 	}
@@ -23139,6 +23139,46 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 	info->use = use;
 }
 
+__printf(2, 3) static void __verbose_insn(void *private_data, const char *fmt, ...)
+{
+	struct bpf_verifier_env *env = private_data;
+	char *buf = env->tmp_str_buf;
+	va_list args;
+	int pos;
+
+	va_start(args, fmt);
+	pos = vsnprintf(buf, TMP_STR_BUF_LEN, fmt, args);
+	va_end(args);
+	if (pos > 0) {
+		pos = min(pos, TMP_STR_BUF_LEN - 1);
+		if (env->tmp_str_buf[pos - 1] == '\n')
+			env->tmp_str_buf[pos - 1] = 0;
+	}
+	if (pos > 5)
+		buf += 5;
+	buf[40] = 0;
+	verbose(env, "%-40s", buf);
+}
+
+static void verbose_insn(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	const struct bpf_insn_cbs cbs = {
+		.cb_call	= disasm_kfunc_name,
+		.cb_print	= __verbose_insn,
+		.private_data	= env,
+	};
+
+	print_bpf_insn(&cbs, insn, env->allow_ptr_leaks);
+}
+
+static void print_10bits(struct bpf_verifier_env *env, int v)
+{
+	int i;
+
+	for (i = 0; i < BPF_REG_10; i++)
+		verbose(env, "%c", ((1 << i) & v) ? '0' + i : '_');
+}
+
 /* Compute may-live registers after each instruction in the program.
  * The register is live after the instruction I if it is read by some
  * instruction S following I during program execution and is not
@@ -23201,6 +23241,38 @@ static noinline int bpf_compute_live_registers(struct bpf_verifier_env *env)
 
 	for (i = 0; i < insn_cnt; ++i)
 		env->insn_aux_data[i].live_regs_before = state[i].in;
+
+	if (0 && (env->log.level & BPF_LOG_LEVEL2)) {
+		verbose(env, "Insn use/def sets:\n");
+		for (i = 0; i < insn_cnt; ++i) {
+			int succ_num;
+			u32 succ[2];
+
+			succ_num = insn_successors(env->prog, i, succ);
+			verbose(env, "%02d: ", i);
+			verbose_insn(env, &insns[i]);
+			verbose(env, "  succ=[");
+			for (int s = 0; s < 2; ++s) {
+				if (s < succ_num)
+					verbose(env, "%s%02d", s ? "," : "", succ[s]);
+				else
+					verbose(env, s ? "   " : "  ");
+			}
+			verbose(env, "], use=");
+			print_10bits(env, state[i].use);
+			verbose(env, ", def=");
+			print_10bits(env, state[i].def);
+			verbose(env, ", in=");
+			print_10bits(env, state[i].in);
+			verbose(env, ", out=");
+			print_10bits(env, state[i].out);
+			verbose(env, ", live=");
+			print_10bits(env, env->insn_aux_data[i].live_regs_before);
+			verbose(env, "\n");
+			if (bpf_is_ldimm64(&insns[i]))
+				i++;
+		}
+	}
 
 out:
 	kvfree(state);
