@@ -1410,6 +1410,84 @@ __naked int checkpoint_states_deletion(void)
 	);
 }
 
+SEC("raw_tp")
+__success
+__naked int checkpoint_states_deletion_small(void)
+{
+	/* This is equivalent to C program below.
+	 *
+	 *   int *a, *b, *c;
+	 *   int i, sum = 0;
+	 *   bpf_for(i, 0, 10) {
+	 *     a = bpf_map_lookup_elem(&amap, &i);
+	 *     b = bpf_map_lookup_elem(&amap, &i);
+	 *     c = bpf_map_lookup_elem(&amap, &i);
+	 *     if (a) sum += 1;
+	 *     if (b) sum += 1;
+	 *     if (c) sum += 1;
+	 *   }
+	 *   return 0;
+	 */
+	asm volatile (
+		"r6 = 0;"                  /* a */
+		"r7 = 0;"                  /* b */
+		"r8 = 0;"                  /* c */
+		"r9 = 0;"                  /* sum */
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+	"loop_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto loop_end_%=;"
+
+		"*(u64 *)(r10 - 16) = r0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"r6 = r0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"r7 = r0;"
+
+		"r1 = %[amap] ll;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call %[bpf_map_lookup_elem];"
+		"r8 = r0;"
+
+		"if r6 == 0 goto +1;"
+		"r9 += 1;"
+		"if r7 == 0 goto +1;"
+		"r9 += 1;"
+		"if r8 == 0 goto +1;"
+		"r9 += 1;"
+
+		"goto loop_%=;"
+	"loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_map_lookup_elem),
+		  __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy),
+		  __imm_addr(amap)
+		: __clobber_all
+	);
+}
+
 struct {
 	int data[32];
 	int n;
