@@ -250,10 +250,11 @@ static const struct argp_option opts[] = {
 static int parse_stats(const char *stats_str, struct stat_specs *specs);
 static int append_filter(struct filter **filters, int *cnt, const char *str);
 static int append_filter_file(const char *path);
+static int append_file(const char *path);
+static int append_file_file(const char *path);
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
-	void *tmp;
 	int err;
 
 	switch (key) {
@@ -352,14 +353,14 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		}
 		break;
 	case ARGP_KEY_ARG:
-		tmp = realloc(env.filenames, (env.filename_cnt + 1) * sizeof(*env.filenames));
-		if (!tmp)
-			return -ENOMEM;
-		env.filenames = tmp;
-		env.filenames[env.filename_cnt] = strdup(arg);
-		if (!env.filenames[env.filename_cnt])
-			return -ENOMEM;
-		env.filename_cnt++;
+		if (arg[0] == '@')
+			err = append_file_file(arg + 1);
+		else
+			err = append_file(arg);
+		if (err) {
+			fprintf(stderr, "Failed to collect BPF object files: %d\n", err);
+			return err;
+		}
 		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -659,6 +660,48 @@ static const struct stat_specs default_output_spec = {
 		TOTAL_INSNS, TOTAL_STATES, SIZE, JITED_SIZE
 	},
 };
+
+static int append_file(const char *path)
+{
+	void *tmp;
+
+	tmp = realloc(env.filenames, (env.filename_cnt + 1) * sizeof(*env.filenames));
+	if (!tmp)
+		return -ENOMEM;
+	env.filenames = tmp;
+	env.filenames[env.filename_cnt] = strdup(path);
+	if (!env.filenames[env.filename_cnt])
+		return -ENOMEM;
+	env.filename_cnt++;
+	return 0;
+}
+
+static int append_file_file(const char *path)
+{
+	char buf[1024];
+	FILE *f;
+	int err = 0;
+
+	f = fopen(path, "r");
+	if (!f) {
+		err = -errno;
+		fprintf(stderr, "Failed to open object files list in '%s': %d\n", path, err);
+		return err;
+	}
+
+	while (fscanf(f, " %1023[^\n]\n", buf) == 1) {
+		/* lines starting with # are comments, skip them */
+		if (buf[0] == '\0' || buf[0] == '#')
+			continue;
+		err = append_file(buf);
+		if (err)
+			goto cleanup;
+	}
+
+cleanup:
+	fclose(f);
+	return err;
+}
 
 static const struct stat_specs default_csv_output_spec = {
 	.spec_cnt = 14,
