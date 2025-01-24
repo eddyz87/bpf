@@ -109,7 +109,7 @@ __msg("mark_precise: frame0: regs=r0 stack= before 2: (07) r0 += 1")
 __msg("mark_precise: frame0: regs=r0 stack= before 1: (07) r0 += 1")
 __msg("mark_precise: frame0: regs=r0 stack= before 4: (05) goto pc-4")
 __msg("mark_precise: frame0: regs=r0 stack= before 3: (35) if r0 >= 0xa goto pc+1")
-__msg("mark_precise: frame0: parent state regs= stack=:  R0_rw=P4")
+__msg("mark_precise: frame0: parent state regs= stack=:  R0_r=P4")
 __msg("3: R0_w=6")
 __naked int state_loop_first_last_equal(void)
 {
