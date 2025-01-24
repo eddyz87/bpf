@@ -3671,8 +3671,7 @@ static int __check_reg_arg(struct bpf_verifier_env *env, struct bpf_reg_state *r
 		if (rw64)
 			mark_insn_zext(env, reg);
 
-		return mark_reg_read(env, reg, reg->parent,
-				     rw64 ? REG_LIVE_READ64 : REG_LIVE_READ32);
+		return 0;
 	} else {
 		/* check whether register used as dest operand can be written to */
 		if (regno == BPF_REG_FP) {
@@ -10643,8 +10642,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		}
 
 		/* we are going to rely on register's precise value */
-		err = mark_reg_read(env, r0, r0->parent, REG_LIVE_READ64);
-		err = err ?: mark_chain_precision(env, BPF_REG_0);
+		err = mark_chain_precision(env, BPF_REG_0);
 		if (err)
 			return err;
 
@@ -11559,12 +11557,8 @@ static void mark_btf_func_reg_size(struct bpf_verifier_env *env, u32 regno,
 			DEF_NOT_SUBREG : env->insn_idx + 1;
 	} else {
 		/* Function argument */
-		if (reg_size == sizeof(u64)) {
+		if (reg_size == sizeof(u64))
 			mark_insn_zext(env, reg);
-			mark_reg_read(env, reg, reg->parent, REG_LIVE_READ64);
-		} else {
-			mark_reg_read(env, reg, reg->parent, REG_LIVE_READ32);
-		}
 	}
 }
 
@@ -17871,8 +17865,15 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 }
 
 static void clean_func_state(struct bpf_verifier_env *env,
-			     struct bpf_func_state *st)
+			     struct bpf_verifier_state *vst,
+			     int frame)
 {
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_func_state *st = vst->frame[frame];
+	int insn_idx = frame == vst->curframe
+		       ? vst->insn_idx
+		       : vst->frame[frame + 1]->callsite;
+	u16 live_regs_before = aux[insn_idx].live_regs_before;
 	enum bpf_reg_liveness live;
 	int i, j;
 
@@ -17880,7 +17881,7 @@ static void clean_func_state(struct bpf_verifier_env *env,
 		live = st->regs[i].live;
 		/* liveness must not touch this register anymore */
 		st->regs[i].live |= REG_LIVE_DONE;
-		if (!(live & REG_LIVE_READ))
+		if ((live_regs_before & BIT(i)) == 0)
 			/* since the register is unused, clear its state
 			 * to make further comparison simpler
 			 */
@@ -17909,7 +17910,7 @@ static void clean_verifier_state(struct bpf_verifier_env *env,
 		return;
 
 	for (i = 0; i <= st->curframe; i++)
-		clean_func_state(env, st->frame[i]);
+		clean_func_state(env, st, i);
 }
 
 /* the parentage chains form a tree.
@@ -18469,14 +18470,9 @@ static int propagate_liveness(struct bpf_verifier_env *env,
 		parent_reg = parent->regs;
 		state_reg = state->regs;
 		/* We don't need to worry about FP liveness, it's read-only */
-		for (i = frame < vstate->curframe ? BPF_REG_6 : 0; i < BPF_REG_FP; i++) {
-			err = propagate_liveness_reg(env, &state_reg[i],
-						     &parent_reg[i]);
-			if (err < 0)
-				return err;
-			if (err == REG_LIVE_READ64)
+		for (i = 0; i < BPF_REG_FP; i++)
+			if (state_reg[i].live & REG_LIVE_READ64)
 				mark_insn_zext(env, &parent_reg[i]);
-		}
 
 		/* Propagate stack slots. */
 		for (i = 0; i < state->allocated_stack / BPF_REG_SIZE &&
@@ -18498,19 +18494,25 @@ static int propagate_liveness(struct bpf_verifier_env *env,
 static int propagate_precision(struct bpf_verifier_env *env,
 			       const struct bpf_verifier_state *old)
 {
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_reg_state *state_reg;
 	struct bpf_func_state *state;
-	int i, err = 0, fr;
+	int i, err = 0, fr, insn_idx;
+	u16 live_regs_before;
 	bool first;
 
 	for (fr = old->curframe; fr >= 0; fr--) {
 		state = old->frame[fr];
 		state_reg = state->regs;
 		first = true;
+		insn_idx = fr == old->curframe
+			   ? old->insn_idx
+			   : old->frame[fr + 1]->callsite;
+		live_regs_before = aux[insn_idx].live_regs_before;
 		for (i = 0; i < BPF_REG_FP; i++, state_reg++) {
 			if (state_reg->type != SCALAR_VALUE ||
 			    !state_reg->precise ||
-			    !(state_reg->live & REG_LIVE_READ))
+			    !(live_regs_before & BIT(i)))
 				continue;
 			if (env->log.level & BPF_LOG_LEVEL2) {
 				if (first)
@@ -18946,37 +18948,35 @@ miss:
 	WARN_ONCE(new->branches != 1,
 		  "BUG is_state_visited:branches_to_explore=%d insn %d\n", new->branches, insn_idx);
 
+	for (j = 0; j <= cur->curframe; j++) {
+		for (i = 0; i < BPF_REG_FP; i++) {
+			if (env->insn_aux_data[insn_idx].live_regs_before & BIT(i))
+				new->frame[j]->regs[i].live = REG_LIVE_READ;
+			else
+				new->frame[j]->regs[i].live = REG_LIVE_NONE;
+			cur->frame[j]->regs[i].live = REG_LIVE_NONE;
+		}
+	}
+
 	cur->parent = new;
 	cur->first_insn_idx = insn_idx;
 	cur->insn_hist_start = cur->insn_hist_end;
 	cur->dfs_depth = new->dfs_depth + 1;
 	list_add(&new_sl->node, head);
 
-	/* connect new state to parentage chain. Current frame needs all
-	 * registers connected. Only r6 - r9 of the callers are alive (pushed
-	 * to the stack implicitly by JITs) so in callers' frames connect just
-	 * r6 - r9 as an optimization. Callers will have r1 - r5 connected to
-	 * the state of the call instruction (with WRITTEN set), and r0 comes
-	 * from callee with its full parentage chain, anyway.
-	 */
 	/* clear write marks in current state: the writes we did are not writes
 	 * our child did, so they don't screen off its reads from us.
 	 * (There are no read marks in current state, because reads always mark
 	 * their parent and current state never has children yet.  Only
 	 * explored_states can get read marks.)
 	 */
-	for (j = 0; j <= cur->curframe; j++) {
-		for (i = j < cur->curframe ? BPF_REG_6 : 0; i < BPF_REG_FP; i++)
-			cur->frame[j]->regs[i].parent = &new->frame[j]->regs[i];
-		for (i = 0; i < BPF_REG_FP; i++)
-			cur->frame[j]->regs[i].live = REG_LIVE_NONE;
-	}
-
 	/* all stack frames are accessible from callee, clear them all */
 	for (j = 0; j <= cur->curframe; j++) {
 		struct bpf_func_state *frame = cur->frame[j];
 		struct bpf_func_state *newframe = new->frame[j];
 
+		for (i = 0; i < BPF_REG_FP; i++)
+			frame->regs[i].live = REG_LIVE_NONE;
 		for (i = 0; i < frame->allocated_stack / BPF_REG_SIZE; i++) {
 			frame->stack[i].spilled_ptr.live = REG_LIVE_NONE;
 			frame->stack[i].spilled_ptr.parent =
