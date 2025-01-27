@@ -23110,8 +23110,31 @@ static void compute_call_live_regs(struct bpf_verifier_env *env,
 				   struct bpf_insn *insn,
 				   u16 *use, u16 *def)
 {
+	struct bpf_kfunc_call_arg_meta meta;
+	const struct bpf_func_proto *fn;
+	int err, i, nargs;
+
 	*def = ALL_CALLER_SAVED_REGS;
 	*use = *def & ~BIT(BPF_REG_0);
+	if (bpf_helper_call(insn)) {
+		err = get_helper_proto(env, insn->imm, &fn);
+		if (err)
+			return;
+		*use = 0;
+		for (i = 1; i < CALLER_SAVED_REGS; i++) {
+			if (fn->arg_type[i - 1] == ARG_DONTCARE)
+				break;
+			*use |= BIT(i);
+		}
+	} else if (bpf_pseudo_kfunc_call(insn)) {
+		err = fetch_kfunc_meta(env, insn, &meta, NULL);
+		if (err)
+			return;
+		nargs = btf_type_vlen(meta.func_proto);
+		*use = 0;
+		for (i = 1; i < nargs; i++)
+			*use |= BIT(i);
+	}
 }
 
 /* Compute info->{use,def} fields for the instruction */
