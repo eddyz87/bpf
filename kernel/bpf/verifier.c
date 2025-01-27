@@ -16389,6 +16389,24 @@ static int check_ld_abs(struct bpf_verifier_env *env, struct bpf_insn *insn)
 	return 0;
 }
 
+static bool prog_returns_void(struct bpf_prog *prog)
+{
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_LSM:
+		if (prog->expected_attach_type == BPF_LSM_CGROUP)
+			/* See below, can be 0 or 0-1 depending on hook. */
+			break;
+		fallthrough;
+	case BPF_PROG_TYPE_STRUCT_OPS:
+		if (!prog->aux->attach_func_proto->type)
+			return true;
+		break;
+	default:
+		break;
+	}
+	return false;
+}
+
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name)
 {
 	const char *exit_ctx = "At program exit";
@@ -16403,21 +16421,9 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
 	bool return_32bit = false;
 
 	/* LSM and struct_ops func-ptr's return type could be "void" */
-	if (!is_subprog || frame->in_exception_callback_fn) {
-		switch (prog_type) {
-		case BPF_PROG_TYPE_LSM:
-			if (prog->expected_attach_type == BPF_LSM_CGROUP)
-				/* See below, can be 0 or 0-1 depending on hook. */
-				break;
-			fallthrough;
-		case BPF_PROG_TYPE_STRUCT_OPS:
-			if (!prog->aux->attach_func_proto->type)
-				return 0;
-			break;
-		default:
-			break;
-		}
-	}
+	if (!is_subprog || frame->in_exception_callback_fn)
+		if (prog_returns_void(env->prog))
+			return 0;
 
 	/* eBPF calling convention is such that R0 is used
 	 * to return the value from eBPF program.
@@ -23140,7 +23146,8 @@ static void compute_call_live_regs(struct bpf_verifier_env *env,
 /* Compute info->{use,def} fields for the instruction */
 static void compute_insn_live_regs(struct bpf_verifier_env *env,
 				   struct bpf_insn *insn,
-				   struct insn_live_regs *info)
+				   struct insn_live_regs *info,
+				   bool returns_void)
 {
 	u8 class = BPF_CLASS(insn->code);
 	u8 code = BPF_OP(insn->code);
@@ -23233,7 +23240,7 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			break;
 		case BPF_EXIT:
 			def = 0;
-			use = r0;
+			use = returns_void ? 0 : r0;
 			break;
 		case BPF_CALL:
 			compute_call_live_regs(env, insn, &use, &def);
@@ -23262,7 +23269,9 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 static int compute_live_registers(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *insn_aux = env->insn_aux_data;
+	struct bpf_subprog_info *subprogs = env->subprog_info;
 	struct bpf_insn *insns = env->prog->insnsi;
+	bool main_is_void, returns_void;
 	struct insn_live_regs *state;
 	int insn_cnt = env->prog->len;
 	int err = 0, i, j;
@@ -23287,8 +23296,11 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 		goto out;
 	}
 
-	for (i = 0; i < insn_cnt; ++i)
-		compute_insn_live_regs(env, &insns[i], &state[i]);
+	main_is_void = prog_returns_void(env->prog);
+	for (i = 0; i < insn_cnt; ++i) {
+		returns_void = main_is_void && i < subprogs[1].start;
+		compute_insn_live_regs(env, &insns[i], &state[i], returns_void);
+	}
 
 	changed = true;
 	while (changed) {
