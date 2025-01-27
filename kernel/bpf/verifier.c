@@ -23146,8 +23146,7 @@ static void compute_call_live_regs(struct bpf_verifier_env *env,
 /* Compute info->{use,def} fields for the instruction */
 static void compute_insn_live_regs(struct bpf_verifier_env *env,
 				   struct bpf_insn *insn,
-				   struct insn_live_regs *info,
-				   bool returns_void)
+				   struct insn_live_regs *info)
 {
 	u8 class = BPF_CLASS(insn->code);
 	u8 code = BPF_OP(insn->code);
@@ -23239,8 +23238,9 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			use = 0;
 			break;
 		case BPF_EXIT:
+			/* this might be updated to 'use r0' on the fly */
 			def = 0;
-			use = returns_void ? 0 : r0;
+			use = 0;
 			break;
 		case BPF_CALL:
 			compute_call_live_regs(env, insn, &use, &def);
@@ -23271,10 +23271,11 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 	struct bpf_insn_aux_data *insn_aux = env->insn_aux_data;
 	struct bpf_subprog_info *subprogs = env->subprog_info;
 	struct bpf_insn *insns = env->prog->insnsi;
-	bool main_is_void, returns_void;
 	struct insn_live_regs *state;
 	int insn_cnt = env->prog->len;
 	int err = 0, i, j;
+	u16 r0 = BIT(0);
+	bool *r0_used;
 	bool changed;
 
 	/* Use simple algorithm desribed in:
@@ -23290,17 +23291,27 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 	 * - repeat the computation while {in,out} fields changes for
 	 *   any instruction.
 	 */
+	state = NULL;
+	r0_used = NULL;
 	state = kvcalloc(insn_cnt, sizeof(*state), GFP_KERNEL);
-	if (!state) {
+	r0_used = kvcalloc(env->subprog_cnt, sizeof(*r0_used), GFP_KERNEL);
+	if (!state || !r0_used) {
 		err = -ENOMEM;
 		goto out;
 	}
 
-	main_is_void = prog_returns_void(env->prog);
+	r0_used[0] = !prog_returns_void(env->prog);
+	for (i = 1; i < env->subprog_cnt; ++i)
+		if (subprog_is_global(env, i))
+			r0_used[i] = true;
 	for (i = 0; i < insn_cnt; ++i) {
-		returns_void = main_is_void && i < subprogs[1].start;
-		compute_insn_live_regs(env, &insns[i], &state[i], returns_void);
+		if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM) &&
+		    insns[i].src_reg == BPF_PSEUDO_FUNC)
+			r0_used[find_subprog(env, i + insns[i].imm + 1)] = true;
 	}
+
+	for (i = 0; i < insn_cnt; ++i)
+		compute_insn_live_regs(env, &insns[i], &state[i]);
 
 	changed = true;
 	while (changed) {
@@ -23321,6 +23332,19 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 				live->in = new_in;
 				live->out = new_out;
 				changed = true;
+
+				if ((live->out & r0) && bpf_pseudo_call(&insns[insn_idx]))
+					r0_used[find_subprog(env, insn_idx + insns[insn_idx].imm + 1)] = true;
+			}
+		}
+		for (i = 0; i < env->subprog_cnt; ++i) {
+			if (!r0_used[i])
+				continue;
+			for (j = subprogs[i].start; j < subprogs[i + 1].start; ++j) {
+				if (insns[j].code == (BPF_JMP | BPF_EXIT) && state[j].use == 0) {
+					state[j].use = r0;
+					changed = true;
+				}
 			}
 		}
 	}
@@ -23346,6 +23370,7 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 
 out:
 	kvfree(state);
+	kvfree(r0_used);
 	kvfree(env->cfg.insn_postorder);
 	env->cfg.insn_postorder = NULL;
 	env->cfg.cur_postorder = 0;
