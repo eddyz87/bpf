@@ -48,6 +48,9 @@ enum stat_id {
 	STACK,
 	PROG_TYPE,
 	ATTACH_TYPE,
+	MAX_FREE_LIST_SZ,
+	MAX_GET_LOOP_ENTRY_STEPS,
+	MAX_USED_AS_LOOP_ENTRY,
 
 	FILE_NAME,
 	PROG_NAME,
@@ -706,13 +709,14 @@ cleanup:
 }
 
 static const struct stat_specs default_csv_output_spec = {
-	.spec_cnt = 14,
+	.spec_cnt = 17,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
 		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
 		MAX_STATES_PER_INSN, MARK_READ_MAX_LEN,
 		SIZE, JITED_SIZE, PROG_TYPE, ATTACH_TYPE,
-		STACK,
+		STACK, MAX_FREE_LIST_SZ, MAX_GET_LOOP_ENTRY_STEPS,
+		MAX_USED_AS_LOOP_ENTRY
 	},
 };
 
@@ -753,6 +757,9 @@ static struct stat_def {
 	[STACK] = {"Stack depth", {"stack_depth", "stack"}, },
 	[PROG_TYPE] = { "Program type", {"prog_type"}, },
 	[ATTACH_TYPE] = { "Attach type", {"attach_type", }, },
+	[MAX_FREE_LIST_SZ] = { "Max free list", {"max_free_list"}, },
+	[MAX_GET_LOOP_ENTRY_STEPS] = { "Max GLE steps", {"max_gle_steps"} },
+	[MAX_USED_AS_LOOP_ENTRY] = { "Max ULE", {"max_ule"}},
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -919,12 +926,16 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 
 		if (1 == sscanf(cur, "verification time %ld usec\n", &s->stats[DURATION]))
 			continue;
-		if (5 == sscanf(cur, "processed %ld insns (limit %*d) max_states_per_insn %ld total_states %ld peak_states %ld mark_read %ld",
+		if (5 == sscanf(cur, "processed %ld insns (limit %*d) max_states_per_insn %ld total_states %ld peak_states %ld mark_read %ld max_free_list_sz %ld max_get_loop_entry_steps %ld max_used_as_loop_entry %ld",
 				&s->stats[TOTAL_INSNS],
 				&s->stats[MAX_STATES_PER_INSN],
 				&s->stats[TOTAL_STATES],
 				&s->stats[PEAK_STATES],
-				&s->stats[MARK_READ_MAX_LEN]))
+				&s->stats[MARK_READ_MAX_LEN],
+				&s->stats[MAX_FREE_LIST_SZ],
+				&s->stats[MAX_GET_LOOP_ENTRY_STEPS],
+				&s->stats[MAX_USED_AS_LOOP_ENTRY]
+				))
 			continue;
 
 		if (1 == sscanf(cur, "stack depth %511s", stack))
@@ -1442,6 +1453,9 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case TOTAL_INSNS:
 	case TOTAL_STATES:
 	case PEAK_STATES:
+	case MAX_FREE_LIST_SZ:
+	case MAX_GET_LOOP_ENTRY_STEPS:
+	case MAX_USED_AS_LOOP_ENTRY:
 	case MAX_STATES_PER_INSN:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
@@ -1667,6 +1681,9 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case TOTAL_INSNS:
 	case TOTAL_STATES:
 	case PEAK_STATES:
+	case MAX_FREE_LIST_SZ:
+	case MAX_GET_LOOP_ENTRY_STEPS:
+	case MAX_USED_AS_LOOP_ENTRY:
 	case MAX_STATES_PER_INSN:
 	case MARK_READ_MAX_LEN:
 	case STACK:
@@ -1754,6 +1771,9 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case TOTAL_INSNS:
 	case TOTAL_STATES:
 	case PEAK_STATES:
+	case MAX_FREE_LIST_SZ:
+	case MAX_GET_LOOP_ENTRY_STEPS:
+	case MAX_USED_AS_LOOP_ENTRY:
 	case MAX_STATES_PER_INSN:
 	case MARK_READ_MAX_LEN:
 	case SIZE:

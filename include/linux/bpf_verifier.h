@@ -778,6 +778,10 @@ struct bpf_verifier_env {
 	 * since the last time the function state was printed
 	 */
 	u32 scratched_regs;
+	u32 free_list_sz;
+	u32 max_free_list_sz;
+	u32 max_get_loop_entry_steps;
+	u32 max_used_as_loop_entry;
 	/* Same as scratched_regs but for stack slots */
 	u64 scratched_stack_slots;
 	u64 prev_log_pos, prev_insn_print_pos;

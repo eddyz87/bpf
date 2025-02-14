@@ -1660,6 +1660,7 @@ static void maybe_free_verifier_state(struct bpf_verifier_env *env, struct bpf_v
 		kfree(sl);
 		env->peak_states--;
 		sl = loop_entry_sl;
+		env->free_list_sz--;
 	}
 }
 
@@ -1877,6 +1878,7 @@ static struct bpf_verifier_state *get_loop_entry(struct bpf_verifier_env *env,
 		}
 		topmost = topmost->loop_entry;
 	}
+	env->max_get_loop_entry_steps = max(env->max_get_loop_entry_steps, steps);
 	return topmost;
 }
 
@@ -1894,6 +1896,8 @@ static void update_loop_entry(struct bpf_verifier_env *env,
 			cur->loop_entry->used_as_loop_entry--;
 			maybe_free_verifier_state(env, state_loop_entry_as_list(cur));
 		}
+		if (hdr->used_as_loop_entry == 0)
+			env->max_used_as_loop_entry++;
 		cur->loop_entry = hdr;
 		hdr->used_as_loop_entry++;
 	}
@@ -18808,7 +18812,9 @@ miss:
 			sl->in_free_list = true;
 			list_del(&sl->node);
 			list_add(&sl->node, &env->free_list);
+			env->free_list_sz++;
 			maybe_free_verifier_state(env, sl);
+			env->max_free_list_sz = max(env->max_free_list_sz, env->free_list_sz);
 		}
 	}
 
@@ -22429,10 +22435,12 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		verbose(env, "\n");
 	}
 	verbose(env, "processed %d insns (limit %d) max_states_per_insn %d "
-		"total_states %d peak_states %d mark_read %d\n",
+		"total_states %d peak_states %d mark_read %d "
+		"max_free_list_sz %d max_get_loop_entry_steps %d max_used_as_loop_entry %d\n",
 		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
 		env->max_states_per_insn, env->total_states,
-		env->peak_states, env->longest_mark_read_walk);
+		env->peak_states, env->longest_mark_read_walk,
+		env->max_free_list_sz, env->max_get_loop_entry_steps, env->max_used_as_loop_entry);
 }
 
 static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
