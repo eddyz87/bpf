@@ -23300,6 +23300,9 @@ static void compute_call_live_regs(struct bpf_verifier_env *env,
 		*use = 0;
 		for (i = 1; i <= nargs; i++)
 			*use |= BIT(i);
+	} else if (bpf_pseudo_call(insn)) {
+		/* will be computed by the main loop */
+		*use = 0;
 	}
 }
 
@@ -23398,7 +23401,7 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			use = 0;
 			break;
 		case BPF_EXIT:
-			/* this might be updated to 'use r0' on the fly */
+			/* will be computed by the main loop */
 			def = 0;
 			use = 0;
 			break;
@@ -23417,6 +23420,13 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 
 	info->def = def;
 	info->use = use;
+}
+
+static int subprog_idx_for_insn(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+
+	return find_subprog(env, insn_idx + insns[insn_idx].imm + 1);
 }
 
 /* Compute may-live registers after each instruction in the program.
@@ -23461,9 +23471,13 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 	}
 
 	r0_used[0] = !prog_returns_void(env->prog);
+	/* Assume return value of global subprogram is always used */
 	for (i = 1; i < env->subprog_cnt; ++i)
 		if (subprog_is_global(env, i))
 			r0_used[i] = true;
+	/* Assume return value of subprogram is used if an address
+	 * of that subprogram is taken.
+	 */
 	for (i = 0; i < insn_cnt; ++i) {
 		if (insns[i].code == (BPF_LD | BPF_DW | BPF_IMM) &&
 		    insns[i].src_reg == BPF_PSEUDO_FUNC)
@@ -23479,6 +23493,7 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 		for (i = 0; i < env->cfg.cur_postorder; ++i) {
 			int insn_idx = env->cfg.insn_postorder[i];
 			struct insn_live_regs *live = &state[insn_idx];
+			int subprog, subprog_start;
 			int succ_num;
 			u32 succ[2];
 			u16 new_out = 0;
@@ -23493,8 +23508,20 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 				live->out = new_out;
 				changed = true;
 
-				if ((live->out & r0) && bpf_pseudo_call(&insns[insn_idx]))
-					r0_used[find_subprog(env, insn_idx + insns[insn_idx].imm + 1)] = true;
+				if (bpf_pseudo_call(&insns[insn_idx])) {
+					subprog = subprog_idx_for_insn(env, insn_idx);
+					if ((live->out & r0))
+						r0_used[subprog] = true;
+				}
+			}
+			if (bpf_pseudo_call(&insns[insn_idx])) {
+				subprog = subprog_idx_for_insn(env, insn_idx);
+				subprog_start = subprogs[subprog].start;
+				if ((state[insn_idx].use & state[subprog_start].in) !=
+				    state[subprog_start].in) {
+					state[insn_idx].use |= state[subprog_start].in;
+					changed = true;
+				}
 			}
 		}
 		for (i = 0; i < env->subprog_cnt; ++i) {
