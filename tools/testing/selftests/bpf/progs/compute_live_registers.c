@@ -354,6 +354,60 @@ __naked void addr_space_cast(void)
 }
 #endif
 
+static __used __naked int aux1(void)
+{
+	asm volatile (
+		"r0 = r1;"
+		"r0 += r2;"
+		"exit;"
+		::: __clobber_all);
+}
+
+SEC("socket")
+__log_level(2)
+__msg("0: .......... (b7) r1 = 1")
+__msg("1: .1........ (b7) r2 = 2")
+__msg("2: .12....... (b7) r3 = 3")
+__msg("3: .12....... (85) call pc+2")
+__msg("4: .......... (b7) r0 = 0")
+__msg("5: 0......... (95) exit")
+__msg("6: .12....... (bf) r0 = r1")
+__msg("7: 0.2....... (0f) r0 += r2")
+__msg("8: .......... (95) exit")
+__naked void subprog_params1(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"r2 = 2;"
+		"r3 = 3;"
+		"call aux1;"
+		"r0 = 0;"
+		"exit;"
+		::: __clobber_all);
+}
+
+SEC("socket")
+__log_level(2)
+__msg("0: .......... (b7) r1 = 1")
+__msg("1: .1........ (b7) r2 = 2")
+__msg("2: .12....... (b7) r3 = 3")
+__msg("3: .12....... (85) call pc+1")
+__msg("4: 0......... (95) exit")
+__msg("5: .12....... (bf) r0 = r1")
+__msg("6: 0.2....... (0f) r0 += r2")
+__msg("7: 0......... (95) exit")
+__naked void subprog_return1(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"r2 = 2;"
+		"r3 = 3;"
+		"call aux1;"
+		"exit;"
+		::: __clobber_all);
+}
+
+
 /* to retain debug info for BTF generation */
 void kfunc_root(void)
 {
