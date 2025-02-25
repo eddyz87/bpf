@@ -365,18 +365,16 @@ static __used __naked int aux1(void)
 
 SEC("socket")
 __log_level(2)
-__msg("0: ....45.... (b7) r1 = 1")
-__msg("1: .1..45.... (b7) r2 = 2")
-__msg("2: .12.45.... (b7) r3 = 3")
-/* Conservative liveness for subprog parameters. */
-__msg("3: .12345.... (85) call pc+2")
+__msg("0: .......... (b7) r1 = 1")
+__msg("1: .1........ (b7) r2 = 2")
+__msg("2: .12....... (b7) r3 = 3")
+__msg("3: .12....... (85) call pc+2")
 __msg("4: .......... (b7) r0 = 0")
 __msg("5: 0......... (95) exit")
 __msg("6: .12....... (bf) r0 = r1")
 __msg("7: 0.2....... (0f) r0 += r2")
-/* Conservative liveness for subprog return value. */
-__msg("8: 0......... (95) exit")
-__naked void subprog1(void)
+__msg("8: .......... (95) exit")
+__naked void subprog_params1(void)
 {
 	asm volatile (
 		"r1 = 1;"
@@ -384,6 +382,27 @@ __naked void subprog1(void)
 		"r3 = 3;"
 		"call aux1;"
 		"r0 = 0;"
+		"exit;"
+		::: __clobber_all);
+}
+
+SEC("socket")
+__log_level(2)
+__msg("0: .......... (b7) r1 = 1")
+__msg("1: .1........ (b7) r2 = 2")
+__msg("2: .12....... (b7) r3 = 3")
+__msg("3: .12....... (85) call pc+1")
+__msg("4: 0......... (95) exit")
+__msg("5: .12....... (bf) r0 = r1")
+__msg("6: 0.2....... (0f) r0 += r2")
+__msg("7: 0......... (95) exit")
+__naked void subprog_return1(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"r2 = 2;"
+		"r3 = 3;"
+		"call aux1;"
 		"exit;"
 		::: __clobber_all);
 }
