@@ -268,6 +268,11 @@ static bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
 }
 
+static bool is_interesting_insn(struct bpf_verifier_env *env, int insn_idx)
+{
+	return false;
+}
+
 struct bpf_call_arg_meta {
 	struct bpf_map *map_ptr;
 	bool raw_mode;
@@ -18160,6 +18165,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 
 		spi = i / BPF_REG_SIZE;
 
+		env->states_equal.spi = spi;
 		if (exact != NOT_EXACT &&
 		    (i >= cur->allocated_stack ||
 		     old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
@@ -18273,6 +18279,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			return false;
 		}
 	}
+	env->states_equal.spi = 0;
 	return true;
 }
 
@@ -18355,8 +18362,10 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	for (i = 0; i < MAX_BPF_REG; i++)
 		if (((1 << i) & live_regs) &&
 		    !regsafe(env, &old->regs[i], &cur->regs[i],
-			     &env->idmap_scratch, exact))
+			     &env->idmap_scratch, exact)) {
+			env->states_equal.regno = i;
 			return false;
+		}
 
 	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact))
 		return false;
@@ -18404,9 +18413,11 @@ static bool states_equal(struct bpf_verifier_env *env,
 			   : old->frame[i + 1]->callsite;
 		if (old->frame[i]->callsite != cur->frame[i]->callsite)
 			return false;
+		env->states_equal.frame = i;
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
+	memset(&env->states_equal, 0, sizeof(env->states_equal));
 	return true;
 }
 
@@ -18683,6 +18694,17 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 
 	clean_live_states(env, insn_idx, cur);
 
+	if (is_interesting_insn(env, insn_idx)) {
+		verbose(env, "is_state_visited: insn_idx=%d, current state:\n", insn_idx);
+		for (i = 0; i <= cur->curframe; ++i) {
+			verbose(env, "  (insn=%d)",
+				cur->curframe == i ? insn_idx : cur->frame[i + 1]->callsite);
+			if (i == 0)
+				verbose(env, " frame0:");
+			print_verifier_state(env, cur, i, true);
+		}
+	}
+
 	head = explored_state(env, insn_idx);
 	list_for_each_safe(pos, tmp, head) {
 		sl = container_of(pos, struct bpf_verifier_state_list, node);
@@ -18842,7 +18864,26 @@ skip_inf_loop_check:
 		if (IS_ERR(loop_entry))
 			return PTR_ERR(loop_entry);
 		force_exact = loop_entry && loop_entry->branches > 0;
-		if (states_equal(env, &sl->state, cur, force_exact ? RANGE_WITHIN : NOT_EXACT)) {
+		bool equal = states_equal(env, &sl->state, cur, force_exact ? RANGE_WITHIN : NOT_EXACT);
+		if (is_interesting_insn(env, insn_idx)) {
+			verbose(env, "  candidate (");
+			if (equal)
+				verbose(env, "equal");
+			else
+				verbose(env, "diff{frame=%d,regno=%d,spi=%d}",
+					env->states_equal.frame,
+					env->states_equal.regno,
+					env->states_equal.spi);
+			verbose(env, ");\n");
+			for (i = 0; i <= sl->state.curframe; ++i) {
+				verbose(env, "    (insn=%d)",
+					sl->state.curframe == i ? sl->state.insn_idx : sl->state.frame[i + 1]->callsite);
+				if (i == 0)
+					verbose(env, " frame0:");
+				print_verifier_state(env, &sl->state, i, true);
+			}
+		}
+		if (equal) {
 			if (force_exact)
 				update_loop_entry(env, cur, loop_entry);
 hit:
