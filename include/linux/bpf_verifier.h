@@ -452,11 +452,7 @@ struct bpf_verifier_state {
 	u32 dfs_depth;
 	u32 callback_unroll_depth;
 	u32 may_goto_depth;
-	/* If this state was ever pointed-to by other state's loop_entry field
-	 * this flag would be set to true. Used to avoid freeing such states
-	 * while they are still in use.
-	 */
-	u32 used_as_loop_entry;
+	u32 id;
 };
 
 #define bpf_get_spilled_reg(slot, frame, mask)				\
@@ -701,8 +697,9 @@ struct bpf_idset {
 };
 
 struct bpf_scc_info {
-	u32 range_within:1;
-	u32 states_on_stack:31;
+	struct list_head backedges;	/* list of struct bpf_verifier_state_list */
+	u32 incomplete_read_marks:1;
+	u32 branches:31;
 };
 
 /* single container for all structs
@@ -730,6 +727,7 @@ struct bpf_verifier_env {
 	u32 used_map_cnt;		/* number of used maps */
 	u32 used_btf_cnt;		/* number of used BTF objects */
 	u32 id_gen;			/* used to generate unique reg IDs */
+	u32 state_id_gen;
 	u32 hidden_subprog_cnt;		/* number of hidden subprogs */
 	int exception_callback_subprog;
 	bool explore_alu_limits;
@@ -803,6 +801,11 @@ struct bpf_verifier_env {
 	char tmp_str_buf[TMP_STR_BUF_LEN];
 	struct bpf_insn insn_buf[INSN_BUF_SIZE];
 	struct bpf_insn epilogue_buf[INSN_BUF_SIZE];
+	struct {
+		u8 frame;
+		u8 spi;
+		u8 regno;
+	} states_equal;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
