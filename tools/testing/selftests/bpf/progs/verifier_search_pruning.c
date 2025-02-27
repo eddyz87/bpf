@@ -272,7 +272,7 @@ l2_%=:	r0 = 0;						\
 
 SEC("socket")
 __description("allocated_stack")
-__success __msg("processed 15 insns")
+__success __msg("processed 19 insns")
 __success_unpriv __msg_unpriv("") __log_level(1) __retval(0)
 __naked void allocated_stack(void)
 {

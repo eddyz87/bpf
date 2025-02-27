@@ -4736,11 +4736,20 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 
 			bitmap_from_u64(mask, bt_frame_stack_mask(bt, fr));
 			for_each_set_bit(i, mask, 64) {
+				/* This is not a bug anymore, as liveness flags of stack slots
+				 * are not tracked, there might be a situation triggered by
+				 * propagate_precision():
+				 *
+				 *               old->frame[N]->allocated_stack == 32; <- fp-32 dead
+				 *         cur_state->frame[N]->allocated_stack == 32; <- fp-32 written
+				 * cur_state->parent->frame[N]->allocated_stack == 24; <- fp-32 not written
+				 *
+				 * clean_verifier_state() would have scratched fp-32 spill information
+				 * had it been marked as not read, but this no longer happens.
+				 */
 				if (i >= func->allocated_stack / BPF_REG_SIZE) {
-					verbose(env, "BUG backtracking (stack slot %d, total slots %d)\n",
-						i, func->allocated_stack / BPF_REG_SIZE);
-					WARN_ONCE(1, "verifier backtracking bug (stack slot out of bounds)");
-					return -EFAULT;
+					bt_clear_frame_slot(bt, fr, i);
+					continue;
 				}
 
 				if (!is_spilled_scalar_reg(&func->stack[i])) {
@@ -17891,12 +17900,7 @@ static void clean_func_state(struct bpf_verifier_env *env,
 	for (i = 0; i < st->allocated_stack / BPF_REG_SIZE; i++) {
 		live = st->stack[i].spilled_ptr.live;
 		/* liveness must not touch this stack slot anymore */
-		st->stack[i].spilled_ptr.live |= REG_LIVE_DONE;
-		if (!(live & REG_LIVE_READ)) {
-			__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
-			for (j = 0; j < BPF_REG_SIZE; j++)
-				st->stack[i].slot_type[j] = STACK_INVALID;
-		}
+		st->stack[i].spilled_ptr.live = REG_LIVE_READ | REG_LIVE_DONE;
 	}
 }
 
@@ -18168,13 +18172,6 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		     old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
 		     cur->stack[spi].slot_type[i % BPF_REG_SIZE]))
 			return false;
-
-		if (!(old->stack[spi].spilled_ptr.live & REG_LIVE_READ)
-		    && exact == NOT_EXACT) {
-			i += BPF_REG_SIZE - 1;
-			/* explored state didn't use this */
-			continue;
-		}
 
 		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_INVALID)
 			continue;
@@ -18529,8 +18526,7 @@ static int propagate_precision(struct bpf_verifier_env *env,
 				continue;
 			state_reg = &state->stack[i].spilled_ptr;
 			if (state_reg->type != SCALAR_VALUE ||
-			    !state_reg->precise ||
-			    !(state_reg->live & REG_LIVE_READ))
+			    !state_reg->precise)
 				continue;
 			if (env->log.level & BPF_LOG_LEVEL2) {
 				if (first)
@@ -18973,15 +18969,11 @@ miss:
 	/* all stack frames are accessible from callee, clear them all */
 	for (j = 0; j <= cur->curframe; j++) {
 		struct bpf_func_state *frame = cur->frame[j];
-		struct bpf_func_state *newframe = new->frame[j];
 
 		for (i = 0; i < BPF_REG_FP; i++)
 			frame->regs[i].live = REG_LIVE_NONE;
-		for (i = 0; i < frame->allocated_stack / BPF_REG_SIZE; i++) {
+		for (i = 0; i < frame->allocated_stack / BPF_REG_SIZE; i++)
 			frame->stack[i].spilled_ptr.live = REG_LIVE_NONE;
-			frame->stack[i].spilled_ptr.parent =
-						&newframe->stack[i].spilled_ptr;
-		}
 	}
 	return 0;
 }
