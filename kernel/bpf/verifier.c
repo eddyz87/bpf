@@ -268,6 +268,11 @@ static bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
 }
 
+static bool is_interesting_insn(struct bpf_verifier_env *env, int insn_idx)
+{
+	return true;
+}
+
 struct bpf_call_arg_meta {
 	struct bpf_map *map_ptr;
 	bool raw_mode;
@@ -1732,6 +1737,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->used_as_loop_entry = src->used_as_loop_entry;
 	dst_state->may_goto_depth = src->may_goto_depth;
 	dst_state->loop_entry = src->loop_entry;
+	dst_state->id = src->id;
 	for (i = 0; i <= src->curframe; i++) {
 		dst = dst_state->frame[i];
 		if (!dst) {
@@ -1925,6 +1931,9 @@ static void update_loop_entry(struct bpf_verifier_env *env,
 		}
 		cur->loop_entry = hdr;
 		hdr->used_as_loop_entry++;
+		if (env->log.level & BPF_LOG_LEVEL2)
+			verbose(env, "sg: %d -> %d [style=dotted]; // update_loop_entry, cur -> hdr, insn_idx=%d\n",
+				cur->id, hdr->id, env->insn_idx);
 	}
 }
 
@@ -2029,6 +2038,10 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 		 * which might have large 'branches' count.
 		 */
 	}
+	elem->st.id = ++env->state_id_gen;
+	if ((env->log.level & BPF_LOG_LEVEL2) && elem->st.parent)
+		verbose(env, "sg: %d -> %d; // push_stack, cur->parent -> elem, prev_insn_idx=%d, insn_idx=%d\n",
+			cur->parent->id, elem->st.id, prev_insn_idx, insn_idx);
 	return &elem->st;
 err:
 	free_verifier_state(env->cur_state, true);
@@ -4738,6 +4751,9 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 				return -EFAULT;
 			}
 		}
+		if ((env->log.level & BPF_LOG_LEVEL2) && st->parent)
+			verbose(env, "sg: %d -> %d [style=dotted,color=chartreuse3]; // precision\n",
+				st->id, st->parent->id);
 		st = st->parent;
 		if (!st)
 			break;
@@ -18316,6 +18332,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 
 		spi = i / BPF_REG_SIZE;
 
+		env->states_equal.spi = spi;
 		if (exact != NOT_EXACT &&
 		    (i >= cur->allocated_stack ||
 		     old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
@@ -18429,6 +18446,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			return false;
 		}
 	}
+	env->states_equal.spi = 0;
 	return true;
 }
 
@@ -18511,8 +18529,10 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	for (i = 0; i < MAX_BPF_REG; i++)
 		if (((1 << i) & live_regs) &&
 		    !regsafe(env, &old->regs[i], &cur->regs[i],
-			     &env->idmap_scratch, exact))
+			     &env->idmap_scratch, exact)) {
+			env->states_equal.regno = i;
 			return false;
+		}
 
 	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact))
 		return false;
@@ -18560,9 +18580,11 @@ static bool states_equal(struct bpf_verifier_env *env,
 			   : old->frame[i + 1]->callsite;
 		if (old->frame[i]->callsite != cur->frame[i]->callsite)
 			return false;
+		env->states_equal.frame = i;
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
+	memset(&env->states_equal, 0, sizeof(env->states_equal));
 	return true;
 }
 
@@ -18657,6 +18679,9 @@ static int propagate_precision(struct bpf_verifier_env *env,
 	int i, err = 0, fr;
 	bool first;
 
+	if ((env->log.level & BPF_LOG_LEVEL2))
+		verbose(env, "sg: %d -> %d [style=dotted,color=purple]; // propagate precision\n",
+			old->id, env->cur_state->id);
 	for (fr = old->curframe; fr >= 0; fr--) {
 		state = old->frame[fr];
 		state_reg = state->regs;
@@ -18810,6 +18835,43 @@ static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf
 	return false;
 }
 
+static void show_candidate(struct bpf_verifier_env *env, struct bpf_verifier_state *state, bool equal)
+{
+	int i;
+
+	if (is_interesting_insn(env, env->insn_idx)) {
+		verbose(env, "  candidate %d (", state->id);
+		if (state->loop_entry)
+			verbose(env, "loop,");
+		if (state->branches)
+			verbose(env, "br==%d,", state->branches);
+		if (equal)
+			verbose(env, "equal");
+		else
+			verbose(env, "diff{frame=%d,regno=%d,spi=%d}",
+				env->states_equal.frame,
+				env->states_equal.regno,
+				env->states_equal.spi);
+		verbose(env, ");\n");
+		for (i = 0; i <= state->curframe; ++i) {
+			verbose(env, "    (insn=%d)",
+				state->curframe == i ? state->insn_idx : state->frame[i + 1]->callsite);
+			if (i == 0)
+				verbose(env, " frame0:");
+			print_verifier_state(env, state, i, true);
+		}
+	}
+	if ((env->log.level & BPF_LOG_LEVEL2) && equal) {
+		verbose(env, "sg: %d [label=\"%d: %d->%d\"];\n",
+			env->cur_state->id,
+			env->cur_state->id,
+			env->cur_state->first_insn_idx,
+			env->cur_state->last_insn_idx);
+		verbose(env, "sg: %d -> %d [style=dashed,color=blue]; // states_equal, cur -> cached ,insn_idx=%d\n",
+			env->cur_state->id, state->id, env->insn_idx);
+	}
+}
+
 static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
@@ -18837,6 +18899,18 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		add_new_state = true;
 
 	clean_live_states(env, insn_idx, cur);
+
+	if (is_interesting_insn(env, insn_idx)) {
+		verbose(env, "is_state_visited: insn_idx=%d, current state %d:\n",
+			insn_idx, cur->id);
+		for (i = 0; i <= cur->curframe; ++i) {
+			verbose(env, "  (insn=%d)",
+				cur->curframe == i ? insn_idx : cur->frame[i + 1]->callsite);
+			if (i == 0)
+				verbose(env, " frame0:");
+			print_verifier_state(env, cur, i, true);
+		}
+	}
 
 	head = explored_state(env, insn_idx);
 	list_for_each_safe(pos, tmp, head) {
@@ -18900,7 +18974,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 			 * => unsafe memory access at 11 would not be caught.
 			 */
 			if (is_iter_next_insn(env, insn_idx)) {
-				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+				bool equal = states_equal(env, &sl->state, cur, RANGE_WITHIN);
+				show_candidate(env, &sl->state, equal);
+				if (equal) {
 					struct bpf_func_state *cur_frame;
 					struct bpf_reg_state *iter_state, *iter_reg;
 					int spi;
@@ -18924,14 +19000,18 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				goto skip_inf_loop_check;
 			}
 			if (is_may_goto_insn_at(env, insn_idx)) {
-				if (sl->state.may_goto_depth != cur->may_goto_depth &&
-				    states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+				bool equal = sl->state.may_goto_depth != cur->may_goto_depth &&
+					     states_equal(env, &sl->state, cur, RANGE_WITHIN);
+				show_candidate(env, &sl->state, equal);
+				if (equal) {
 					update_loop_entry(env, cur, &sl->state);
 					goto hit;
 				}
 			}
 			if (calls_callback(env, insn_idx)) {
-				if (states_equal(env, &sl->state, cur, RANGE_WITHIN))
+				bool equal = states_equal(env, &sl->state, cur, RANGE_WITHIN);
+				show_candidate(env, &sl->state, equal);
+				if (equal)
 					goto hit;
 				goto skip_inf_loop_check;
 			}
@@ -18996,7 +19076,9 @@ skip_inf_loop_check:
 		loop_entry = get_loop_entry(env, &sl->state);
 		if (IS_ERR(loop_entry))
 			return PTR_ERR(loop_entry);
-		if (states_equal(env, &sl->state, cur, loop_entry ? RANGE_WITHIN : NOT_EXACT)) {
+		bool equal = states_equal(env, &sl->state, cur, loop_entry ? RANGE_WITHIN : NOT_EXACT);
+		show_candidate(env, &sl->state, equal);
+		if (equal) {
 			if (loop_entry)
 				update_loop_entry(env, cur, loop_entry);
 hit:
@@ -19099,6 +19181,13 @@ miss:
 	WARN_ONCE(new->branches != 1,
 		  "BUG is_state_visited:branches_to_explore=%d insn %d\n", new->branches, insn_idx);
 
+	cur->id = ++env->state_id_gen;
+	if (env->log.level & BPF_LOG_LEVEL2) {
+		verbose(env, "sg: %d [label=\"%d: %d->%d\"];\n",
+			new->id, new->id, new->first_insn_idx, new->last_insn_idx);
+		verbose(env, "sg: %d -> %d; // is_state_visited, new -> cur, insn_idx=%d\n",
+			new->id, cur->id, insn_idx);
+	}
 	cur->parent = new;
 	cur->first_insn_idx = insn_idx;
 	cur->insn_hist_start = cur->insn_hist_end;
@@ -19472,6 +19561,13 @@ process_bpf_exit_full:
 				err = check_return_code(env, BPF_REG_0, "R0");
 				if (err)
 					return err;
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose(env, "sg: %d [label=\"%d: %d->%d\"];\n",
+						env->cur_state->id,
+						env->cur_state->id,
+						env->cur_state->first_insn_idx,
+						env->cur_state->last_insn_idx);
+				}
 process_bpf_exit:
 				mark_verifier_state_scratched(env);
 				update_branch_counts(env, env->cur_state);
