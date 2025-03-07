@@ -1954,8 +1954,8 @@ static void update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifi
 		 * turned out that st is a part of some loop.
 		 * This is a part of 'case A' in get_loop_entry() comment.
 		 */
-		if (br == 0 && st->parent && st->loop_entry)
-			update_loop_entry(env, st->parent, st->loop_entry);
+		//if (br == 0 && st->parent && st->loop_entry)
+		//	update_loop_entry(env, st->parent, st->loop_entry);
 
 		/* WARN_ON(br > 1) technically makes sense here,
 		 * but see comment in push_stack(), hence:
@@ -1973,6 +1973,23 @@ static void update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifi
 		sl = parent_sl;
 	}
 }
+
+static void scc_enter(struct bpf_verifier_env *env, u32 insn_idx)
+{
+	u32 insn_scc = env->insn_aux_data[insn_idx].scc;
+	
+	if (!insn_scc)
+		return;
+	++env->scc_info[insn_scc].states_on_stack;
+}
+
+static void scc_exit(struct bpf_verifier_env *env, u32 insn_idx)
+{
+	u32 insn_scc = env->insn_aux_data[insn_idx].scc;
+	
+	if (!insn_scc)
+		return;
+	--env->scc_info[insn_scc].states_on_stack;}
 
 static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
 		     int *insn_idx, bool pop_log)
@@ -1996,6 +2013,7 @@ static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
 	if (prev_insn_idx)
 		*prev_insn_idx = head->prev_insn_idx;
 	elem = head->next;
+	scc_exit(env, head->prev_insn_idx);
 	free_verifier_state(&head->st, false);
 	kfree(head);
 	env->head = elem;
@@ -2042,6 +2060,7 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 		 * which might have large 'branches' count.
 		 */
 	}
+	scc_enter(env, prev_insn_idx);
 	return &elem->st;
 err:
 	free_verifier_state(env->cur_state, true);
@@ -18105,17 +18124,21 @@ static void clean_verifier_state(struct bpf_verifier_env *env,
 static void clean_live_states(struct bpf_verifier_env *env, int insn,
 			      struct bpf_verifier_state *cur)
 {
-	struct bpf_verifier_state *loop_entry;
+	//struct bpf_verifier_state *loop_entry;
 	struct bpf_verifier_state_list *sl;
 	struct list_head *pos, *head;
+	u32 insn_scc;
 
 	head = explored_state(env, insn);
 	list_for_each(pos, head) {
 		sl = container_of(pos, struct bpf_verifier_state_list, node);
 		if (sl->state.branches)
 			continue;
-		loop_entry = get_loop_entry(env, &sl->state);
-		if (!IS_ERR_OR_NULL(loop_entry) && loop_entry->branches)
+		//loop_entry = get_loop_entry(env, &sl->state);
+		//if (!IS_ERR_OR_NULL(loop_entry) && loop_entry->branches)
+		//	continue;
+		insn_scc = env->insn_aux_data[insn].scc;
+		if (insn_scc && env->scc_info[insn_scc].range_within)
 			continue;
 		if (sl->state.insn_idx != insn ||
 		    !same_callsites(&sl->state, cur))
@@ -18818,8 +18841,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
 	struct bpf_verifier_state_list *sl;
-	struct bpf_verifier_state *cur = env->cur_state, *new, *loop_entry;
-	int i, j, n, err, states_cnt = 0;
+	struct bpf_verifier_state *cur = env->cur_state, *new;
+	struct bpf_scc_info *scc_info;
+	int i, j, n, err, states_cnt = 0, insn_scc;
 	bool force_new_state, add_new_state, force_exact;
 	struct list_head *pos, *tmp, *head;
 
@@ -18841,6 +18865,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		add_new_state = true;
 
 	clean_live_states(env, insn_idx, cur);
+	insn_scc = env->insn_aux_data[insn_idx].scc;
+	scc_info = &env->scc_info[insn_scc];
 
 	head = explored_state(env, insn_idx);
 	list_for_each_safe(pos, tmp, head) {
@@ -18921,7 +18947,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 					spi = __get_spi(iter_reg->off + iter_reg->var_off.value);
 					iter_state = &func(env, iter_reg)->stack[spi].spilled_ptr;
 					if (iter_state->iter.state == BPF_ITER_STATE_ACTIVE) {
-						update_loop_entry(env, cur, &sl->state);
+						scc_info->range_within = 1;
+						//update_loop_entry(env, cur, &sl->state);
 						goto hit;
 					}
 				}
@@ -18930,7 +18957,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 			if (is_may_goto_insn_at(env, insn_idx)) {
 				if (sl->state.may_goto_depth != cur->may_goto_depth &&
 				    states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
-					update_loop_entry(env, cur, &sl->state);
+					scc_info->range_within = 1;
+					//update_loop_entry(env, cur, &sl->state);
 					goto hit;
 				}
 			}
@@ -18997,13 +19025,13 @@ skip_inf_loop_check:
 		 *
 		 * Additional details are in the comment before get_loop_entry().
 		 */
-		loop_entry = get_loop_entry(env, &sl->state);
-		if (IS_ERR(loop_entry))
-			return PTR_ERR(loop_entry);
-		force_exact = loop_entry && loop_entry->branches > 0;
+		//loop_entry = get_loop_entry(env, &sl->state);
+		//if (IS_ERR(loop_entry))
+		//	return PTR_ERR(loop_entry);
+		force_exact = insn_scc && scc_info->range_within;
 		if (states_equal(env, &sl->state, cur, force_exact ? RANGE_WITHIN : NOT_EXACT)) {
-			if (force_exact)
-				update_loop_entry(env, cur, loop_entry);
+			//if (force_exact)
+			//	update_loop_entry(env, cur, loop_entry);
 hit:
 			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
@@ -23767,6 +23795,12 @@ dfs_continue:
 			dfs_sz--;
 		}
 	}
+	env->scc_info = kvcalloc(next_scc_id, sizeof(*env->scc_info), GFP_KERNEL);
+	if (!env->scc_info) {
+		err = -ENOMEM;
+		goto exit;
+	}
+	env->num_sccs = next_scc_id;
 exit:
 	kvfree(stack);
 	kvfree(pre);
@@ -24042,6 +24076,7 @@ err_unlock:
 	vfree(env->insn_aux_data);
 err_free_env:
 	kvfree(env->cfg.insn_postorder);
+	kvfree(env->scc_info);
 	kvfree(env);
 	return ret;
 }

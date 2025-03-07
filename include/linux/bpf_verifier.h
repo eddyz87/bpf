@@ -700,6 +700,11 @@ struct bpf_idset {
 	u32 ids[BPF_ID_MAP_SIZE];
 };
 
+struct bpf_scc_info {
+	u32 range_within:1;
+	u32 states_on_stack:31;
+};
+
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
@@ -790,6 +795,8 @@ struct bpf_verifier_env {
 	u64 prev_log_pos, prev_insn_print_pos;
 	/* buffer used to temporary hold constants as scalar registers */
 	struct bpf_reg_state fake_reg[2];
+	struct bpf_scc_info *scc_info;
+	u32 num_sccs;
 	/* buffer used to generate temporary string representations,
 	 * e.g., in reg_type_str() to generate reg_type string
 	 */
