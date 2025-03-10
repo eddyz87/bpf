@@ -23,6 +23,7 @@
 #include <float.h>
 #include <math.h>
 #include <limits.h>
+#include <pthread.h>
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -208,7 +209,44 @@ static struct env {
 	int top_src_lines;
 	struct var_preset *presets;
 	int npresets;
+	int nthreads;
 } env;
+
+static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int vfprintf_sync(FILE *stream, const char *format, va_list ap)
+{
+	int err;
+
+	pthread_mutex_lock(&output_lock);
+	err = vfprintf(stream, format, ap);
+	pthread_mutex_unlock(&output_lock);
+	return err;
+}
+
+__attribute__((format(printf, 1, 2)))
+static int log_error(const char *format, ...)
+{
+	va_list ap;
+	int err;
+
+	va_start(ap, format);
+	err = vfprintf_sync(stderr, format, ap);
+	va_end(ap);
+	return err;
+}
+
+__attribute__((format(printf, 1, 2)))
+static int log_info(const char *format, ...)
+{
+	va_list ap;
+	int err;
+
+	va_start(ap, format);
+	err = vfprintf_sync(stdout, format, ap);
+	va_end(ap);
+	return err;
+}
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
@@ -216,7 +254,7 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 		return 0;
 	if (level == LIBBPF_DEBUG  && !env.debug)
 		return 0;
-	return vfprintf(stderr, format, args);
+	return log_error(format, args);
 }
 
 #ifndef VERISTAT_VERSION
@@ -260,6 +298,7 @@ static const struct argp_option opts[] = {
 	  "Force BPF verifier failure on register invariant violation (BPF_F_TEST_REG_INVARIANTS program flag)" },
 	{ "top-src-lines", 'S', "N", 0, "Emit N most frequent source code lines" },
 	{ "set-global-vars", 'G', "GLOBAL", 0, "Set global variables provided in the expression, for example \"var1 = 1\"" },
+	{ "jobs", 'j', "JOBS", 0, "Number of parallel jobs" },
 	{},
 };
 
@@ -378,6 +417,15 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		if (err) {
 			fprintf(stderr, "Failed to parse global variable presets: %s\n", arg);
 			return err;
+		}
+		break;
+	}
+	case 'j': {
+		errno = 0;
+		env.nthreads = strtol(arg, NULL, 10);
+		if (errno) {
+			fprintf(stderr, "invalid jobs number: %s\n", arg);
+			argp_usage(state);
 		}
 		break;
 	}
@@ -1048,6 +1096,7 @@ static int print_top_src_lines(char * const buf, size_t buf_sz, const char *prog
 
 	qsort(freq, unique_lines, sizeof(struct line_cnt), line_cnt_cmp);
 
+	pthread_mutex_lock(&output_lock);
 	printf("Top source lines (%s):\n", prog_name);
 	for (i = 0; i < min(unique_lines, env.top_src_lines); ++i) {
 		const char *src_code = freq[i].line;
@@ -1071,6 +1120,7 @@ static int print_top_src_lines(char * const buf, size_t buf_sz, const char *prog
 			printf("%5d: %s\n", freq[i].cnt, src_code);
 	}
 	printf("\n");
+	pthread_mutex_unlock(&output_lock);
 
 cleanup:
 	free(freq);
@@ -1278,10 +1328,21 @@ static int max_verifier_log_size(void)
 	return log_size;
 }
 
-static int process_prog(const char *filename, struct bpf_object *obj, struct bpf_program *prog)
+struct task {
+	const char *filename;
+	struct verif_stats *prog_stats;
+	int prog_stat_cnt;
+	int files_processed;
+	int files_skipped;
+	int progs_processed;
+	int progs_skipped;
+};
+
+static int process_prog(struct task *task, struct bpf_object *obj, struct bpf_program *prog)
 {
-	const char *base_filename = basename(strdupa(filename));
+	const char *base_filename = basename(strdupa(task->filename));
 	const char *prog_name = bpf_program__name(prog);
+	const char *filename = task->filename;
 	char *buf;
 	int buf_sz, log_level;
 	struct verif_stats *stats;
@@ -1292,15 +1353,15 @@ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf
 	int fd;
 
 	if (!should_process_file_prog(base_filename, bpf_program__name(prog))) {
-		env.progs_skipped++;
+		task->progs_skipped++;
 		return 0;
 	}
 
-	tmp = realloc(env.prog_stats, (env.prog_stat_cnt + 1) * sizeof(*env.prog_stats));
+	tmp = realloc(task->prog_stats, (task->prog_stat_cnt + 1) * sizeof(*task->prog_stats));
 	if (!tmp)
 		return -ENOMEM;
-	env.prog_stats = tmp;
-	stats = &env.prog_stats[env.prog_stat_cnt++];
+	task->prog_stats = tmp;
+	stats = &task->prog_stats[task->prog_stat_cnt++];
 	memset(stats, 0, sizeof(*stats));
 
 	if (env.verbose || env.top_src_lines > 0) {
@@ -1333,7 +1394,7 @@ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf
 		bpf_program__set_flags(prog, bpf_program__flags(prog) | BPF_F_TEST_REG_INVARIANTS);
 
 	err = bpf_object__load(obj);
-	env.progs_processed++;
+	task->progs_processed++;
 
 	stats->file_name = strdup(base_filename);
 	stats->prog_name = strdup(bpf_program__name(prog));
@@ -1350,9 +1411,9 @@ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf
 	parse_verif_log(buf, buf_sz, stats);
 
 	if (env.verbose) {
-		printf("PROCESSING %s/%s, DURATION US: %ld, VERDICT: %s, VERIFIER LOG:\n%s\n",
-		       filename, prog_name, stats->stats[DURATION],
-		       err ? "failure" : "success", buf);
+		log_info("PROCESSING %s/%s, DURATION US: %ld, VERDICT: %s, VERIFIER LOG:\n%s\n",
+			 filename, prog_name, stats->stats[DURATION],
+			 err ? "failure" : "success", buf);
 	}
 	if (env.top_src_lines > 0)
 		print_top_src_lines(buf, buf_sz, stats->prog_name);
@@ -1497,26 +1558,25 @@ static int set_global_var(struct bpf_object *obj, struct btf *btf, const struct 
 
 	base_type = btf__type_by_id(btf, btf__resolve_type(btf, t->type));
 	if (!base_type) {
-		fprintf(stderr, "Failed to resolve type %d\n", t->type);
+		log_error("Failed to resolve type %d\n", t->type);
 		return -EINVAL;
 	}
 	if (!is_preset_supported(base_type)) {
-		fprintf(stderr, "Setting value for type %s is not supported\n",
-			btf__name_by_offset(btf, base_type->name_off));
+		log_error("Setting value for type %s is not supported\n",
+			  btf__name_by_offset(btf, base_type->name_off));
 		return -EINVAL;
 	}
 
 	if (preset->type == ENUMERATOR) {
 		if (btf_is_any_enum(base_type)) {
 			if (enum_value_from_name(btf, base_type, preset->svalue, &value)) {
-				fprintf(stderr,
-					"Failed to find integer value for enum element %s\n",
-					preset->svalue);
+				log_error("Failed to find integer value for enum element %s\n",
+					  preset->svalue);
 				return -EINVAL;
 			}
 		} else {
-			fprintf(stderr, "Value %s is not supported for type %s\n",
-				preset->svalue, btf__name_by_offset(btf, base_type->name_off));
+			log_error(stderr, "Value %s is not supported for type %s\n",
+				  preset->svalue, btf__name_by_offset(btf, base_type->name_off));
 			return -EINVAL;
 		}
 	}
@@ -1528,10 +1588,9 @@ static int set_global_var(struct bpf_object *obj, struct btf *btf, const struct 
 		long long max_val = 1ll << unsigned_bits;
 
 		if (value >= max_val || value < -max_val) {
-			fprintf(stderr,
-				"Variable %s value %lld is out of range [%lld; %lld]\n",
-				btf__name_by_offset(btf, t->name_off), value,
-				is_signed ? -max_val : 0, max_val - 1);
+			log_error("Variable %s value %lld is out of range [%lld; %lld]\n",
+				  btf__name_by_offset(btf, t->name_off), value,
+				  is_signed ? -max_val : 0, max_val - 1);
 			return -EINVAL;
 		}
 	}
@@ -1618,32 +1677,31 @@ static int set_global_vars(struct bpf_object *obj, struct var_preset *presets, i
 	return err;
 }
 
-static int process_obj(const char *filename)
+static int process_obj(struct task *task)
 {
-	const char *base_filename = basename(strdupa(filename));
+	const char *base_filename = basename(strdupa(task->filename));
+	const char *filename = task->filename;
 	struct bpf_object *obj = NULL, *tobj;
 	struct bpf_program *prog, *tprog, *lprog;
-	libbpf_print_fn_t old_libbpf_print_fn;
 	LIBBPF_OPTS(bpf_object_open_opts, opts);
 	int err = 0, prog_cnt = 0;
 
 	if (!should_process_file_prog(base_filename, NULL)) {
 		if (env.verbose)
-			printf("Skipping '%s' due to filters...\n", filename);
-		env.files_skipped++;
+			log_info("Skipping '%s' due to filters...\n", filename);
+		task->files_skipped++;
 		return 0;
 	}
 	if (!is_bpf_obj_file(filename)) {
 		if (env.verbose)
-			printf("Skipping '%s' as it's not a BPF object file...\n", filename);
-		env.files_skipped++;
+			log_info("Skipping '%s' as it's not a BPF object file...\n", filename);
+		task->files_skipped++;
 		return 0;
 	}
 
 	if (!env.quiet && env.out_fmt == RESFMT_TABLE)
-		printf("Processing '%s'...\n", base_filename);
+		log_info("Processing '%s'...\n", base_filename);
 
-	old_libbpf_print_fn = libbpf_set_print(libbpf_print_fn);
 	obj = bpf_object__open_file(filename, &opts);
 	if (!obj) {
 		/* if libbpf can't open BPF object file, it could be because
@@ -1652,13 +1710,13 @@ static int process_obj(const char *filename)
 		 * out, report it into stderr, mark it as skipped, and
 		 * proceed
 		 */
-		fprintf(stderr, "Failed to open '%s': %d\n", filename, -errno);
-		env.files_skipped++;
+		log_info("Failed to open '%s': %d\n", filename, -errno);
+		task->files_skipped++;
 		err = 0;
 		goto cleanup;
 	}
 
-	env.files_processed++;
+	task->files_processed++;
 
 	bpf_object__for_each_program(prog, obj) {
 		prog_cnt++;
@@ -1669,10 +1727,10 @@ static int process_obj(const char *filename)
 		bpf_program__set_autoload(prog, true);
 		err = set_global_vars(obj, env.presets, env.npresets);
 		if (err) {
-			fprintf(stderr, "Failed to set global variables %d\n", err);
+			log_info("Failed to set global variables %d\n", err);
 			goto cleanup;
 		}
-		process_prog(filename, obj, prog);
+		process_prog(task, obj, prog);
 		goto cleanup;
 	}
 
@@ -1682,13 +1740,13 @@ static int process_obj(const char *filename)
 		tobj = bpf_object__open_file(filename, &opts);
 		if (!tobj) {
 			err = -errno;
-			fprintf(stderr, "Failed to open '%s': %d\n", filename, err);
+			log_info("Failed to open '%s': %d\n", filename, err);
 			goto cleanup;
 		}
 
 		err = set_global_vars(tobj, env.presets, env.npresets);
 		if (err) {
-			fprintf(stderr, "Failed to set global variables %d\n", err);
+			log_info("Failed to set global variables %d\n", err);
 			goto cleanup;
 		}
 
@@ -1704,13 +1762,12 @@ static int process_obj(const char *filename)
 			}
 		}
 
-		process_prog(filename, tobj, lprog);
+		process_prog(task, tobj, lprog);
 		bpf_object__close(tobj);
 	}
 
 cleanup:
 	bpf_object__close(obj);
-	libbpf_set_print(old_libbpf_print_fn);
 	return err;
 }
 
@@ -2687,9 +2744,46 @@ static void output_prog_stats(void)
 	}
 }
 
+struct task_queue {
+	pthread_mutex_t lock;
+	struct task *tasks;
+	int next_task;
+	int task_cnt;
+};
+
+static struct task *next_task(struct task_queue *queue)
+{
+	struct task *task = NULL;
+
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	pthread_mutex_lock(&queue->lock);
+	if (queue->next_task < queue->task_cnt)
+		task = &queue->tasks[queue->next_task++];
+	pthread_mutex_unlock(&queue->lock);
+	return task;
+}
+
+static void *task_queue_worker(void *ctx)
+{
+	struct task_queue *queue = ctx;
+	struct task *task;
+	int err;
+
+	while ((task = next_task(queue))) {
+		err = process_obj(task);
+		if (err)
+			fprintf(stderr, "Failed to process '%s': %d\n", task->filename, err);
+	}
+	return NULL;
+}
+
 static int handle_verif_mode(void)
 {
-	int i, err;
+	libbpf_print_fn_t old_libbpf_print_fn;
+	struct task_queue queue = {};
+	pthread_t *threads = NULL;
+	struct task *task;
+	int i, j, err = 0;
 
 	if (env.filename_cnt == 0) {
 		fprintf(stderr, "Please provide path to BPF object file!\n\n");
@@ -2697,19 +2791,59 @@ static int handle_verif_mode(void)
 		return -EINVAL;
 	}
 
-	for (i = 0; i < env.filename_cnt; i++) {
-		err = process_obj(env.filenames[i]);
+	old_libbpf_print_fn = libbpf_set_print(libbpf_print_fn);
+	queue.tasks = calloc(env.filename_cnt, sizeof(*queue.tasks));
+	threads = calloc(env.nthreads, sizeof(*threads));
+	if (!queue.tasks || !threads) {
+		err = -ENOMEM;
+		goto out;
+	}
+	pthread_mutex_init(&queue.lock, NULL);
+	for (i = 0; i < env.filename_cnt; i++)
+		queue.tasks[i].filename = env.filenames[i];
+	queue.task_cnt = env.filename_cnt;
+	for (i = 0; i < env.nthreads; i++) {
+		err = pthread_create(&threads[i], NULL, task_queue_worker, &queue);
 		if (err) {
-			fprintf(stderr, "Failed to process '%s': %d\n", env.filenames[i], err);
-			return err;
+			for (j = 0; j < i; j++)
+				pthread_cancel(threads[j]);
+			goto out;
 		}
+	}
+	for (i = 0; i < env.nthreads; i++)
+		pthread_join(threads[i], NULL);
+	env.prog_stat_cnt = 0;
+	for (i = 0; i < env.filename_cnt; i++) {
+		env.prog_stat_cnt   += queue.tasks[i].prog_stat_cnt;
+		env.files_processed += queue.tasks[i].files_processed;
+		env.files_skipped   += queue.tasks[i].files_skipped;
+		env.progs_processed += queue.tasks[i].progs_processed;
+		env.progs_skipped   += queue.tasks[i].progs_skipped;
+	}
+	env.prog_stats = calloc(env.prog_stat_cnt, sizeof(*env.prog_stats));
+	if (!env.prog_stats) {
+		err = -ENOMEM;
+		goto out;
+	}
+	j = 0;
+	for (i = 0; i < env.filename_cnt; i++) {
+		task = &queue.tasks[i];
+		memcpy(&env.prog_stats[j], task->prog_stats,
+		       sizeof(*task->prog_stats) * task->prog_stat_cnt);
+		j += task->prog_stat_cnt;
 	}
 
 	qsort(env.prog_stats, env.prog_stat_cnt, sizeof(*env.prog_stats), cmp_prog_stats);
 
 	output_prog_stats();
-
-	return 0;
+out:
+	libbpf_set_print(old_libbpf_print_fn);
+	if (queue.tasks)
+		for (i = 0; i < env.filename_cnt; i++)
+			free(queue.tasks[i].prog_stats);
+	free(queue.tasks);
+	free(threads);
+	return err;
 }
 
 static int handle_replay_mode(void)
@@ -2741,6 +2875,7 @@ int main(int argc, char **argv)
 {
 	int err = 0, i;
 
+	env.nthreads = 1;
 	if (argp_parse(&argp, argc, argv, 0, NULL, NULL))
 		return 1;
 
