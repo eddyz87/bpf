@@ -4641,10 +4641,11 @@ static void mark_all_scalars_imprecise(struct bpf_verifier_env *env, struct bpf_
  * mark_all_scalars_imprecise() to hopefully get more permissive and generic
  * finalized states which help in short circuiting more future states.
  */
-static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
+static int __mark_chain_precision(struct bpf_verifier_env *env,
+				  struct bpf_verifier_state *start_state, int regno)
 {
+	struct bpf_verifier_state *st = start_state;
 	struct backtrack_state *bt = &env->bt;
-	struct bpf_verifier_state *st = env->cur_state;
 	int first_idx = st->first_insn_idx;
 	int last_idx = env->insn_idx;
 	int subseq_idx = -1;
@@ -4657,7 +4658,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 		return 0;
 
 	/* set frame number from which we are starting to backtrack */
-	bt_init(bt, env->cur_state->curframe);
+	bt_init(bt, start_state->curframe);
 
 	/* Do sanity checks against current state of register and/or stack
 	 * slot, but don't set precise flag in current state, as precision
@@ -4723,7 +4724,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 				err = backtrack_insn(env, i, subseq_idx, hist, bt);
 			}
 			if (err == -ENOTSUPP) {
-				mark_all_scalars_precise(env, env->cur_state);
+				mark_all_scalars_precise(env, start_state);
 				bt_reset(bt);
 				return 0;
 			} else if (err) {
@@ -4817,7 +4818,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 	 * fallback to marking all precise
 	 */
 	if (!bt_empty(bt)) {
-		mark_all_scalars_precise(env, env->cur_state);
+		mark_all_scalars_precise(env, start_state);
 		bt_reset(bt);
 	}
 
@@ -4826,7 +4827,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env, int regno)
 
 int mark_chain_precision(struct bpf_verifier_env *env, int regno)
 {
-	return __mark_chain_precision(env, regno);
+	return __mark_chain_precision(env, env->cur_state, regno);
 }
 
 /* mark_chain_precision_batch() assumes that env->bt is set in the caller to
@@ -4834,7 +4835,41 @@ int mark_chain_precision(struct bpf_verifier_env *env, int regno)
  */
 static int mark_chain_precision_batch(struct bpf_verifier_env *env)
 {
-	return __mark_chain_precision(env, -1);
+	return __mark_chain_precision(env, env->cur_state, -1);
+}
+
+static int mark_all_registers_read(struct bpf_verifier_env *env,
+				   struct bpf_verifier_state *st)
+{
+	struct bpf_func_state *func;
+	struct bpf_reg_state *reg;
+	int i, j, err;
+
+	for (i = 0; i <= st->curframe; i++) {
+		func = st->frame[i];
+		for (j = 0; j < BPF_REG_FP; j++) {
+			reg = &func->regs[j];
+			reg->live |= REG_LIVE_READ64;
+			mark_reg_read(env, reg, reg->parent, REG_LIVE_READ64);
+			if (reg->type == SCALAR_VALUE) {
+				bt_set_frame_reg(&env->bt, i, j);
+				reg->precise = true;
+			}
+		}
+		for (j = 0; j < func->allocated_stack / BPF_REG_SIZE; j++) {
+			reg = &func->stack[j].spilled_ptr;
+			reg->live |= REG_LIVE_READ64;
+			mark_reg_read(env, reg, reg->parent, REG_LIVE_READ64);
+			if (is_spilled_reg(&func->stack[j]) && reg->type == SCALAR_VALUE) {
+				bt_set_frame_slot(&env->bt, i, j);
+				reg->precise = true;
+			}
+		}
+	}
+	err = __mark_chain_precision(env, st, -1);
+	if (err < 0)
+		return err;
+	return 0;
 }
 
 static bool is_spillable_regtype(enum bpf_reg_type type)
@@ -18993,7 +19028,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 					spi = __get_spi(iter_reg->off + iter_reg->var_off.value);
 					iter_state = &func(env, iter_reg)->stack[spi].spilled_ptr;
 					if (iter_state->iter.state == BPF_ITER_STATE_ACTIVE) {
-						update_loop_entry(env, cur, &sl->state);
+						mark_all_registers_read(env, &sl->state);
 						goto hit;
 					}
 				}
@@ -19004,15 +19039,17 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 					     states_equal(env, &sl->state, cur, RANGE_WITHIN);
 				show_candidate(env, &sl->state, equal);
 				if (equal) {
-					update_loop_entry(env, cur, &sl->state);
+					mark_all_registers_read(env, &sl->state);
 					goto hit;
 				}
 			}
 			if (calls_callback(env, insn_idx)) {
 				bool equal = states_equal(env, &sl->state, cur, RANGE_WITHIN);
 				show_candidate(env, &sl->state, equal);
-				if (equal)
+				if (equal) {
+					mark_all_registers_read(env, &sl->state);
 					goto hit;
+				}
 				goto skip_inf_loop_check;
 			}
 			/* attempt to detect infinite loop to avoid unnecessary doomed work */
