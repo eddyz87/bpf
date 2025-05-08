@@ -3,6 +3,7 @@
  * Copyright (c) 2016 Facebook
  * Copyright (c) 2018 Covalent IO, Inc. http://covalent.io
  */
+#include "linux/debugfs.h"
 #include <uapi/linux/btf.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/kernel.h>
@@ -266,6 +267,20 @@ static bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_JMP | BPF_CALL) &&
 	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
+}
+
+static u32 interesting_insn;
+
+static __init int interesting_insn_debugfs(void)
+{
+	debugfs_create_u32("bpf_interesting_insn", 0600, NULL, &interesting_insn);
+	return 0;
+}
+late_initcall(interesting_insn_debugfs);
+
+static bool is_interesting_insn(struct bpf_verifier_env *env, int insn_idx)
+{
+	return interesting_insn == insn_idx;
 }
 
 struct bpf_call_arg_meta {
@@ -1737,6 +1752,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->callback_unroll_depth = src->callback_unroll_depth;
 	dst_state->may_goto_depth = src->may_goto_depth;
 	dst_state->scc_epoch = src->scc_epoch;
+	dst_state->id = src->id;
 	for (i = 0; i <= src->curframe; i++) {
 		dst = dst_state->frame[i];
 		if (!dst) {
@@ -1941,6 +1957,7 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 		 * which might have large 'branches' count.
 		 */
 	}
+	elem->st.id = ++env->state_id_gen;
 	return &elem->st;
 err:
 	free_verifier_state(env->cur_state, true);
@@ -18494,6 +18511,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 
 		spi = i / BPF_REG_SIZE;
 
+		env->states_equal.spi = spi;
 		if (exact != NOT_EXACT &&
 		    (i >= cur->allocated_stack ||
 		     old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
@@ -18608,6 +18626,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			return false;
 		}
 	}
+	env->states_equal.spi = 0;
 	return true;
 }
 
@@ -18693,11 +18712,14 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	if (old->callback_depth > cur->callback_depth)
 		return false;
 
-	for (i = 0; i < MAX_BPF_REG; i++)
+	for (i = 0; i < MAX_BPF_REG; i++) {
 		if (((1 << i) & live_regs) &&
 		    !regsafe(env, &old->regs[i], &cur->regs[i],
-			     &env->idmap_scratch, exact))
+			     &env->idmap_scratch, exact)) {
+			env->states_equal.regno = i;
 			return false;
+		}
+	}
 
 	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact))
 		return false;
@@ -18718,6 +18740,8 @@ static bool states_equal(struct bpf_verifier_env *env,
 {
 	u32 insn_idx;
 	int i;
+
+	memset(&env->states_equal, 0, sizeof(env->states_equal));
 
 	if (old->curframe != cur->curframe)
 		return false;
@@ -18743,6 +18767,7 @@ static bool states_equal(struct bpf_verifier_env *env,
 		insn_idx = frame_insn_idx(old, i);
 		if (old->frame[i]->callsite != cur->frame[i]->callsite)
 			return false;
+		env->states_equal.frame = i;
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
@@ -18993,6 +19018,37 @@ static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf
 	return false;
 }
 
+static void show_candidate(struct bpf_verifier_env *env, struct bpf_verifier_state *state, bool equal, bool loop)
+{
+	int i;
+
+	if (!(env->log.level & BPF_LOG_LEVEL2) ||
+	    !is_interesting_insn(env, env->insn_idx))
+		return;
+
+	verbose(env, "  candidate %d (", state->id);
+	if (state->branches)
+		verbose(env, "br==%d,", state->branches);
+	if (loop)
+		verbose(env, "loop,");
+	if (equal)
+		verbose(env, "equal,");
+	else
+		verbose(env, "diff{frame=%d,regno=%d,spi=%d/%d}",
+			env->states_equal.frame,
+			env->states_equal.regno,
+			env->states_equal.spi,
+			(-env->states_equal.spi - 1) * BPF_REG_SIZE);
+	verbose(env, ");\n");
+	for (i = 0; i <= state->curframe; ++i) {
+		verbose(env, "    (insn=%d)",
+			state->curframe == i ? state->insn_idx : state->frame[i + 1]->callsite);
+		if (i == 0)
+			verbose(env, " frame0:");
+		print_verifier_state(env, state, i, true);
+	}
+}
+
 static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
@@ -19002,6 +19058,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	bool force_new_state, add_new_state, force_exact;
 	struct list_head *pos, *tmp, *head;
 	struct bpf_scc_info *scc_info;
+	bool log_candidate, loop;
 
 	force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx) ||
 			  /* Avoid accumulating infinitely long jmp history */
@@ -19022,6 +19079,17 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 
 	clean_live_states(env, insn_idx, cur);
 
+	if ((env->log.level & BPF_LOG_LEVEL2) && is_interesting_insn(env, insn_idx)) {
+		verbose(env, "is_state_visited: insn_idx=%d, current state %d:\n",
+			insn_idx, cur->id);
+		for (i = 0; i <= cur->curframe; ++i) {
+			verbose(env, "  (insn=%d)",
+				cur->curframe == i ? insn_idx : cur->frame[i + 1]->callsite);
+			if (i == 0)
+				verbose(env, " frame0:");
+			print_verifier_state(env, cur, i, true);
+		}
+	}
 	head = explored_state(env, insn_idx);
 	list_for_each_safe(pos, tmp, head) {
 		sl = container_of(pos, struct bpf_verifier_state_list, node);
@@ -19029,6 +19097,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		if (sl->state.insn_idx != insn_idx)
 			continue;
 
+		log_candidate = sl->state.branches == 0;
+		loop = false;
 		if (sl->state.branches) {
 			struct bpf_func_state *frame = sl->state.frame[sl->state.curframe];
 
@@ -19084,6 +19154,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 			 * => unsafe memory access at 11 would not be caught.
 			 */
 			if (is_iter_next_insn(env, insn_idx)) {
+				log_candidate = true;
+				loop = true;
 				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
 					struct bpf_func_state *cur_frame;
 					struct bpf_reg_state *iter_state, *iter_reg;
@@ -19108,6 +19180,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				goto skip_inf_loop_check;
 			}
 			if (is_may_goto_insn_at(env, insn_idx)) {
+				log_candidate = true;
+				loop = true;
 				if (sl->state.may_goto_depth != cur->may_goto_depth &&
 				    states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
 					mark_state_loops_possible(env, &sl->state);
@@ -19115,6 +19189,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				}
 			}
 			if (calls_callback(env, insn_idx)) {
+				log_candidate = true;
+				loop = true;
 				if (states_equal(env, &sl->state, cur, RANGE_WITHIN))
 					goto hit;
 				goto skip_inf_loop_check;
@@ -19154,8 +19230,10 @@ skip_inf_loop_check:
 		}
 		/* See comments for mark_all_regs_read_and_precise() */
 		force_exact = incomplete_read_marks(env, &sl->state, true);
+		loop = force_exact;
 		if (states_equal(env, &sl->state, cur, force_exact ? RANGE_WITHIN : NOT_EXACT)) {
 hit:
+			show_candidate(env, &sl->state, true, loop);
 			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
@@ -19182,6 +19260,8 @@ hit:
 			return 1;
 		}
 miss:
+		if (log_candidate)
+			show_candidate(env, &sl->state, false, loop);
 		/* when new state is not going to be added do not increase miss count.
 		 * Otherwise several loop iterations will remove the state
 		 * recorded earlier. The goal of these heuristics is to have
@@ -19261,6 +19341,7 @@ miss:
 	WARN_ONCE(new->branches != 1,
 		  "BUG is_state_visited:branches_to_explore=%d insn %d\n", new->branches, insn_idx);
 
+	cur->id = ++env->state_id_gen;
 	cur->parent = new;
 	cur->first_insn_idx = insn_idx;
 	cur->insn_hist_start = cur->insn_hist_end;
