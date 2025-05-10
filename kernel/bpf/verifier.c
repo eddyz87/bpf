@@ -1834,6 +1834,9 @@ static bool incomplete_read_marks(struct bpf_verifier_env *env,
 	for (i = 0; i <= st->curframe; i++) {
 		insn_idx = frame_insn_idx(st, i);
 		scc_info = insn_scc(env, insn_idx);
+		if ((env->log.level & BPF_LOG_LEVEL2) && scc_info)
+			verbose(env, "incomplete_read_marks for %d (same_epoch %d), st epoch %d, scc epoch %d, loops possible? %d\n",
+				st->id, same_epoch, st->scc_epoch, scc_info->scc_epoch, scc_info->state_loops_possible);
 		if (scc_info &&
 		    scc_info->state_loops_possible &&
 		    (same_epoch ? scc_info->scc_epoch == st->scc_epoch
@@ -18236,6 +18239,8 @@ static void mark_all_regs_read_and_precise(struct bpf_verifier_env *env,
 	u32 insn_idx;
 	int i, j;
 
+	if (env->log.level & BPF_LOG_LEVEL2)
+		verbose(env, "mark_all_regs_read_and_precise for %d\n", st->id);
 	for (i = 0; i <= st->curframe; i++) {
 		insn_idx = frame_insn_idx(st, i);
 		live_regs = env->insn_aux_data[insn_idx].live_regs_before;
