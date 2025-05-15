@@ -30,8 +30,37 @@
 #include <net/xdp.h>
 #include <linux/trace_events.h>
 #include <linux/kallsyms.h>
+#include <linux/debugfs.h>
 
 #include "disasm.h"
+
+static atomic_t total_insns;
+static atomic_t stack_insns;
+static atomic_t other_frame_stack_insns;
+static atomic_t prune_point_insns;
+
+/* Stats for selftests:
+ * # for f in $(ls /sys/kernel/debug/bpf_*); do printf "%-48s: %d\n" $f $(cat $f); done
+ * /sys/kernel/debug/bpf_total_insns               : 470814
+ * /sys/kernel/debug/bpf_prune_point_insns         : 71666
+ * /sys/kernel/debug/bpf_stack_insns               : 73732
+ * /sys/kernel/debug/bpf_other_frame_stack_insns   : 762
+ *
+ * Stats for scx:
+ * /sys/kernel/debug/bpf_total_insns               : 51508
+ * /sys/kernel/debug/bpf_prune_point_insns         : 14968
+ * /sys/kernel/debug/bpf_stack_insns               : 4488
+ * /sys/kernel/debug/bpf_other_frame_stack_insns   : 369
+ */
+static int debugfs_init(void)
+{
+	debugfs_create_atomic_t("bpf_total_insns", 0600, NULL, &total_insns);
+	debugfs_create_atomic_t("bpf_stack_insns", 0600, NULL, &stack_insns);
+	debugfs_create_atomic_t("bpf_other_frame_stack_insns", 0600, NULL, &other_frame_stack_insns);
+	debugfs_create_atomic_t("bpf_prune_point_insns", 0600, NULL, &prune_point_insns);
+	return 0;
+}
+late_initcall(debugfs_init);
 
 static const struct bpf_verifier_ops * const bpf_verifier_ops[] = {
 #define BPF_PROG_TYPE(_id, _name, prog_ctx_type, kern_ctx_type) \
@@ -7560,6 +7589,17 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		if (err)
 			return err;
 
+		struct bpf_insn_aux_data *aux;
+		aux = &env->insn_aux_data[env->insn_idx];
+		if (!aux->stack_access) {
+			aux->stack_access = true;
+			env->stack_insns++;
+			if (!aux->other_frame_stack_access &&
+			    cur_func(env)->regs[regno].frameno != env->cur_state->curframe) {
+				aux->other_frame_stack_access = true;
+				env->other_frame_stack_insns++;
+			}
+		}
 		if (t == BPF_READ)
 			err = check_stack_read(env, regno, off, size,
 					       value_regno);
@@ -17112,6 +17152,8 @@ enum {
 
 static void mark_prune_point(struct bpf_verifier_env *env, int idx)
 {
+	if (env->insn_aux_data[idx].prune_point)
+		env->prune_point_insns++;
 	env->insn_aux_data[idx].prune_point = true;
 }
 
@@ -24123,6 +24165,10 @@ skip_full_check:
 	env->verification_time = ktime_get_ns() - start_time;
 	print_verification_stats(env);
 	env->prog->aux->verified_insns = env->insn_processed;
+	atomic_add(env->prog->len, &total_insns);
+	atomic_add(env->stack_insns, &stack_insns);
+	atomic_add(env->other_frame_stack_insns, &other_frame_stack_insns);
+	atomic_add(env->prune_point_insns, &prune_point_insns);
 
 	/* preserve original error even if log finalization is successful */
 	err = bpf_vlog_finalize(&env->log, &log_true_size);

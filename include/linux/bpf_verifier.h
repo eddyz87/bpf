@@ -605,6 +605,8 @@ struct bpf_insn_aux_data {
 	 * accepts callback function as a parameter.
 	 */
 	bool calls_callback;
+	bool stack_access;
+	bool other_frame_stack_access;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
 };
@@ -796,6 +798,9 @@ struct bpf_verifier_env {
 	u32 free_list_size;
 	u32 explored_states_size;
 	bpfptr_t fd_array;
+	u32 stack_insns;
+	u32 other_frame_stack_insns;
+	u32 prune_point_insns;
 
 	/* bit mask to keep track of whether a register has been accessed
 	 * since the last time the function state was printed
