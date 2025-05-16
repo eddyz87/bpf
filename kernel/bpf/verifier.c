@@ -637,6 +637,42 @@ static u32 frame_insn_idx(struct bpf_verifier_state *st, u32 frame)
 	       : st->frame[frame + 1]->callsite;
 }
 
+static void mark_stack_write(struct bpf_verifier_env *env, u32 insn_idx, u64 mask)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	u64 stack_def = aux[insn_idx].stack_def;
+
+	if ((env->log.level & BPF_LOG_LEVEL2) && (stack_def | mask) != stack_def)
+		verbose(env, "insn %d stack def %016llx -> %016llx\n",
+			insn_idx, stack_def, stack_def | mask);
+	aux[insn_idx].stack_def |= mask;
+}
+
+static void mark_stack_read(struct bpf_verifier_env *env, u32 insn_idx, u64 mask)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	u64 stack_use = aux[insn_idx].stack_use;
+
+	if ((env->log.level & BPF_LOG_LEVEL2) && (stack_use | mask) != stack_use)
+		verbose(env, "insn %d stack use %016llx -> %016llx\n",
+			insn_idx, stack_use, stack_use | mask);
+	aux[insn_idx].stack_use |= mask;
+}
+
+static bool stack_can_be_read(struct bpf_verifier_env *env, u32 insn_idx, u32 spi)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+
+	return aux[insn_idx].live_stack_before & BIT(spi);
+}
+
+static bool reg_can_be_read(struct bpf_verifier_env *env, u32 insn_idx, u32 regno)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+
+	return aux[insn_idx].live_regs_before & BIT(regno);
+}
+
 static bool is_spi_bounds_valid(struct bpf_func_state *state, int spi, int nr_slots)
 {
        int allocated_slots = state->allocated_stack / BPF_REG_SIZE;
@@ -813,8 +849,8 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 		state->stack[spi - 1].spilled_ptr.ref_obj_id = id;
 	}
 
-	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
-	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
+	mark_stack_write(env, frame_insn_idx(env->cur_state, reg->frameno),
+			 BIT(spi) | BIT(spi - 1));
 
 	return 0;
 }
@@ -852,8 +888,8 @@ static void invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_stat
 	 * done later on reads or by mark_dynptr_read as well to unnecessary
 	 * mark registers in verifier state.
 	 */
-	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
-	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
+	mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno),
+			 BIT(spi) | BIT(spi - 1));
 }
 
 static int unmark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
@@ -963,8 +999,8 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 	__mark_reg_not_init(env, &state->stack[spi - 1].spilled_ptr);
 
 	/* Same reason as unmark_stack_slots_dynptr above */
-	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
-	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
+	mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno),
+			 BIT(spi) | BIT(spi - 1));
 
 	return 0;
 }
@@ -1082,12 +1118,12 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 			else
 				st->type |= PTR_UNTRUSTED;
 		}
-		st->live |= REG_LIVE_WRITTEN;
 		st->ref_obj_id = i == 0 ? id : 0;
 		st->iter.btf = btf;
 		st->iter.btf_id = btf_id;
 		st->iter.state = BPF_ITER_STATE_ACTIVE;
 		st->iter.depth = 0;
+		mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 
 		for (j = 0; j < BPF_REG_SIZE; j++)
 			slot->slot_type[j] = STACK_ITER;
@@ -1118,7 +1154,7 @@ static int unmark_stack_slots_iter(struct bpf_verifier_env *env,
 		__mark_reg_not_init(env, st);
 
 		/* see unmark_stack_slots_dynptr() for why we need to set REG_LIVE_WRITTEN */
-		st->live |= REG_LIVE_WRITTEN;
+		mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 
 		for (j = 0; j < BPF_REG_SIZE; j++)
 			slot->slot_type[j] = STACK_INVALID;
@@ -1214,7 +1250,7 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 
 	__mark_reg_known_zero(st);
 	st->type = PTR_TO_STACK; /* we don't have dedicated reg type */
-	st->live |= REG_LIVE_WRITTEN;
+	mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 	st->ref_obj_id = id;
 	st->irq.kfunc_class = kfunc_class;
 
@@ -1269,7 +1305,7 @@ static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_r
 	__mark_reg_not_init(env, st);
 
 	/* see unmark_stack_slots_dynptr() for why we need to set REG_LIVE_WRITTEN */
-	st->live |= REG_LIVE_WRITTEN;
+	mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 
 	for (i = 0; i < BPF_REG_SIZE; i++)
 		slot->slot_type[i] = STACK_INVALID;
@@ -3480,69 +3516,13 @@ next:
 	return 0;
 }
 
-/* Parentage chain of this register (or stack slot) should take care of all
- * issues like callee-saved registers, stack slot allocation time, etc.
- */
-static int mark_reg_read(struct bpf_verifier_env *env,
-			 const struct bpf_reg_state *state,
-			 struct bpf_reg_state *parent, u8 flag)
-{
-	bool writes = parent == state->parent; /* Observe write marks */
-	int cnt = 0;
-
-	while (parent) {
-		/* if read wasn't screened by an earlier write ... */
-		if (writes && state->live & REG_LIVE_WRITTEN)
-			break;
-		if (verifier_bug_if(parent->live & REG_LIVE_DONE, env,
-				    "type %s var_off %lld off %d",
-				    reg_type_str(env, parent->type),
-				    parent->var_off.value, parent->off))
-			return -EFAULT;
-		/* The first condition is more likely to be true than the
-		 * second, checked it first.
-		 */
-		if ((parent->live & REG_LIVE_READ) == flag ||
-		    parent->live & REG_LIVE_READ64)
-			/* The parentage chain never changes and
-			 * this parent was already marked as LIVE_READ.
-			 * There is no need to keep walking the chain again and
-			 * keep re-marking all parents as LIVE_READ.
-			 * This case happens when the same register is read
-			 * multiple times without writes into it in-between.
-			 * Also, if parent has the stronger REG_LIVE_READ64 set,
-			 * then no need to set the weak REG_LIVE_READ32.
-			 */
-			break;
-		/* ... then we depend on parent's value */
-		parent->live |= flag;
-		/* REG_LIVE_READ64 overrides REG_LIVE_READ32. */
-		if (flag == REG_LIVE_READ64)
-			parent->live &= ~REG_LIVE_READ32;
-		state = parent;
-		parent = state->parent;
-		writes = true;
-		cnt++;
-	}
-
-	if (env->longest_mark_read_walk < cnt)
-		env->longest_mark_read_walk = cnt;
-	return 0;
-}
-
 static int mark_stack_slot_obj_read(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 				    int spi, int nr_slots)
 {
-	struct bpf_func_state *state = func(env, reg);
-	int err, i;
+	int i;
 
 	for (i = 0; i < nr_slots; i++) {
-		struct bpf_reg_state *st = &state->stack[spi - i].spilled_ptr;
-
-		err = mark_reg_read(env, st, st->parent, REG_LIVE_READ64);
-		if (err)
-			return err;
-
+		mark_stack_read(env, frame_insn_idx(env->cur_state, reg->frameno), BIT(spi - i));
 		mark_stack_slot_scratched(env, spi - i);
 	}
 	return 0;
@@ -3750,16 +3730,12 @@ static int __check_reg_arg(struct bpf_verifier_env *env, struct bpf_reg_state *r
 
 		if (rw64)
 			mark_insn_zext(env, reg);
-
-		return mark_reg_read(env, reg, reg->parent,
-				     rw64 ? REG_LIVE_READ64 : REG_LIVE_READ32);
 	} else {
 		/* check whether register used as dest operand can be written to */
 		if (regno == BPF_REG_FP) {
 			verbose(env, "frame pointer is read only\n");
 			return -EACCES;
 		}
-		reg->live |= REG_LIVE_WRITTEN;
 		reg->subreg_def = rw64 ? DEF_NOT_SUBREG : env->insn_idx + 1;
 		if (t == DST_OP)
 			mark_reg_unknown(env, regs, regno);
@@ -4973,8 +4949,8 @@ static void save_register_state(struct bpf_verifier_env *env,
 	int i;
 
 	copy_register_state(&state->stack[spi].spilled_ptr, reg);
-	if (size == BPF_REG_SIZE)
-		state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
+	if (size == BPF_REG_SIZE) // TODO: not needed?
+		mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 
 	for (i = BPF_REG_SIZE; i > BPF_REG_SIZE - size; i--)
 		state->stack[spi].slot_type[i - 1] = STACK_SPILL;
@@ -5119,8 +5095,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		 * to stack slots all the way to first state when programs
 		 * writes+reads less than 8 bytes
 		 */
-		if (size == BPF_REG_SIZE)
-			state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
+		if (size == BPF_REG_SIZE) // TODO: not needed?
+			mark_stack_write(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 
 		/* when we zero initialize stack slots mark them as such */
 		if ((reg && register_is_null(reg)) ||
@@ -5314,7 +5290,6 @@ static void mark_reg_stack_read(struct bpf_verifier_env *env,
 		/* have read misc data from the stack */
 		mark_reg_unknown(env, state->regs, dst_regno);
 	}
-	state->regs[dst_regno].live |= REG_LIVE_WRITTEN;
 }
 
 /* Read the stack at 'off' and put the results into the register indicated by
@@ -5357,7 +5332,6 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				return -EACCES;
 			}
 
-			mark_reg_read(env, reg, reg->parent, REG_LIVE_READ64);
 			if (dst_regno < 0)
 				return 0;
 
@@ -5411,15 +5385,9 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 					insn_flags = 0; /* not restoring original register state */
 				}
 			}
-			state->regs[dst_regno].live |= REG_LIVE_WRITTEN;
 		} else if (dst_regno >= 0) {
 			/* restore register state from stack */
 			copy_register_state(&state->regs[dst_regno], reg);
-			/* mark reg as written since spilled pointer state likely
-			 * has its liveness marks cleared by is_state_visited()
-			 * which resets stack/reg liveness for state transitions
-			 */
-			state->regs[dst_regno].live |= REG_LIVE_WRITTEN;
 		} else if (__is_pointer_value(env->allow_ptr_leaks, reg)) {
 			/* If dst_regno==-1, the caller is asking us whether
 			 * it is acceptable to use this value as a SCALAR_VALUE
@@ -5431,7 +5399,6 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				off);
 			return -EACCES;
 		}
-		mark_reg_read(env, reg, reg->parent, REG_LIVE_READ64);
 	} else {
 		for (i = 0; i < size; i++) {
 			type = stype[(slot - i) % BPF_REG_SIZE];
@@ -5445,7 +5412,7 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				off, i, size);
 			return -EACCES;
 		}
-		mark_reg_read(env, reg, reg->parent, REG_LIVE_READ64);
+		mark_stack_read(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 		if (dst_regno >= 0)
 			mark_reg_stack_read(env, reg_state, off, off + size, dst_regno);
 		insn_flags = 0; /* we are not restoring spilled register */
@@ -7349,6 +7316,14 @@ static int check_stack_slot_within_bounds(struct bpf_verifier_env *env,
 	return 0;
 }
 
+static u64 gen_mask(u8 l, u8 h)
+{
+	u64 a = h >= 63 ? -1 : BIT(h + 1) - 1;
+	u64 b = l >= 63 ? -1 : BIT(l) - 1;
+
+	return a & ~b;
+}
+
 /* Check that the stack access at 'regno + off' falls within the maximum stack
  * bounds.
  *
@@ -7363,6 +7338,8 @@ static int check_stack_access_within_bounds(
 	struct bpf_reg_state *reg = regs + regno;
 	struct bpf_func_state *state = func(env, reg);
 	s64 min_off, max_off;
+	u32 reg_frame_ip;
+	u64 mask;
 	int err;
 	char *err_extra;
 
@@ -7406,6 +7383,16 @@ static int check_stack_access_within_bounds(
 				err_extra, regno, tn_buf, off, access_size);
 		}
 		return err;
+	}
+
+	reg_frame_ip = frame_insn_idx(env->cur_state, reg->frameno);
+	if (type == BPF_READ) {
+		mask = gen_mask(__get_spi(max_off - 1), __get_spi(min_off));
+		mark_stack_read(env, reg_frame_ip, mask);
+	} else {
+		/* count only writes overwriting full spi */
+		mask = gen_mask(__get_spi(round_down(max_off - 1, 8)), __get_spi(round_down(min_off, 8)));
+		mark_stack_write(env, reg_frame_ip, mask);
 	}
 
 	/* Note that there is no stack access with offset zero, so the needed stack
@@ -8058,17 +8045,8 @@ static int check_stack_range_initialized(
 		}
 		return -EACCES;
 mark:
-		/* reading any byte out of 8-byte 'spill_slot' will cause
-		 * the whole slot to be marked as 'read'
-		 */
-		mark_reg_read(env, &state->stack[spi].spilled_ptr,
-			      state->stack[spi].spilled_ptr.parent,
-			      REG_LIVE_READ64);
-		/* We do not set REG_LIVE_WRITTEN for stack slot, as we can not
-		 * be sure that whether stack slot is written to or not. Hence,
-		 * we must still conservatively propagate reads upwards even if
-		 * helper may write to the entire memory range.
-		 */
+		/* TODO: not needed? */
+		mark_stack_read(env, frame_insn_idx(env->cur_state, state->frameno), BIT(spi));
 	}
 	return 0;
 }
@@ -10890,8 +10868,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		}
 
 		/* we are going to rely on register's precise value */
-		err = mark_reg_read(env, r0, r0->parent, REG_LIVE_READ64);
-		err = err ?: mark_chain_precision(env, BPF_REG_0);
+		err = mark_chain_precision(env, BPF_REG_0);
 		if (err)
 			return err;
 
@@ -11798,16 +11775,12 @@ static void __mark_btf_func_reg_size(struct bpf_verifier_env *env, struct bpf_re
 
 	if (regno == BPF_REG_0) {
 		/* Function return value */
-		reg->live |= REG_LIVE_WRITTEN;
 		reg->subreg_def = reg_size == sizeof(u64) ?
 			DEF_NOT_SUBREG : env->insn_idx + 1;
 	} else {
 		/* Function argument */
 		if (reg_size == sizeof(u64)) {
 			mark_insn_zext(env, reg);
-			mark_reg_read(env, reg, reg->parent, REG_LIVE_READ64);
-		} else {
-			mark_reg_read(env, reg, reg->parent, REG_LIVE_READ32);
 		}
 	}
 }
@@ -15488,7 +15461,6 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 					 */
 					assign_scalar_id_before_mov(env, src_reg);
 					copy_register_state(dst_reg, src_reg);
-					dst_reg->live |= REG_LIVE_WRITTEN;
 					dst_reg->subreg_def = DEF_NOT_SUBREG;
 				} else {
 					/* case: R1 = (s8, s16 s32)R2 */
@@ -15507,7 +15479,6 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						if (!no_sext)
 							dst_reg->id = 0;
 						coerce_reg_to_size_sx(dst_reg, insn->off >> 3);
-						dst_reg->live |= REG_LIVE_WRITTEN;
 						dst_reg->subreg_def = DEF_NOT_SUBREG;
 					} else {
 						mark_reg_unknown(env, regs, insn->dst_reg);
@@ -15533,7 +15504,6 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						 */
 						if (!is_src_reg_u32)
 							dst_reg->id = 0;
-						dst_reg->live |= REG_LIVE_WRITTEN;
 						dst_reg->subreg_def = env->insn_idx + 1;
 					} else {
 						/* case: W1 = (s8, s16)W2 */
@@ -15544,7 +15514,6 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						copy_register_state(dst_reg, src_reg);
 						if (!no_sext)
 							dst_reg->id = 0;
-						dst_reg->live |= REG_LIVE_WRITTEN;
 						dst_reg->subreg_def = env->insn_idx + 1;
 						coerce_subreg_to_size_sx(dst_reg, insn->off >> 3);
 					}
@@ -18274,8 +18243,10 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 }
 
 static void clean_func_state(struct bpf_verifier_env *env,
+			     struct bpf_verifier_state *vst,
 			     struct bpf_func_state *st)
 {
+	u32 ip = frame_insn_idx(vst, st->frameno);
 	enum bpf_reg_liveness live;
 	int i, j;
 
@@ -18283,7 +18254,7 @@ static void clean_func_state(struct bpf_verifier_env *env,
 		live = st->regs[i].live;
 		/* liveness must not touch this register anymore */
 		st->regs[i].live |= REG_LIVE_DONE;
-		if (!(live & REG_LIVE_READ))
+		if (!reg_can_be_read(env, ip, i))
 			/* since the register is unused, clear its state
 			 * to make further comparison simpler
 			 */
@@ -18294,7 +18265,7 @@ static void clean_func_state(struct bpf_verifier_env *env,
 		live = st->stack[i].spilled_ptr.live;
 		/* liveness must not touch this stack slot anymore */
 		st->stack[i].spilled_ptr.live |= REG_LIVE_DONE;
-		if (!(live & REG_LIVE_READ)) {
+		if (!stack_can_be_read(env, ip, i)) {
 			__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
 			for (j = 0; j < BPF_REG_SIZE; j++)
 				st->stack[i].slot_type[j] = STACK_INVALID;
@@ -18312,7 +18283,7 @@ static void clean_verifier_state(struct bpf_verifier_env *env,
 		return;
 
 	for (i = 0; i <= st->curframe; i++)
-		clean_func_state(env, st->frame[i]);
+		clean_func_state(env, st, st->frame[i]);
 }
 
 /* the parentage chains form a tree.
@@ -18392,9 +18363,6 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 	if (exact == EXACT)
 		return regs_exact(rold, rcur, idmap);
 
-	if (!(rold->live & REG_LIVE_READ) && exact == NOT_EXACT)
-		/* explored state didn't use this */
-		return true;
 	if (rold->type == NOT_INIT) {
 		if (exact == NOT_EXACT || rcur->type == NOT_INIT)
 			/* explored state can't have used this */
@@ -18518,7 +18486,6 @@ static struct bpf_reg_state unbound_reg;
 static __init int unbound_reg_init(void)
 {
 	__mark_reg_unknown_imprecise(&unbound_reg);
-	unbound_reg.live |= REG_LIVE_READ;
 	return 0;
 }
 late_initcall(unbound_reg_init);
@@ -18552,7 +18519,7 @@ static struct bpf_reg_state *scalar_reg_for_stack(struct bpf_verifier_env *env,
 
 static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		      struct bpf_func_state *cur, struct bpf_idmap *idmap,
-		      enum exact_level exact)
+		      enum exact_level exact, u32 insn_idx)
 {
 	int i, spi;
 
@@ -18571,7 +18538,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		     cur->stack[spi].slot_type[i % BPF_REG_SIZE]))
 			return false;
 
-		if (!(old->stack[spi].spilled_ptr.live & REG_LIVE_READ)
+		if (!stack_can_be_read(env, insn_idx, spi)
 		    && exact == NOT_EXACT) {
 			i += BPF_REG_SIZE - 1;
 			/* explored state didn't use this */
@@ -18770,7 +18737,7 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 			     &env->idmap_scratch, exact))
 			return false;
 
-	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact))
+	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact, insn_idx))
 		return false;
 
 	return true;
@@ -18820,86 +18787,6 @@ static bool states_equal(struct bpf_verifier_env *env,
 	return true;
 }
 
-/* Return 0 if no propagation happened. Return negative error code if error
- * happened. Otherwise, return the propagated bit.
- */
-static int propagate_liveness_reg(struct bpf_verifier_env *env,
-				  struct bpf_reg_state *reg,
-				  struct bpf_reg_state *parent_reg)
-{
-	u8 parent_flag = parent_reg->live & REG_LIVE_READ;
-	u8 flag = reg->live & REG_LIVE_READ;
-	int err;
-
-	/* When comes here, read flags of PARENT_REG or REG could be any of
-	 * REG_LIVE_READ64, REG_LIVE_READ32, REG_LIVE_NONE. There is no need
-	 * of propagation if PARENT_REG has strongest REG_LIVE_READ64.
-	 */
-	if (parent_flag == REG_LIVE_READ64 ||
-	    /* Or if there is no read flag from REG. */
-	    !flag ||
-	    /* Or if the read flag from REG is the same as PARENT_REG. */
-	    parent_flag == flag)
-		return 0;
-
-	err = mark_reg_read(env, reg, parent_reg, flag);
-	if (err)
-		return err;
-
-	return flag;
-}
-
-/* A write screens off any subsequent reads; but write marks come from the
- * straight-line code between a state and its parent.  When we arrive at an
- * equivalent state (jump target or such) we didn't arrive by the straight-line
- * code, so read marks in the state must propagate to the parent regardless
- * of the state's write marks. That's what 'parent == state->parent' comparison
- * in mark_reg_read() is for.
- */
-static int propagate_liveness(struct bpf_verifier_env *env,
-			      const struct bpf_verifier_state *vstate,
-			      struct bpf_verifier_state *vparent)
-{
-	struct bpf_reg_state *state_reg, *parent_reg;
-	struct bpf_func_state *state, *parent;
-	int i, frame, err = 0;
-
-	if (vparent->curframe != vstate->curframe) {
-		WARN(1, "propagate_live: parent frame %d current frame %d\n",
-		     vparent->curframe, vstate->curframe);
-		return -EFAULT;
-	}
-	/* Propagate read liveness of registers... */
-	BUILD_BUG_ON(BPF_REG_FP + 1 != MAX_BPF_REG);
-	for (frame = 0; frame <= vstate->curframe; frame++) {
-		parent = vparent->frame[frame];
-		state = vstate->frame[frame];
-		parent_reg = parent->regs;
-		state_reg = state->regs;
-		/* We don't need to worry about FP liveness, it's read-only */
-		for (i = frame < vstate->curframe ? BPF_REG_6 : 0; i < BPF_REG_FP; i++) {
-			err = propagate_liveness_reg(env, &state_reg[i],
-						     &parent_reg[i]);
-			if (err < 0)
-				return err;
-			if (err == REG_LIVE_READ64)
-				mark_insn_zext(env, &parent_reg[i]);
-		}
-
-		/* Propagate stack slots. */
-		for (i = 0; i < state->allocated_stack / BPF_REG_SIZE &&
-			    i < parent->allocated_stack / BPF_REG_SIZE; i++) {
-			parent_reg = &parent->stack[i].spilled_ptr;
-			state_reg = &state->stack[i].spilled_ptr;
-			err = propagate_liveness_reg(env, state_reg,
-						     parent_reg);
-			if (err < 0)
-				return err;
-		}
-	}
-	return 0;
-}
-
 /* find precise scalars in the previous equivalent state and
  * propagate them into the current state
  */
@@ -18916,9 +18803,7 @@ static int propagate_precision(struct bpf_verifier_env *env,
 		state_reg = state->regs;
 		first = true;
 		for (i = 0; i < BPF_REG_FP; i++, state_reg++) {
-			if (state_reg->type != SCALAR_VALUE ||
-			    !state_reg->precise ||
-			    !(state_reg->live & REG_LIVE_READ))
+			if (state_reg->type != SCALAR_VALUE || !state_reg->precise)
 				continue;
 			if (env->log.level & BPF_LOG_LEVEL2) {
 				if (first)
@@ -18934,9 +18819,7 @@ static int propagate_precision(struct bpf_verifier_env *env,
 			if (!is_spilled_reg(&state->stack[i]))
 				continue;
 			state_reg = &state->stack[i].spilled_ptr;
-			if (state_reg->type != SCALAR_VALUE ||
-			    !state_reg->precise ||
-			    !(state_reg->live & REG_LIVE_READ))
+			if (state_reg->type != SCALAR_VALUE || !state_reg->precise)
 				continue;
 			if (env->log.level & BPF_LOG_LEVEL2) {
 				if (first)
@@ -19258,23 +19141,16 @@ hit:
 			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
-			 * Registers read by the continuation are read by us.
-			 * If we have any write marks in env->cur_state, they
-			 * will prevent corresponding reads in the continuation
-			 * from reaching our parent (an explored_state).  Our
-			 * own state will get the read marks recorded, but
-			 * they'll be immediately forgotten as we're pruning
-			 * this state and will pop a new one.
 			 */
-			err = propagate_liveness(env, &sl->state, cur);
 
 			/* if previous state reached the exit with precision and
 			 * current state is equivalent to it (except precision marks)
 			 * the precision needs to be propagated back in
 			 * the current state.
 			 */
+			err = 0;
 			if (is_jmp_point(env, env->insn_idx))
-				err = err ? : push_insn_history(env, cur, 0, 0);
+				err = push_insn_history(env, cur, 0, 0);
 			err = err ? : propagate_precision(env, &sl->state);
 			if (err)
 				return err;
@@ -19466,6 +19342,8 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 
 	return 0;
 }
+
+static void update_live_stack(struct bpf_verifier_env *env);
 
 static int do_check(struct bpf_verifier_env *env)
 {
@@ -19731,6 +19609,7 @@ process_bpf_exit_full:
 process_bpf_exit:
 				mark_verifier_state_scratched(env);
 				update_branch_counts(env, env->cur_state);
+				update_live_stack(env);
 				err = pop_stack(env, &prev_insn_idx,
 						&env->insn_idx, pop_log);
 				if (err < 0) {
@@ -23974,10 +23853,52 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 
 out:
 	kvfree(state);
-	kvfree(env->cfg.insn_postorder);
-	env->cfg.insn_postorder = NULL;
-	env->cfg.cur_postorder = 0;
 	return err;
+}
+
+/* TODO: this is a copy-paste of the core logic of compute_live_registers(),
+ *       but data is u64 instead of u16 and comes from insn_aux.
+ *       How to get rid of this copy-paste?
+ */
+static void update_live_stack(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	bool changed;
+	int i, cnt;
+
+	cnt = 0;
+	do {
+		changed = false;
+		cnt++;
+		for (i = 0; i < env->cfg.cur_postorder; ++i) {
+			int insn_idx = env->cfg.insn_postorder[i];
+			struct bpf_insn_aux_data *insn = &aux[insn_idx];
+			int succ_num;
+			u32 succ[2];
+			u64 new_before = 0;
+			u64 new_after = 0;
+
+			succ_num = insn_successors(env->prog, insn_idx, succ);
+			for (int s = 0; s < succ_num; ++s)
+				new_after |= aux[succ[s]].live_stack_before;
+			/* TODO: comment */
+			if (hweight64(insn->stack_def) > 1)
+				insn->stack_def = 0;
+			new_before = (new_after & ~insn->stack_def) | insn->stack_use;
+			if (new_after != insn->live_stack_after ||
+			    new_before != insn->live_stack_before) {
+				if (env->log.level & BPF_LOG_LEVEL2)
+					verbose(env, "live stack update at %d: %016llx -> %016llx\n",
+						i, insn->live_stack_before, new_before);
+				insn->live_stack_before = new_before;
+				insn->live_stack_after = new_after;
+				changed = true;
+			}
+		}
+	} while (changed);
+
+	if (cnt > 1 && (env->log.level & BPF_LOG_LEVEL2))
+		verbose(env, "live stack updated in %d iterations\n", cnt);
 }
 
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)

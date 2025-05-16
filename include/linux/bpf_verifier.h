@@ -609,6 +609,10 @@ struct bpf_insn_aux_data {
 	bool other_frame_stack_access;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	u64 live_stack_before;
+	u64 live_stack_after;
+	u64 stack_use;
+	u64 stack_def;
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
