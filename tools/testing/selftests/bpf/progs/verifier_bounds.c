@@ -888,7 +888,7 @@ l1_%=:	r0 = 0;						\
 SEC("socket")
 __description("bounds check for non const xor src dst")
 __success __log_level(2)
-__msg("5: (af) r0 ^= r6                      ; R0_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=431,var_off=(0x0; 0x1af))")
+__msg("5: (af) r0 ^= r6                      ; R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=431,var_off=(0x0; 0x1af))")
 __naked void non_const_xor_src_dst(void)
 {
 	asm volatile ("					\
@@ -909,7 +909,7 @@ __naked void non_const_xor_src_dst(void)
 SEC("socket")
 __description("bounds check for non const or src dst")
 __success __log_level(2)
-__msg("5: (4f) r0 |= r6                      ; R0_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=431,var_off=(0x0; 0x1af))")
+__msg("5: (4f) r0 |= r6                      ; R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=431,var_off=(0x0; 0x1af))")
 __naked void non_const_or_src_dst(void)
 {
 	asm volatile ("					\
@@ -930,7 +930,7 @@ __naked void non_const_or_src_dst(void)
 SEC("socket")
 __description("bounds check for non const mul regs")
 __success __log_level(2)
-__msg("5: (2f) r0 *= r6                      ; R0_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=3825,var_off=(0x0; 0xfff))")
+__msg("5: (2f) r0 *= r6                      ; R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=3825,var_off=(0x0; 0xfff))")
 __naked void non_const_mul_regs(void)
 {
 	asm volatile ("					\
@@ -1203,7 +1203,7 @@ l0_%=:	r0 = 0;						\
 SEC("tc")
 __description("multiply mixed sign bounds. test 1")
 __success __log_level(2)
-__msg("r6 *= r7 {{.*}}; R6_w=scalar(smin=umin=0x1bc16d5cd4927ee1,smax=umax=0x1bc16d674ec80000,smax32=0x7ffffeff,umax32=0xfffffeff,var_off=(0x1bc16d4000000000; 0x3ffffffeff))")
+__msg("r6 *= r7 {{.*}}; R6=scalar(smin=umin=0x1bc16d5cd4927ee1,smax=umax=0x1bc16d674ec80000,smax32=0x7ffffeff,umax32=0xfffffeff,var_off=(0x1bc16d4000000000; 0x3ffffffeff))")
 __naked void mult_mixed0_sign(void)
 {
 	asm volatile (
@@ -1226,7 +1226,7 @@ __naked void mult_mixed0_sign(void)
 SEC("tc")
 __description("multiply mixed sign bounds. test 2")
 __success __log_level(2)
-__msg("r6 *= r7 {{.*}}; R6_w=scalar(smin=smin32=-100,smax=smax32=200)")
+__msg("r6 *= r7 {{.*}}; R6=scalar(smin=smin32=-100,smax=smax32=200)")
 __naked void mult_mixed1_sign(void)
 {
 	asm volatile (
@@ -1249,7 +1249,7 @@ __naked void mult_mixed1_sign(void)
 SEC("tc")
 __description("multiply negative bounds")
 __success __log_level(2)
-__msg("r6 *= r7 {{.*}}; R6_w=scalar(smin=umin=smin32=umin32=0x3ff280b0,smax=umax=smax32=umax32=0x3fff0001,var_off=(0x3ff00000; 0xf81ff))")
+__msg("r6 *= r7 {{.*}}; R6=scalar(smin=umin=smin32=umin32=0x3ff280b0,smax=umax=smax32=umax32=0x3fff0001,var_off=(0x3ff00000; 0xf81ff))")
 __naked void mult_sign_bounds(void)
 {
 	asm volatile (
@@ -1273,7 +1273,7 @@ __naked void mult_sign_bounds(void)
 SEC("tc")
 __description("multiply bounds that don't cross signed boundary")
 __success __log_level(2)
-__msg("r8 *= r6 {{.*}}; R6_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=11,var_off=(0x0; 0xb)) R8_w=scalar(smin=0,smax=umax=0x7b96bb0a94a3a7cd,var_off=(0x0; 0x7fffffffffffffff))")
+__msg("r8 *= r6 {{.*}}; R6=scalar(smin=smin32=0,smax=umax=smax32=umax32=11,var_off=(0x0; 0xb)) R8=scalar(smin=0,smax=umax=0x7b96bb0a94a3a7cd,var_off=(0x0; 0x7fffffffffffffff))")
 __naked void mult_no_sign_crossing(void)
 {
 	asm volatile (
@@ -1293,7 +1293,7 @@ __naked void mult_no_sign_crossing(void)
 SEC("tc")
 __description("multiplication overflow, result in unbounded reg. test 1")
 __success __log_level(2)
-__msg("r6 *= r7 {{.*}}; R6_w=scalar()")
+__msg("r6 *= r7 {{.*}}; R6=scalar()")
 __naked void mult_unsign_ovf(void)
 {
 	asm volatile (
@@ -1315,7 +1315,7 @@ __naked void mult_unsign_ovf(void)
 SEC("tc")
 __description("multiplication overflow, result in unbounded reg. test 2")
 __success __log_level(2)
-__msg("r6 *= r7 {{.*}}; R6_w=scalar()")
+__msg("r6 *= r7 {{.*}}; R6=scalar()")
 __naked void mult_sign_ovf(void)
 {
 	asm volatile (
