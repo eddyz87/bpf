@@ -652,14 +652,37 @@ static u32 frame_insn_idx(struct bpf_verifier_state *st, u32 frame)
 	       : st->frame[frame + 1]->callsite;
 }
 
+static char *format_stack_mask(struct bpf_verifier_env *env, u64 mask)
+{
+	int i, off, remaining = sizeof(env->tmp_str_buf);
+	char *buf = env->tmp_str_buf;
+
+	buf[0] = 0;
+	for (i = 0; i < 64; i++) {
+		if (!(BIT(i) & mask))
+			continue;
+		off = snprintf(buf, remaining, "%d ", (i + 1) * 8);
+		remaining -= off;
+		buf += off;
+		if (remaining < 0) {
+			snprintf(env->tmp_str_buf, sizeof(env->tmp_str_buf), "%016llx", mask);
+			return env->tmp_str_buf;
+		}
+	}
+	return env->tmp_str_buf;
+}
+
 static void mark_stack_write(struct bpf_verifier_env *env, u32 insn_idx, u64 mask)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	u64 stack_def = aux[insn_idx].stack_def;
 
-	if ((env->log.level & BPF_LOG_LEVEL2) && (stack_def | mask) != stack_def)
-		verbose(env, "insn %d stack def %016llx -> %016llx\n",
-			insn_idx, stack_def, stack_def | mask);
+	if ((env->log.level & BPF_LOG_LEVEL2) && (stack_def | mask) != stack_def) {
+		verbose(env, "insn %d stack def %s",
+			insn_idx, format_stack_mask(env, stack_def));
+		verbose(env, " -> %s\n",
+			format_stack_mask(env, stack_def | mask));
+	}
 	aux[insn_idx].stack_def |= mask;
 }
 
@@ -668,9 +691,12 @@ static void mark_stack_read(struct bpf_verifier_env *env, u32 insn_idx, u64 mask
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	u64 stack_use = aux[insn_idx].stack_use;
 
-	if ((env->log.level & BPF_LOG_LEVEL2) && (stack_use | mask) != stack_use)
-		verbose(env, "insn %d stack use %016llx -> %016llx\n",
-			insn_idx, stack_use, stack_use | mask);
+	if ((env->log.level & BPF_LOG_LEVEL2) && (stack_use | mask) != stack_use) {
+		verbose(env, "insn %d stack use %s",
+			insn_idx, format_stack_mask(env, stack_use));
+		verbose(env, " -> %s\n",
+			format_stack_mask(env, stack_use | mask));
+	}
 	aux[insn_idx].stack_use |= mask;
 }
 
@@ -23968,9 +23994,11 @@ static void update_live_stack(struct bpf_verifier_env *env)
 			new_before = (new_after & ~insn->stack_def) | insn->stack_use;
 			if (new_after != insn->live_stack_after ||
 			    new_before != insn->live_stack_before) {
-				if (env->log.level & BPF_LOG_LEVEL2)
-					verbose(env, "live stack update at %d: %016llx -> %016llx\n",
-						i, insn->live_stack_before, new_before);
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose(env, "live stack update at %d: %s",
+						i, format_stack_mask(env, insn->live_stack_before));
+					verbose(env, " -> %s\n", format_stack_mask(env, new_before));
+				}
 				insn->live_stack_before = new_before;
 				insn->live_stack_after = new_after;
 				changed = true;
