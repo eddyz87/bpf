@@ -3,6 +3,7 @@
 #include <test_progs.h>
 #include <network_helpers.h>
 #include "type_cast.skel.h"
+#include <bpf/btf.h>
 
 static void test_xdp(void)
 {
@@ -103,6 +104,74 @@ out:
 	}
 }
 
+static void test_memcast_glob(void)
+{
+	struct type_cast *skel;
+	int err;
+
+	skel = type_cast__open();
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		return;
+
+	skel->bss->my_pid = getpid();
+	strcpy(skel->bss->filename_glob, "*test_progs");
+
+	bpf_program__set_autoload(skel->progs.mem_cast_glob, true);
+	err = type_cast__load(skel);
+	if (!ASSERT_OK(err, "skel_load"))
+		goto out;
+
+	err = type_cast__attach(skel);
+	if (!ASSERT_OK(err, "skel_attach"))
+		goto out;
+
+	read(-1, NULL, 0); /* trigger */
+
+	ASSERT_EQ(skel->bss->filename_glob_match, 1, "filename_glob_match");
+
+out:
+	type_cast__destroy(skel);
+}
+
+static void test_memcast_btf(void)
+{
+	struct type_cast *skel = NULL;
+	struct btf *vmlinux_btf;
+	int err, task_struct_id = -1;
+
+	vmlinux_btf = btf__load_vmlinux_btf();
+	if (!ASSERT_OK_PTR(vmlinux_btf, "load_vmlinux_btf"))
+		return;
+
+	task_struct_id = btf__find_by_name_kind(vmlinux_btf, "task_struct", BTF_KIND_STRUCT);
+	if (!ASSERT_GT(task_struct_id, 0, "task_struct_id"))
+		goto out;
+
+	skel = type_cast__open();
+	if (!ASSERT_OK_PTR(skel, "skel_open"))
+		return;
+
+	skel->bss->my_pid = getpid();
+	skel->bss->btf_type_id = task_struct_id;
+
+	bpf_program__set_autoload(skel->progs.mem_cast_btf, true);
+	err = type_cast__load(skel);
+	if (!ASSERT_OK(err, "skel_load"))
+		goto out;
+
+	err = type_cast__attach(skel);
+	if (!ASSERT_OK(err, "skel_attach"))
+		goto out;
+
+	read(-1, NULL, 0); /* trigger */
+
+	ASSERT_STREQ(skel->bss->btf_type_name, "task_struct", "task_struct_name");
+
+out:
+	type_cast__destroy(skel);
+	btf__free(vmlinux_btf);
+}
+
 void test_type_cast(void)
 {
 	if (test__start_subtest("xdp"))
@@ -111,4 +180,8 @@ void test_type_cast(void)
 		test_tc();
 	if (test__start_subtest("negative"))
 		test_negative();
+	if (test__start_subtest("memcast_glob"))
+		test_memcast_glob();
+	if (test__start_subtest("memcast_btf"))
+		test_memcast_btf();
 }
