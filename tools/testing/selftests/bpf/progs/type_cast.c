@@ -76,4 +76,177 @@ int kctx_u64(void *ctx)
 	return 0;
 }
 
+long ZERO = 0, ONE = 1, MINUS_ONE = -1;
+int my_pid;
+
+char filename_glob[32];
+int filename_glob_match;
+
+#define E2BIG 7
+#define EINVAL 22
+
+/* Non-recursive glob matching logic, adapted from:
+ *
+ * https://github.com/torvalds/linux/blob/master/lib/glob.c
+ */
+__noinline __weak int _glob_match(u64 pat_addr, u64 str_addr)
+{
+	const char *pat = bpf_rdonly_cast((void *)pat_addr, 0);
+	const char *str = bpf_rdonly_cast((void *)pat_addr, 0);
+	ssize_t backtrack_pi = MINUS_ONE, backtrack_si = MINUS_ONE;
+	size_t pi = ZERO, si = ZERO;
+
+	bpf_repeat(1000000) {
+		unsigned char p = pat[pi];
+		unsigned char s = str[si];
+
+		pi += ONE;
+		si += ONE;
+
+		switch (p) {
+		case '?':
+			/* single char wildcard matches anything but zero terminator */
+			if (s == '\0')
+				return 0; /* no match */
+			break;
+		case '*':
+			/* any-length widlcard, matched lazily (the least amount
+			 * of characters that is enough to satisfy the
+			 * pattern), which permits never needing to backtrack
+			 * more than one level (though it's not that obvious)
+			 */
+			if (pat[pi] == '\0')
+				return 1; /* match: trailing '*' matches anything */
+			backtrack_pi = pi;
+			backtrack_si = si - ONE; /* allow zero-length match */
+			si -= ONE; /* "unconsume" last string character */
+			break;
+		default:
+			if (p == '\\') {
+				p = pat[pi];
+				pi += ONE;
+			}
+			/* literal character match */
+			if (p == s) {
+				if (p == '\0')
+					return 1; /* full match */
+				break;
+			}
+
+			if (s == '\0' || backtrack_pi < 0)
+				return 0; /* no match and no backtracking left */
+
+			/* backtrack to last * wildcard and consume one character */
+			backtrack_si += ONE;
+			pi = backtrack_pi;
+			si = backtrack_si;
+			break;
+		}
+	}
+
+	return -E2BIG;
+}
+
+static int glob_match(const char *pat, const char *str)
+{
+	return _glob_match((u64)pat, (u64)str);
+}
+
+SEC("?tp_btf/sys_enter")
+int BPF_PROG(mem_cast_glob)
+{
+	const struct task_struct *task;
+	const char *filename;
+
+	if ((bpf_get_current_pid_tgid() >> 32) != my_pid)
+		return 0;
+
+	task = bpf_get_current_task_btf();
+
+	filename = (void *)task->mm->exe_file->f_path.dentry->d_name.name;
+	filename_glob_match = glob_match(filename_glob, filename);
+	bpf_printk("FILENAME = '%s' MATCH=%d", filename, filename_glob_match);
+
+	return 0;
+}
+
+char btf_type_name[32];
+int btf_type_id;
+
+#define BTF_INFO_KIND(info) (((info) >> 24) & 0x1f)
+#define BTF_INFO_VLEN(info) ((info) & 0xffff)
+
+static int btf_type_size(const struct btf_type *t)
+{
+	const int base_size = sizeof(struct btf_type);
+	u32 vlen = BTF_INFO_VLEN(t->info);
+	u32 kind = BTF_INFO_KIND(t->info);
+
+	switch (kind) {
+	case BTF_KIND_FWD:
+	case BTF_KIND_CONST:
+	case BTF_KIND_VOLATILE:
+	case BTF_KIND_RESTRICT:
+	case BTF_KIND_PTR:
+	case BTF_KIND_TYPEDEF:
+	case BTF_KIND_FUNC:
+	case BTF_KIND_FLOAT:
+	case BTF_KIND_TYPE_TAG:
+		return base_size;
+	case BTF_KIND_INT:
+		return base_size + sizeof(__u32);
+	case BTF_KIND_ENUM:
+		return base_size + vlen * sizeof(struct btf_enum);
+	case BTF_KIND_ENUM64:
+		return base_size + vlen * sizeof(struct btf_enum64);
+	case BTF_KIND_ARRAY:
+		return base_size + sizeof(struct btf_array);
+	case BTF_KIND_STRUCT:
+	case BTF_KIND_UNION:
+		return base_size + vlen * sizeof(struct btf_member);
+	case BTF_KIND_FUNC_PROTO:
+		return base_size + vlen * sizeof(struct btf_param);
+	case BTF_KIND_VAR:
+		return base_size + sizeof(struct btf_var);
+	case BTF_KIND_DATASEC:
+		return base_size + vlen * sizeof(struct btf_var_secinfo);
+	case BTF_KIND_DECL_TAG:
+		return base_size + sizeof(struct btf_decl_tag);
+	default:
+		return -EINVAL;
+	}
+}
+
+extern void __start_BTF __ksym __weak;
+
+SEC("?raw_tp/sys_enter")
+int BPF_PROG(mem_cast_btf)
+{
+	if ((bpf_get_current_pid_tgid() >> 32) != my_pid)
+		return 0;
+
+	struct btf_header *hdr = bpf_rdonly_cast(&__start_BTF, 0);
+	const void *types = (void *)hdr + hdr->hdr_len + hdr->type_off;
+	const char *strings = (void *)hdr + hdr->hdr_len + hdr->str_off;
+
+	const struct btf_type *t = (void *)types;
+	int i = 0;
+	bpf_for(i, 1, 1000000) {
+		int sz = btf_type_size(t);
+		if (sz < 0)
+			return 1;
+
+		if (i == btf_type_id)
+			break;
+
+		t = (void *)t + sz;
+	}
+
+	bpf_printk("TYPE ID %d NAME '%s'", i, strings + t->name_off);
+
+	__builtin_memcpy(btf_type_name, strings + t->name_off, sizeof(btf_type_name));
+
+	return 0;
+}
+
 char _license[] SEC("license") = "GPL";
