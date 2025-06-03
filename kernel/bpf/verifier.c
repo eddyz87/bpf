@@ -7113,15 +7113,6 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 			regno, tname, off);
 		return -EACCES;
 	}
-	if (!tnum_is_const(reg->var_off) || reg->var_off.value) {
-		char tn_buf[48];
-
-		tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
-		verbose(env,
-			"R%d is ptr_%s invalid variable offset: off=%d, var_off=%s\n",
-			regno, tname, off, tn_buf);
-		return -EACCES;
-	}
 
 	if (reg->type & MEM_USER) {
 		verbose(env,
@@ -7134,6 +7125,16 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 		verbose(env,
 			"R%d is ptr_%s access percpu memory: off=%d\n",
 			regno, tname, off);
+		return -EACCES;
+	}
+
+	if (!tnum_is_const(reg->var_off) || reg->var_off.value) {
+		char tn_buf[48];
+
+		tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
+		verbose(env,
+			"R%d is ptr_%s invalid variable offset: off=%d, var_off=%s\n",
+			regno, tname, off, tn_buf);
 		return -EACCES;
 	}
 
