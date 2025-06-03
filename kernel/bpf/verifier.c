@@ -7081,6 +7081,13 @@ static bool type_is_trusted_or_null(struct bpf_verifier_env *env,
 					  "__safe_trusted_or_null");
 }
 
+static bool btf_type_is_primitive(const struct btf_type *t)
+{
+	return btf_type_is_void(t) ||
+	       (btf_type_is_int(t) && BTF_INT_BITS(btf_int_encoding(t)) == 0 &&
+		(t->size == 1 || t->size == 2 || t->size == 4 || t->size == 8));
+}
+
 static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 				   struct bpf_reg_state *regs,
 				   int regno, int off, int size,
@@ -7126,6 +7133,11 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 			"R%d is ptr_%s access percpu memory: off=%d\n",
 			regno, tname, off);
 		return -EACCES;
+	}
+
+	if (btf_type_is_primitive(t) && atype == BPF_READ && value_regno >= 0) {
+		mark_btf_ld_reg(env, regs, value_regno, SCALAR_VALUE, NULL, 0, 0);
+		return 0;
 	}
 
 	if (!tnum_is_const(reg->var_off) || reg->var_off.value) {
@@ -10331,10 +10343,12 @@ static int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
 		struct bpf_subprog_arg_info *arg = &sub->args[i];
 
 		if (arg->arg_type == ARG_ANYTHING) {
+			/*
 			if (reg->type != SCALAR_VALUE) {
 				bpf_log(log, "R%d is not a scalar\n", regno);
 				return -EINVAL;
 			}
+			*/
 		} else if (arg->arg_type == ARG_PTR_TO_CTX) {
 			ret = check_func_arg_reg_off(env, reg, regno, ARG_DONTCARE);
 			if (ret < 0)
@@ -13538,13 +13552,16 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_kfunc_ca
 		regs[BPF_REG_0].btf_id = meta->ret_btf_id;
 	} else if (meta->func_id == special_kfunc_list[KF_bpf_rdonly_cast]) {
 		ret_t = btf_type_by_id(desc_btf, meta->arg_constant.value);
-		if (!ret_t || !btf_type_is_struct(ret_t)) {
+		if (!ret_t || (!btf_type_is_struct(ret_t) && !btf_type_is_primitive(ret_t))) {
 			verbose(env,
 				"kfunc bpf_rdonly_cast type ID argument must be of a struct\n");
 			return -EINVAL;
 		}
 
-		mark_reg_known_zero(env, regs, BPF_REG_0);
+		if (btf_type_is_primitive(ret_t))
+			mark_reg_unknown(env, regs, BPF_REG_0);
+		else
+			mark_reg_known_zero(env, regs, BPF_REG_0);
 		regs[BPF_REG_0].type = PTR_TO_BTF_ID | PTR_UNTRUSTED;
 		regs[BPF_REG_0].btf = desc_btf;
 		regs[BPF_REG_0].btf_id = meta->arg_constant.value;
@@ -13951,6 +13968,9 @@ static bool check_reg_sane_offset(struct bpf_verifier_env *env,
 			reg_type_str(env, type), val);
 		return false;
 	}
+
+	if (base_type(type) == PTR_TO_BTF_ID)
+		return true;
 
 	if (reg->off >= BPF_MAX_VAR_OFF || reg->off <= -BPF_MAX_VAR_OFF) {
 		verbose(env, "%s pointer offset %d is not allowed\n",
@@ -14398,8 +14418,8 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 		/* We can take a fixed offset as long as it doesn't overflow
 		 * the s32 'off' field
 		 */
-		if (known && (ptr_reg->off + smin_val ==
-			      (s64)(s32)(ptr_reg->off + smin_val))) {
+		if (known && !tnum_is_unknown(ptr_reg->var_off) &&
+		    (ptr_reg->off + smin_val == (s64)(s32)(ptr_reg->off + smin_val))) {
 			/* pointer += K.  Accumulate it into fixed offset */
 			dst_reg->smin_value = smin_ptr;
 			dst_reg->smax_value = smax_ptr;
