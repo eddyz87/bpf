@@ -346,6 +346,27 @@ struct bpf_kfunc_call_arg_meta {
 	u64 mem_size;
 };
 
+static size_t sizeof_bpf_func_state(struct bpf_func_state *p)
+{
+	size_t acc = sizeof(*p);
+
+	acc += sizeof(*p->stack) * p->allocated_stack / BPF_REG_SIZE;
+	return acc;
+}
+
+static size_t sizeof_bpf_verifier_state(struct bpf_verifier_state *p)
+{
+	size_t acc = sizeof(*p);
+	int i;
+
+	for (i = 0; i < MAX_CALL_FRAMES; i++)
+		if (p->frame[i])
+			acc += sizeof_bpf_func_state(p->frame[i]);
+	acc += sizeof(*p->refs) * p->acquired_refs;
+	acc += sizeof(*p->jmp_history) * p->jmp_history_cnt;
+	return acc;
+}
+
 struct btf *btf_vmlinux;
 
 static const char *btf_type_name(const struct btf *btf, u32 id)
@@ -19837,6 +19858,17 @@ static int do_check(struct bpf_verifier_env *env)
 		insn = &insns[env->insn_idx];
 
 		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
+			u64 sizeof_state_chain = 0;
+			u32 num_states = 0;
+			struct bpf_verifier_state *s = env->cur_state;
+
+			while (s) {
+				sizeof_state_chain += sizeof_bpf_verifier_state(s);
+				s = s->parent;
+				num_states++;
+			}
+			printk("sizeof_state_chain: %llu, num_states=%d, log.len_total=%u\n",
+			       sizeof_state_chain, num_states, env->log.len_total);
 			verbose(env,
 				"BPF program is too large. Processed %d insn\n",
 				env->insn_processed);
