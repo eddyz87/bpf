@@ -6904,6 +6904,7 @@ enum bpf_struct_walk_result {
 	/* < 0 error */
 	WALK_SCALAR = 0,
 	WALK_PTR,
+	WALK_PTR_TO_MEM,
 	WALK_STRUCT,
 };
 
@@ -7145,6 +7146,7 @@ error:
 					*field_name = mname;
 				return WALK_PTR;
 			}
+			return WALK_PTR_TO_MEM;
 		}
 
 		/* Allow more flexible access within an int as long as
@@ -7217,6 +7219,8 @@ int btf_struct_access(struct bpf_verifier_log *log,
 			*next_btf_id = id;
 			*flag = tmp_flag;
 			return PTR_TO_BTF_ID;
+		case WALK_PTR_TO_MEM:
+			return PTR_TO_MEM;
 		case WALK_SCALAR:
 			return SCALAR_VALUE;
 		case WALK_STRUCT:
@@ -7818,12 +7822,16 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog)
 			}
 
 			t = btf_type_skip_modifiers(btf, t->type, NULL);
-			ref_t = btf_resolve_size(btf, t, &mem_size);
-			if (IS_ERR(ref_t)) {
-				bpf_log(log, "arg#%d reference type('%s %s') size cannot be determined: %ld\n",
-					i, btf_type_str(t), btf_name_by_offset(btf, t->name_off),
-					PTR_ERR(ref_t));
-				return -EINVAL;
+			if (btf_type_is_void(btf_type_by_id(btf, t->type))) {
+				mem_size = 0;
+			} else {
+				ref_t = btf_resolve_size(btf, t, &mem_size);
+				if (IS_ERR(ref_t)) {
+					bpf_log(log, "arg#%d reference type('%s %s') size cannot be determined: %ld\n",
+						i, btf_type_str(t), btf_name_by_offset(btf, t->name_off),
+						PTR_ERR(ref_t));
+					return -EINVAL;
+				}
 			}
 
 			sub->args[i].arg_type = ARG_PTR_TO_MEM | PTR_MAYBE_NULL;

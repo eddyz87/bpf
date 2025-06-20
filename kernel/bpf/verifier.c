@@ -2792,22 +2792,33 @@ static void mark_reg_not_init(struct bpf_verifier_env *env,
 	__mark_reg_not_init(env, regs + regno);
 }
 
-static void mark_btf_ld_reg(struct bpf_verifier_env *env,
-			    struct bpf_reg_state *regs, u32 regno,
-			    enum bpf_reg_type reg_type,
-			    struct btf *btf, u32 btf_id,
-			    enum bpf_type_flag flag)
+static int mark_btf_ld_reg(struct bpf_verifier_env *env,
+			   struct bpf_reg_state *regs, u32 regno,
+			   enum bpf_reg_type reg_type,
+			   struct btf *btf, u32 btf_id,
+			   enum bpf_type_flag flag)
 {
 	if (reg_type == SCALAR_VALUE) {
 		mark_reg_unknown(env, regs, regno);
-		return;
+		return 0;
 	}
-	mark_reg_known_zero(env, regs, regno);
-	regs[regno].type = PTR_TO_BTF_ID | flag;
-	regs[regno].btf = btf;
-	regs[regno].btf_id = btf_id;
-	if (type_may_be_null(flag))
-		regs[regno].id = ++env->id_gen;
+	if (reg_type == PTR_TO_MEM) {
+		__mark_reg_known_zero(&regs[regno]);
+		regs[regno].type = reg_type;
+		regs[regno].mem_size = 0;
+		return 0;
+	}
+	if (reg_type == PTR_TO_BTF_ID) {
+		mark_reg_known_zero(env, regs, regno);
+		regs[regno].type = PTR_TO_BTF_ID | flag;
+		regs[regno].btf = btf;
+		regs[regno].btf_id = btf_id;
+		if (type_may_be_null(flag))
+			regs[regno].id = ++env->id_gen;
+		return 0;
+	}
+	verifier_bug(env, "unexpected register type %d in %s\n", reg_type, __FUNCTION__);
+	return -EFAULT;
 }
 
 #define DEF_NOT_SUBREG	(0)
@@ -7291,7 +7302,7 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 	}
 
 	if (atype == BPF_READ && value_regno >= 0)
-		mark_btf_ld_reg(env, regs, value_regno, ret, reg->btf, btf_id, flag);
+		return mark_btf_ld_reg(env, regs, value_regno, ret, reg->btf, btf_id, flag);
 
 	return 0;
 }
