@@ -10401,7 +10401,10 @@ static int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
 		struct bpf_subprog_arg_info *arg = &sub->args[i];
 
 		if (arg->arg_type == ARG_ANYTHING) {
-			if (reg->type != SCALAR_VALUE) {
+			if (reg->type == NOT_INIT) {
+				bpf_log(log, "parameter R%d is not initialized\n", regno);
+				return -EINVAL;
+			} else if (!env->allow_ptr_leaks && reg->type != SCALAR_VALUE) {
 				bpf_log(log, "R%d is not a scalar\n", regno);
 				return -EINVAL;
 			}
