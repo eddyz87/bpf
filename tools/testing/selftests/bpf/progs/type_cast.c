@@ -89,7 +89,7 @@ int filename_glob_match;
  *
  * https://github.com/torvalds/linux/blob/master/lib/glob.c
  */
-__noinline __weak int _glob_match(u64 pat_addr, u64 str_addr)
+__noinline __weak int glob_match(const void *pat_addr, const void *str_addr)
 {
 	const char *pat = bpf_rdonly_cast((void *)pat_addr, 0);
 	const char *str = bpf_rdonly_cast((void *)pat_addr, 0);
@@ -145,11 +145,6 @@ __noinline __weak int _glob_match(u64 pat_addr, u64 str_addr)
 	}
 
 	return -E2BIG;
-}
-
-static int glob_match(const char *pat, const char *str)
-{
-	return _glob_match((u64)pat, (u64)str);
 }
 
 SEC("?tp_btf/sys_enter")
