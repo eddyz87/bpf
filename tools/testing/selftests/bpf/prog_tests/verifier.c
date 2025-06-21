@@ -57,6 +57,7 @@
 #include "verifier_may_goto_1.skel.h"
 #include "verifier_may_goto_2.skel.h"
 #include "verifier_meta_access.skel.h"
+#include "verifier_mem_rdonly_untrusted.skel.h"
 #include "verifier_movsx.skel.h"
 #include "verifier_mtu.skel.h"
 #include "verifier_netfilter_ctx.skel.h"
@@ -205,6 +206,7 @@ void test_verifier_prevent_map_lookup(void)   { RUN(verifier_prevent_map_lookup)
 void test_verifier_private_stack(void)        { RUN(verifier_private_stack); }
 void test_verifier_raw_stack(void)            { RUN(verifier_raw_stack); }
 void test_verifier_raw_tp_writable(void)      { RUN(verifier_raw_tp_writable); }
+void test_verifier_mem_rdonly_untrusted(void) { RUN_FULL_CAPS(verifier_mem_rdonly_untrusted); }
 void test_verifier_reg_equal(void)            { RUN(verifier_reg_equal); }
 void test_verifier_ref_tracking(void)         { RUN(verifier_ref_tracking); }
 void test_verifier_regalloc(void)             { RUN(verifier_regalloc); }
