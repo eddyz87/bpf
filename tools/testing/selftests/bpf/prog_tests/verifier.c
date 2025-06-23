@@ -115,14 +115,16 @@ struct test_val {
 __maybe_unused
 static void run_tests_aux(const char *skel_name,
 			  skel_elf_bytes_fn elf_bytes_factory,
-			  pre_execution_cb pre_execution_cb)
+			  pre_execution_cb pre_execution_cb,
+			  bool drop_sysadmin)
 {
 	struct test_loader tester = {};
-	__u64 old_caps;
+	__u64 caps_to_drop, old_caps;
 	int err;
 
 	/* test_verifier tests are executed w/o CAP_SYS_ADMIN, do the same here */
-	err = cap_disable_effective(1ULL << CAP_SYS_ADMIN, &old_caps);
+	caps_to_drop = drop_sysadmin ? 1ULL << CAP_SYS_ADMIN : 0;
+	err = cap_disable_effective(caps_to_drop, &old_caps);
 	if (err) {
 		PRINT_FAIL("failed to drop CAP_SYS_ADMIN: %i, %s\n", err, strerror(-err));
 		return;
@@ -137,7 +139,8 @@ static void run_tests_aux(const char *skel_name,
 		PRINT_FAIL("failed to restore CAP_SYS_ADMIN: %i, %s\n", err, strerror(-err));
 }
 
-#define RUN(skel) run_tests_aux(#skel, skel##__elf_bytes, NULL)
+#define RUN(skel) run_tests_aux(#skel, skel##__elf_bytes, NULL, true)
+#define RUN_FULL_CAPS(skel) run_tests_aux(#skel, skel##__elf_bytes, NULL, false)
 
 void test_verifier_and(void)                  { RUN(verifier_and); }
 void test_verifier_arena(void)                { RUN(verifier_arena); }
@@ -272,7 +275,8 @@ void test_verifier_array_access(void)
 {
 	run_tests_aux("verifier_array_access",
 		      verifier_array_access__elf_bytes,
-		      init_array_access_maps);
+		      init_array_access_maps,
+		      true);
 }
 
 static int init_value_ptr_arith_maps(struct bpf_object *obj)
@@ -284,5 +288,6 @@ void test_verifier_value_ptr_arith(void)
 {
 	run_tests_aux("verifier_value_ptr_arith",
 		      verifier_value_ptr_arith__elf_bytes,
-		      init_value_ptr_arith_maps);
+		      init_value_ptr_arith_maps,
+		      true);
 }
