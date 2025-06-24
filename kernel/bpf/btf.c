@@ -857,28 +857,31 @@ const struct btf_type *btf_type_by_id(const struct btf *btf, u32 type_id)
 }
 EXPORT_SYMBOL_GPL(btf_type_by_id);
 
-/*
- * Regular int is not a bit field and it must be either
- * u8/u16/u32/u64 or __int128.
- */
-static bool btf_type_int_is_regular(const struct btf_type *t)
+static bool __btf_type_int_is_regular(const struct btf_type *t, size_t expected_size)
 {
-	u8 nr_bits, nr_bytes;
-	u32 int_data;
+	u32 int_data, nr_bits, nr_bytes;
+
+	if (!btf_type_is_int(t))
+		return false;
 
 	int_data = btf_type_int(t);
 	nr_bits = BTF_INT_BITS(int_data);
 	nr_bytes = BITS_ROUNDUP_BYTES(nr_bits);
-	if (BITS_PER_BYTE_MASKED(nr_bits) ||
-	    BTF_INT_OFFSET(int_data) ||
-	    (nr_bytes != sizeof(u8) && nr_bytes != sizeof(u16) &&
-	     nr_bytes != sizeof(u32) && nr_bytes != sizeof(u64) &&
-	     nr_bytes != (2 * sizeof(u64)))) {
-		return false;
-	}
-
-	return true;
+	return BITS_PER_BYTE_MASKED(nr_bits) == 0 &&
+	       BTF_INT_OFFSET(int_data) == 0 &&
+	       (nr_bytes <= 16 && is_power_of_2(nr_bytes)) &&
+	       (expected_size == 0 || nr_bytes == expected_size);
 }
+
+/*
+ * Check that the type @t is a regular int. This means that @t is not
+ * a bit field and it has the same size as either of u8/u16/u32/u64
+ * or __int128. If @expected_size is not zero, then size of @t should
+ * be the same.
+ */
+static bool btf_type_int_is_regular(const struct btf_type *t) { return __btf_type_int_is_regular(t, 0); }
+bool btf_is_u32(const struct btf_type *t) { return __btf_type_int_is_regular(t, sizeof(u32)); }
+bool btf_is_u64(const struct btf_type *t) { return __btf_type_int_is_regular(t, sizeof(u64)); }
 
 /*
  * Check that given struct member is a regular int with expected
@@ -2969,8 +2972,7 @@ static int btf_array_resolve(struct btf_verifier_env *env,
 		return env_stack_push(env, index_type, index_type_id);
 
 	index_type = btf_type_id_size(btf, &index_type_id, NULL);
-	if (!index_type || !btf_type_is_int(index_type) ||
-	    !btf_type_int_is_regular(index_type)) {
+	if (!index_type || !btf_type_int_is_regular(index_type)) {
 		btf_verifier_log_type(env, v->t, "Invalid index");
 		return -EINVAL;
 	}
