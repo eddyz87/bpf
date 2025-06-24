@@ -179,4 +179,20 @@ int BPF_PROG(trusted_acq_rel, struct task_struct *task, u64 clone_flags)
 	return subprog_trusted_acq_rel(task);
 }
 
+__noinline u64 ptr_as_scalar_fn(u64 addr)
+{
+	return *(u64 *)bpf_rdonly_cast((void *)addr, 0);
+}
+
+SEC("socket")
+__success
+__retval(42)
+int ptr_as_scalar_param(void *ctx)
+{
+	u64 v;
+
+	v = 42;
+	return ptr_as_scalar_fn((u64)&v);
+}
+
 char _license[] SEC("license") = "GPL";
