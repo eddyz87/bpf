@@ -381,6 +381,8 @@ struct bpf_jmp_history_entry {
 	u64 linked_regs;
 };
 
+struct bpf_cc_liveness;
+
 /* Maximum number of register states that can exist at once */
 #define BPF_ID_MAP_SIZE ((MAX_BPF_REG + MAX_BPF_STACK / BPF_REG_SIZE) * MAX_CALL_FRAMES)
 struct bpf_verifier_state {
@@ -850,6 +852,9 @@ struct bpf_verifier_env {
 	/* array of pointers to bpf_scc_info indexed by SCC id */
 	struct bpf_scc_info **scc_info;
 	u32 scc_cnt;
+	struct rhashtable callchain_liveness_ht;
+	bool ccl_ht_init;
+	bool internal_error;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1070,5 +1075,17 @@ void print_insn_state(struct bpf_verifier_env *env, const struct bpf_verifier_st
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
 int bpf_insn_successors(struct bpf_prog *prog, u32 idx, u32 succ[2]);
 void bpf_fmt_stack_mask(char *buf, ssize_t buf_sz, u64 stack_mask);
+
+int bpf_stack_liveness_init(struct bpf_verifier_env *env);
+void bpf_stack_liveness_free(struct bpf_verifier_env *env);
+int bpf_update_live_stack(struct bpf_verifier_env *env);
+int bpf_mark_stack_read(struct bpf_verifier_env *env, u32 frameno, u32 insn_idx, u64 mask);
+int bpf_mark_stack_write(struct bpf_verifier_env *env, u32 frameno, u32 insn_idx, u64 mask);
+
+struct bpf_cc_liveness *bpf_lookup_cc_liveness(struct bpf_verifier_env *env,
+					       struct bpf_verifier_state *st,
+					       u32 frameno);
+bool bpf_stack_can_be_read(struct bpf_verifier_env *env,
+			   struct bpf_cc_liveness *ccl, u32 insn_idx, u32 spi);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

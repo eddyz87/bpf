@@ -607,6 +607,14 @@ static struct bpf_func_state *func(struct bpf_verifier_env *env,
 	return cur->frame[reg->frameno];
 }
 
+static u64 gen_mask(u8 l, u8 h)
+{
+	u64 a = h >= 63 ? -1 : BIT(h + 1) - 1;
+	u64 b = l >= 63 ? -1 : BIT(l) - 1;
+
+	return a & ~b;
+}
+
 static bool is_spi_bounds_valid(struct bpf_func_state *state, int spi, int nr_slots)
 {
        int allocated_slots = state->allocated_stack / BPF_REG_SIZE;
@@ -783,15 +791,18 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 		state->stack[spi - 1].spilled_ptr.ref_obj_id = id;
 	}
 
+	err = bpf_mark_stack_write(env, state->frameno, insn_idx, gen_mask(spi - 1, spi));
+	if (err)
+		return err;
 	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
 	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
 
 	return 0;
 }
 
-static void invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_state *state, int spi)
+static int invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_state *state, int spi)
 {
-	int i;
+	int i, err;
 
 	for (i = 0; i < BPF_REG_SIZE; i++) {
 		state->stack[spi].slot_type[i] = STACK_INVALID;
@@ -822,22 +833,25 @@ static void invalidate_dynptr(struct bpf_verifier_env *env, struct bpf_func_stat
 	 * done later on reads or by mark_dynptr_read as well to unnecessary
 	 * mark registers in verifier state.
 	 */
+	err = bpf_mark_stack_write(env, state->frameno, env->insn_idx, gen_mask(spi - 1, spi));
+	if (err)
+		return err;
 	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
 	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
+	return 0;
 }
 
 static int unmark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int spi, ref_obj_id, i;
+	int spi, ref_obj_id, i, err;
 
 	spi = dynptr_get_spi(env, reg);
 	if (spi < 0)
 		return spi;
 
 	if (!dynptr_type_refcounted(state->stack[spi].spilled_ptr.dynptr.type)) {
-		invalidate_dynptr(env, state, spi);
-		return 0;
+		return invalidate_dynptr(env, state, spi);
 	}
 
 	ref_obj_id = state->stack[spi].spilled_ptr.ref_obj_id;
@@ -865,8 +879,11 @@ static int unmark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_re
 			verifier_bug(env, "misconfigured ref_obj_id");
 			return -EFAULT;
 		}
-		if (state->stack[i].spilled_ptr.dynptr.first_slot)
-			invalidate_dynptr(env, state, i);
+		if (state->stack[i].spilled_ptr.dynptr.first_slot) {
+			err = invalidate_dynptr(env, state, i);
+			if (err)
+				return err;
+		}
 	}
 
 	return 0;
@@ -888,7 +905,7 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 {
 	struct bpf_func_state *fstate;
 	struct bpf_reg_state *dreg;
-	int i, dynptr_id;
+	int i, dynptr_id, err;
 
 	/* We always ensure that STACK_DYNPTR is never set partially,
 	 * hence just checking for slot_type[0] is enough. This is
@@ -933,6 +950,9 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 	__mark_reg_not_init(env, &state->stack[spi - 1].spilled_ptr);
 
 	/* Same reason as unmark_stack_slots_dynptr above */
+	err = bpf_mark_stack_write(env, state->frameno, env->insn_idx, gen_mask(spi - 1, spi));
+	if (err)
+		return err;
 	state->stack[spi].spilled_ptr.live |= REG_LIVE_WRITTEN;
 	state->stack[spi - 1].spilled_ptr.live |= REG_LIVE_WRITTEN;
 
@@ -1030,7 +1050,7 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 				 struct btf *btf, u32 btf_id, int nr_slots)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int spi, i, j, id;
+	int spi, i, j, id, err;
 
 	spi = iter_get_spi(env, reg, nr_slots);
 	if (spi < 0)
@@ -1040,6 +1060,9 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 	if (id < 0)
 		return id;
 
+	err = bpf_mark_stack_write(env, state->frameno, insn_idx, gen_mask(spi - nr_slots + 1, spi));
+	if (err)
+		return err;
 	for (i = 0; i < nr_slots; i++) {
 		struct bpf_stack_state *slot = &state->stack[spi - i];
 		struct bpf_reg_state *st = &slot->spilled_ptr;
@@ -1072,12 +1095,15 @@ static int unmark_stack_slots_iter(struct bpf_verifier_env *env,
 				   struct bpf_reg_state *reg, int nr_slots)
 {
 	struct bpf_func_state *state = func(env, reg);
-	int spi, i, j;
+	int spi, i, j, err;
 
 	spi = iter_get_spi(env, reg, nr_slots);
 	if (spi < 0)
 		return spi;
 
+	err = bpf_mark_stack_write(env, state->frameno, env->insn_idx, gen_mask(spi - nr_slots + 1, spi));
+	if (err)
+		return err;
 	for (i = 0; i < nr_slots; i++) {
 		struct bpf_stack_state *slot = &state->stack[spi - i];
 		struct bpf_reg_state *st = &slot->spilled_ptr;
@@ -1169,7 +1195,7 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 	struct bpf_func_state *state = func(env, reg);
 	struct bpf_stack_state *slot;
 	struct bpf_reg_state *st;
-	int spi, i, id;
+	int spi, i, id, err;
 
 	spi = irq_flag_get_spi(env, reg);
 	if (spi < 0)
@@ -1182,6 +1208,9 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 	slot = &state->stack[spi];
 	st = &slot->spilled_ptr;
 
+	err = bpf_mark_stack_write(env, reg->frameno, insn_idx, BIT(spi));
+	if (err)
+		return err;
 	__mark_reg_known_zero(st);
 	st->type = PTR_TO_STACK; /* we don't have dedicated reg type */
 	st->live |= REG_LIVE_WRITTEN;
@@ -1239,6 +1268,9 @@ static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_r
 	__mark_reg_not_init(env, st);
 
 	/* see unmark_stack_slots_dynptr() for why we need to set REG_LIVE_WRITTEN */
+	err = bpf_mark_stack_write(env, reg->frameno, env->insn_idx, BIT(spi));
+	if (err)
+		return err;
 	st->live |= REG_LIVE_WRITTEN;
 
 	for (i = 0; i < BPF_REG_SIZE; i++)
@@ -3619,6 +3651,9 @@ static int mark_stack_slot_obj_read(struct bpf_verifier_env *env, struct bpf_reg
 		if (err)
 			return err;
 
+		err = bpf_mark_stack_read(env, reg->frameno, env->insn_idx, BIT(spi - i));
+		if (err)
+			return err;
 		mark_stack_slot_scratched(env, spi - i);
 	}
 	return 0;
@@ -5153,6 +5188,12 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	if (err)
 		return err;
 
+	if (!(off % BPF_REG_SIZE) && size == BPF_DW) {
+		err = bpf_mark_stack_write(env, reg->frameno, insn_idx, BIT(spi));
+		if (err)
+			return err;
+	}
+
 	check_fastcall_stack_contract(env, state, insn_idx, off);
 	mark_stack_slot_scratched(env, spi);
 	if (reg && !(off % BPF_REG_SIZE) && reg->type == SCALAR_VALUE && env->bpf_capable) {
@@ -5422,12 +5463,16 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 	struct bpf_reg_state *reg;
 	u8 *stype, type;
 	int insn_flags = insn_stack_access_flags(reg_state->frameno, spi);
+	int err;
 
 	stype = reg_state->stack[spi].slot_type;
 	reg = &reg_state->stack[spi].spilled_ptr;
 
 	mark_stack_slot_scratched(env, spi);
 	check_fastcall_stack_contract(env, state, env->insn_idx, off);
+	err = bpf_mark_stack_read(env, reg_state->frameno, env->insn_idx, BIT(spi));
+	if (err)
+		return err;
 
 	if (is_spilled_reg(&reg_state->stack[spi])) {
 		u8 spill_size = 1;
@@ -8161,6 +8206,9 @@ mark:
 		mark_reg_read(env, &state->stack[spi].spilled_ptr,
 			      state->stack[spi].spilled_ptr.parent,
 			      REG_LIVE_READ64);
+		err = bpf_mark_stack_read(env, reg->frameno, env->insn_idx, BIT(spi));
+		if (err)
+			return err;
 		/* We do not set REG_LIVE_WRITTEN for stack slot, as we can not
 		 * be sure that whether stack slot is written to or not. Hence,
 		 * we must still conservatively propagate reads upwards even if
@@ -18521,6 +18569,7 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 }
 
 static void clean_func_state(struct bpf_verifier_env *env,
+			     struct bpf_cc_liveness *ccl,
 			     struct bpf_func_state *st,
 			     u32 ip)
 {
@@ -18536,7 +18585,11 @@ static void clean_func_state(struct bpf_verifier_env *env,
 	}
 
 	for (i = 0; i < st->allocated_stack / BPF_REG_SIZE; i++) {
-		if (!(aux->live_stack_before & BIT(i))) {
+		if (!bpf_stack_can_be_read(env, ccl, ip, i)) {
+			if (st->stack[i].spilled_ptr.live & REG_LIVE_READ) {
+				verifier_bug(env, "incorrect live marks #1 for insn %d spi %d\n", ip, i);
+				env->internal_error = true;
+			}
 			__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
 			for (j = 0; j < BPF_REG_SIZE; j++)
 				st->stack[i].slot_type[j] = STACK_INVALID;
@@ -18547,12 +18600,14 @@ static void clean_func_state(struct bpf_verifier_env *env,
 static void clean_verifier_state(struct bpf_verifier_env *env,
 				 struct bpf_verifier_state *st)
 {
+	struct bpf_cc_liveness *ccl;
 	int i, ip;
 
 	st->cleaned = true;
 	for (i = 0; i <= st->curframe; i++) {
+		ccl = bpf_lookup_cc_liveness(env, st, i);
 		ip = frame_insn_idx(st, i);
-		clean_func_state(env, st->frame[i], ip);
+		clean_func_state(env, ccl, st->frame[i], ip);
 	}
 }
 
@@ -18789,9 +18844,10 @@ static struct bpf_reg_state *scalar_reg_for_stack(struct bpf_verifier_env *env,
 	return NULL;
 }
 
-static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
-		      struct bpf_func_state *cur, struct bpf_idmap *idmap,
-		      enum exact_level exact)
+static bool stacksafe(struct bpf_verifier_env *env,
+		      struct bpf_func_state *old, struct bpf_func_state *cur,
+		      struct bpf_cc_liveness *ccl,
+		      u32 insn_idx, struct bpf_idmap *idmap, enum exact_level exact)
 {
 	int i, spi;
 
@@ -18810,8 +18866,12 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		     cur->stack[spi].slot_type[i % BPF_REG_SIZE]))
 			return false;
 
-		if (!(old->stack[spi].spilled_ptr.live & REG_LIVE_READ)
+		if (!bpf_stack_can_be_read(env, ccl, insn_idx, spi)
 		    && exact == NOT_EXACT) {
+			if (old->stack[spi].spilled_ptr.live & REG_LIVE_READ) {
+				verifier_bug(env, "incorrect live marks #2 for insn %d spi %d\n", insn_idx, spi);
+				env->internal_error = true;
+			}
 			i += BPF_REG_SIZE - 1;
 			/* explored state didn't use this */
 			continue;
@@ -18994,8 +19054,10 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
  * whereas register type in current state is meaningful, it means that
  * the current state will reach 'bpf_exit' instruction safely
  */
-static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_state *old,
-			      struct bpf_func_state *cur, u32 insn_idx, enum exact_level exact)
+static bool func_states_equal(struct bpf_verifier_env *env,
+			      struct bpf_func_state *old, struct bpf_func_state *cur,
+			      struct bpf_cc_liveness *ccl,
+			      u32 insn_idx, enum exact_level exact)
 {
 	u16 live_regs = env->insn_aux_data[insn_idx].live_regs_before;
 	u16 i;
@@ -19009,7 +19071,7 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 			     &env->idmap_scratch, exact))
 			return false;
 
-	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact))
+	if (!stacksafe(env, old, cur, ccl, insn_idx, &env->idmap_scratch, exact))
 		return false;
 
 	return true;
@@ -19026,6 +19088,7 @@ static bool states_equal(struct bpf_verifier_env *env,
 			 struct bpf_verifier_state *cur,
 			 enum exact_level exact)
 {
+	struct bpf_cc_liveness *ccl;
 	u32 insn_idx;
 	int i;
 
@@ -19051,9 +19114,10 @@ static bool states_equal(struct bpf_verifier_env *env,
 	 */
 	for (i = 0; i <= old->curframe; i++) {
 		insn_idx = frame_insn_idx(old, i);
+		ccl = bpf_lookup_cc_liveness(env, old, i);
 		if (old->frame[i]->callsite != cur->frame[i]->callsite)
 			return false;
-		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
+		if (!func_states_equal(env, old->frame[i], cur->frame[i], ccl, insn_idx, exact))
 			return false;
 	}
 	return true;
@@ -19513,6 +19577,8 @@ skip_inf_loop_check:
 		loop = incomplete_read_marks(env, &sl->state);
 		if (states_equal(env, &sl->state, cur, loop ? RANGE_WITHIN : NOT_EXACT)) {
 hit:
+			if (env->internal_error)
+				return -EFAULT;
 			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
@@ -19627,6 +19693,8 @@ hit:
 			return 1;
 		}
 miss:
+		if (env->internal_error)
+			return -EFAULT;
 		/* when new state is not going to be added do not increase miss count.
 		 * Otherwise several loop iterations will remove the state
 		 * recorded earlier. The goal of these heuristics is to have
@@ -19898,6 +19966,9 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 		return PROCESS_BPF_EXIT;
 
 	if (env->cur_state->curframe) {
+		err = bpf_update_live_stack(env);
+		if (err)
+			return err;
 		/* exit from nested function */
 		err = prepare_func_exit(env, &env->insn_idx);
 		if (err)
@@ -20215,6 +20286,9 @@ static int do_check(struct bpf_verifier_env *env)
 process_bpf_exit:
 			mark_verifier_state_scratched(env);
 			err = update_branch_counts(env, env->cur_state);
+			if (err)
+				return err;
+			err = bpf_update_live_stack(env);
 			if (err)
 				return err;
 			err = pop_stack(env, &prev_insn_idx, &env->insn_idx,
@@ -24463,9 +24537,6 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 
 out:
 	kvfree(state);
-	kvfree(env->cfg.insn_postorder);
-	env->cfg.insn_postorder = NULL;
-	env->cfg.cur_postorder = 0;
 	return err;
 }
 
@@ -24771,6 +24842,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	if (ret)
 		goto skip_full_check;
 
+	ret = bpf_stack_liveness_init(env);
+	if (ret)
+		return ret;
+
 	ret = check_attach_btf_id(env);
 	if (ret)
 		goto skip_full_check;
@@ -24920,6 +24995,7 @@ err_unlock:
 		mutex_unlock(&bpf_verifier_lock);
 	vfree(env->insn_aux_data);
 err_free_env:
+	bpf_stack_liveness_free(env);
 	kvfree(env->cfg.insn_postorder);
 	kvfree(env->scc_info);
 	kvfree(env);
