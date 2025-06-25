@@ -2,15 +2,24 @@
 #include <test_progs.h>
 #include "get_func_args_test.skel.h"
 
+static char log[4 * 1024 * 1024];
+
 void test_get_func_args_test(void)
 {
 	struct get_func_args_test *skel = NULL;
 	int err, prog_fd;
 	LIBBPF_OPTS(bpf_test_run_opts, topts);
 
-	skel = get_func_args_test__open_and_load();
-	if (!ASSERT_OK_PTR(skel, "get_func_args_test__open_and_load"))
+	skel = get_func_args_test__open();
+	if (!ASSERT_OK_PTR(skel, "get_func_args_test__open"))
 		return;
+
+	bpf_program__set_log_level(skel->progs.test2, 1|2|4);
+	bpf_program__set_log_buf(skel->progs.test2, log, sizeof(log));
+	err = get_func_args_test__load(skel);
+	printf("Verifier log:\n%s\n", log);
+	if (!ASSERT_OK(err, "get_func_args_test__load"))
+		goto cleanup;
 
 	err = get_func_args_test__attach(skel);
 	if (!ASSERT_OK(err, "get_func_args_test__attach"))
