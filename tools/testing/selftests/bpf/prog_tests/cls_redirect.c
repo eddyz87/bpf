@@ -437,6 +437,8 @@ cleanup:
 	test_cls_redirect_dynptr__destroy(skel);
 }
 
+static char log[4*1024*1024];
+
 static void test_cls_redirect_inlined(void)
 {
 	struct test_cls_redirect *skel;
@@ -449,7 +451,12 @@ static void test_cls_redirect_inlined(void)
 	skel->rodata->ENCAPSULATION_IP = htonl(ENCAP_IP);
 	skel->rodata->ENCAPSULATION_PORT = htons(ENCAP_PORT);
 
+	bpf_program__set_log_buf(skel->progs.cls_redirect, log, sizeof(log));
+	if (env.verbosity >= VERBOSE_SUPER)
+		bpf_program__set_log_level(skel->progs.cls_redirect, 1|2|4);
 	err = test_cls_redirect__load(skel);
+	if (env.verbosity >= VERBOSE_SUPER)
+		printf("Verifier log:\n%s\n", log);
 	if (CHECK(err, "skel_load", "failed: %d\n", err))
 		goto cleanup;
 
