@@ -214,6 +214,10 @@ struct bpf_reg_state {
 	u32 ref_obj_id;
 	/* parentage chain for liveness checking */
 	struct bpf_reg_state *parent;
+	u32 insn_idx;
+	u32 owner_frame;
+	int owner_spi;
+	int owner_reg;
 	/* Inside the callee two registers can be both PTR_TO_STACK like
 	 * R1=fp-8 and R2=fp-8, but one of them points to this function stack
 	 * while another to the caller's stack. To differentiate them 'frameno'
