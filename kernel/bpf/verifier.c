@@ -3604,6 +3604,11 @@ static int mark_reg_read(struct bpf_verifier_env *env,
 		/* REG_LIVE_READ64 overrides REG_LIVE_READ32. */
 		if (flag == REG_LIVE_READ64)
 			parent->live &= ~REG_LIVE_READ32;
+		/*
+		 * if (flag & REG_LIVE_READ && parent->insn_idx == 236)
+		 * 	verbose(env, "marking reg read 236, fr=%d, spi=%d, reg=%d\n",
+		 * 		parent->owner_frame, parent->owner_spi, parent->owner_reg);
+		 */
 		state = parent;
 		parent = state->parent;
 		writes = true;
@@ -19706,6 +19711,25 @@ miss:
 						&newframe->stack[i].spilled_ptr;
 		}
 	}
+
+	for (j = 0; j <= new->curframe; j++) {
+		struct bpf_func_state *frame = cur->frame[j];
+
+		for (i = 0; i < BPF_REG_FP; i++) {
+			new->frame[j]->regs[i].insn_idx = insn_idx;
+			new->frame[j]->regs[i].owner_frame = j;
+			new->frame[j]->regs[i].owner_spi = -1;
+			new->frame[j]->regs[i].owner_reg = i;
+		}
+
+		for (i = 0; i < frame->allocated_stack / BPF_REG_SIZE; i++) {
+			frame->stack[i].spilled_ptr.insn_idx = insn_idx;
+			frame->stack[i].spilled_ptr.owner_frame = j;
+			frame->stack[i].spilled_ptr.owner_spi = i;
+			frame->stack[i].spilled_ptr.owner_reg = -1;
+		}
+	}
+
 	return 0;
 }
 
