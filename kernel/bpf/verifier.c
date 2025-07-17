@@ -1754,6 +1754,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 		return err;
 	dst_state->speculative = src->speculative;
 	dst_state->in_sleepable = src->in_sleepable;
+	dst_state->cleaned = src->cleaned;
 	dst_state->curframe = src->curframe;
 	dst_state->branches = src->branches;
 	dst_state->parent = src->parent;
@@ -3569,11 +3570,6 @@ static int mark_reg_read(struct bpf_verifier_env *env,
 		/* if read wasn't screened by an earlier write ... */
 		if (writes && state->live & REG_LIVE_WRITTEN)
 			break;
-		if (verifier_bug_if(parent->live & REG_LIVE_DONE, env,
-				    "type %s var_off %lld off %d",
-				    reg_type_str(env, parent->type),
-				    parent->var_off.value, parent->off))
-			return -EFAULT;
 		/* The first condition is more likely to be true than the
 		 * second, checked it first.
 		 */
@@ -18454,16 +18450,14 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 }
 
 static void clean_func_state(struct bpf_verifier_env *env,
-			     struct bpf_func_state *st)
+			     struct bpf_func_state *st,
+			     u32 ip)
 {
-	enum bpf_reg_liveness live;
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[ip];
 	int i, j;
 
 	for (i = 0; i < BPF_REG_FP; i++) {
-		live = st->regs[i].live;
-		/* liveness must not touch this register anymore */
-		st->regs[i].live |= REG_LIVE_DONE;
-		if (!(live & REG_LIVE_READ))
+		if (!(aux->live_regs_before & BIT(i)))
 			/* since the register is unused, clear its state
 			 * to make further comparison simpler
 			 */
@@ -18471,10 +18465,7 @@ static void clean_func_state(struct bpf_verifier_env *env,
 	}
 
 	for (i = 0; i < st->allocated_stack / BPF_REG_SIZE; i++) {
-		live = st->stack[i].spilled_ptr.live;
-		/* liveness must not touch this stack slot anymore */
-		st->stack[i].spilled_ptr.live |= REG_LIVE_DONE;
-		if (!(live & REG_LIVE_READ)) {
+		if (!(aux->live_stack_before & BIT(i))) {
 			__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
 			for (j = 0; j < BPF_REG_SIZE; j++)
 				st->stack[i].slot_type[j] = STACK_INVALID;
@@ -18485,10 +18476,13 @@ static void clean_func_state(struct bpf_verifier_env *env,
 static void clean_verifier_state(struct bpf_verifier_env *env,
 				 struct bpf_verifier_state *st)
 {
-	int i;
+	int i, ip;
 
-	for (i = 0; i <= st->curframe; i++)
-		clean_func_state(env, st->frame[i]);
+	st->cleaned = true;
+	for (i = 0; i <= st->curframe; i++) {
+		ip = frame_insn_idx(st, i);
+		clean_func_state(env, st->frame[i], ip);
+	}
 }
 
 /* the parentage chains form a tree.
@@ -18514,7 +18508,7 @@ static void clean_verifier_state(struct bpf_verifier_env *env,
  * their final liveness marks are already propagated.
  * Hence when the verifier completes the search of state list in is_state_visited()
  * we can call this clean_live_states() function to mark all liveness states
- * as REG_LIVE_DONE to indicate that 'parent' pointers of 'struct bpf_reg_state'
+ * as st->cleaned to indicate that 'parent' pointers of 'struct bpf_reg_state'
  * will not be used.
  * This function also clears the registers and stack for states that !READ
  * to simplify state merging.
@@ -18537,7 +18531,7 @@ static void clean_live_states(struct bpf_verifier_env *env, int insn,
 		if (sl->state.insn_idx != insn ||
 		    !same_callsites(&sl->state, cur))
 			continue;
-		if (sl->state.frame[0]->regs[0].live & REG_LIVE_DONE)
+		if (sl->state.cleaned)
 			/* all regs in this state in all frames were already marked */
 			continue;
 		if (incomplete_read_marks(env, &sl->state))
@@ -18569,9 +18563,6 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 	if (exact == EXACT)
 		return regs_exact(rold, rcur, idmap);
 
-	if (!(rold->live & REG_LIVE_READ) && exact == NOT_EXACT)
-		/* explored state didn't use this */
-		return true;
 	if (rold->type == NOT_INIT) {
 		if (exact == NOT_EXACT || rcur->type == NOT_INIT)
 			/* explored state can't have used this */
