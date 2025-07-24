@@ -824,6 +824,7 @@ struct bpf_verifier_env {
 	u32 free_list_size;
 	u32 explored_states_size;
 	u32 num_backedges;
+	u32 callchain_frames_count;
 	bpfptr_t fd_array;
 
 	/* bit mask to keep track of whether a register has been accessed

@@ -23324,10 +23324,11 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		verbose(env, "\n");
 	}
 	verbose(env, "processed %d insns (limit %d) max_states_per_insn %d "
-		"total_states %d peak_states %d mark_read %d\n",
+		"total_states %d peak_states %d mark_read %d callchain_frames_count %d\n",
 		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
 		env->max_states_per_insn, env->total_states,
-		env->peak_states, env->longest_mark_read_walk);
+		env->peak_states, env->longest_mark_read_walk,
+		env->callchain_frames_count);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
@@ -24520,6 +24521,108 @@ exit:
 	return err;
 }
 
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+
+struct cg_entry {
+	u32 caller;
+	u32 callee;
+};
+
+static int cg_entry_cmp(const void *_a, const void *_b)
+{
+	const struct cg_entry *a = _a;
+	const struct cg_entry *b = _b;
+
+	return a->caller - b->caller;
+}
+
+static struct cg_entry *callgraph_find(struct cg_entry *cg, u32 cg_cnt, u32 caller)
+{
+	struct cg_entry key = { caller, 0 };
+
+	return bsearch(&key, cg, cg_cnt, sizeof(*cg), cg_entry_cmp);
+}
+
+static struct cg_entry *collect_callgraph(struct bpf_verifier_env *env, u32 *cg_cnt)
+{
+	struct bpf_subprog_info *info = env->subprog_info;
+	struct bpf_insn *insns = env->prog->insnsi;
+	struct cg_entry *callgraph, *tmp;
+	u32 caller, callee, i, cnt;
+
+	callgraph = NULL;
+	cnt = 0;
+	for (caller = 0; caller < env->subprog_cnt; caller++) {
+		u32 start, end;
+
+		start = info[caller].start;
+		end = info[caller + 1].start;
+		for (i = start; i < end; i++) {
+			// what about bpf_pseudo_func(insn)?
+			if (!bpf_pseudo_call(insns + i))
+				continue;
+
+			callee = find_subprog(env, i + insns[i].imm + 1);
+			if (subprog_is_global(env, callee))
+				continue;
+
+			cnt++;
+			tmp = vrealloc(callgraph, sizeof(*callgraph) * cnt, GFP_KERNEL_ACCOUNT);
+			if (!tmp) {
+				vfree(callgraph);
+				return ERR_PTR(-ENOMEM);
+			}
+			callgraph = tmp;
+			callgraph[cnt - 1] = (struct cg_entry){ caller, callee };
+		}
+	}
+	*cg_cnt = cnt;
+	return callgraph;
+}
+
+static u32 count_callchain_frames(struct bpf_verifier_env *env, struct cg_entry *cg, u32 cg_cnt, u32 caller, u32 depth)
+{
+	struct bpf_subprog_info *info = env->subprog_info;
+	struct cg_entry *e, *end = cg + cg_cnt;
+	u32 cnt;
+
+	if (depth > MAX_CALL_FRAMES)
+		return 0;
+
+	cnt = (info[caller + 1].start - info[caller].start) * depth;
+	e = callgraph_find(cg, cg_cnt, caller);
+	if (!e)
+		return cnt;
+
+	for (; e < end && e->caller == caller; e++)
+		cnt += count_callchain_frames(env, cg, cg_cnt, e->callee, depth + 1);
+	return cnt;
+}
+
+static int compute_callchain_frames_count(struct bpf_verifier_env *env)
+{
+	u32 cg_cnt, count, max_count, i;
+	struct cg_entry *cg;
+
+	cg = collect_callgraph(env, &cg_cnt);
+	if (IS_ERR(cg))
+		return PTR_ERR(cg);
+
+	max_count = 0;
+	for (i = 0; i < env->subprog_cnt; i++) {
+		if (i > 0 && !subprog_is_global(env, i))
+			continue;
+		count = count_callchain_frames(env, cg, cg_cnt, i, 1);
+		max_count = max(max_count, count);
+	}
+	env->callchain_frames_count = max_count;
+	vfree(cg);
+	return 0;
+}
+
+#pragma GCC pop_options
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
@@ -24637,6 +24740,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 
 	ret = check_cfg(env);
 	if (ret < 0)
+		goto skip_full_check;
+
+	ret = compute_callchain_frames_count(env);
+	if (ret)
 		goto skip_full_check;
 
 	ret = check_attach_btf_id(env);
