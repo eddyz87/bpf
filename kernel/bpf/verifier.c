@@ -2355,8 +2355,19 @@ static void __update_reg_bounds(struct bpf_reg_state *reg)
 	__update_reg64_bounds(reg);
 }
 
+void print_reg_state(struct bpf_verifier_env *env,
+		     const struct bpf_func_state *state,
+		     const struct bpf_reg_state *reg);
+
+static void log_reg_state(struct bpf_verifier_env *env, struct bpf_reg_state *reg, const char *pfx)
+{
+	verbose(env, "%s: ", pfx);
+	print_reg_state(env, NULL, reg);
+	verbose(env, "\n");
+}
+
 /* Uses signed min/max values to inform unsigned, and vice-versa */
-static void __reg32_deduce_bounds(struct bpf_reg_state *reg)
+static void __reg32_deduce_bounds(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	/* If upper 32 bits of u64/s64 range don't change, we can use lower 32
 	 * bits to improve our u32/s32 boundaries.
@@ -2386,9 +2397,11 @@ static void __reg32_deduce_bounds(struct bpf_reg_state *reg)
 		reg->u32_min_value = max_t(u32, reg->u32_min_value, (u32)reg->umin_value);
 		reg->u32_max_value = min_t(u32, reg->u32_max_value, (u32)reg->umax_value);
 
+		log_reg_state(env, reg, "__reg32_deduce_bounds #1");
 		if ((s32)reg->umin_value <= (s32)reg->umax_value) {
 			reg->s32_min_value = max_t(s32, reg->s32_min_value, (s32)reg->umin_value);
 			reg->s32_max_value = min_t(s32, reg->s32_max_value, (s32)reg->umax_value);
+			log_reg_state(env, reg, "__reg32_deduce_bounds #2");
 		}
 	}
 	if ((reg->smin_value >> 32) == (reg->smax_value >> 32)) {
@@ -2396,11 +2409,13 @@ static void __reg32_deduce_bounds(struct bpf_reg_state *reg)
 		if ((u32)reg->smin_value <= (u32)reg->smax_value) {
 			reg->u32_min_value = max_t(u32, reg->u32_min_value, (u32)reg->smin_value);
 			reg->u32_max_value = min_t(u32, reg->u32_max_value, (u32)reg->smax_value);
+			log_reg_state(env, reg, "__reg32_deduce_bounds #3");
 		}
 		/* low 32 bits should form a proper s32 range */
 		if ((s32)reg->smin_value <= (s32)reg->smax_value) {
 			reg->s32_min_value = max_t(s32, reg->s32_min_value, (s32)reg->smin_value);
 			reg->s32_max_value = min_t(s32, reg->s32_max_value, (s32)reg->smax_value);
+			log_reg_state(env, reg, "__reg32_deduce_bounds #4");
 		}
 	}
 	/* Special case where upper bits form a small sequence of two
@@ -2420,11 +2435,13 @@ static void __reg32_deduce_bounds(struct bpf_reg_state *reg)
 	    (s32)reg->umin_value < 0 && (s32)reg->umax_value >= 0) {
 		reg->s32_min_value = max_t(s32, reg->s32_min_value, (s32)reg->umin_value);
 		reg->s32_max_value = min_t(s32, reg->s32_max_value, (s32)reg->umax_value);
+		log_reg_state(env, reg, "__reg32_deduce_bounds #5");
 	}
 	if ((u32)(reg->smin_value >> 32) + 1 == (u32)(reg->smax_value >> 32) &&
 	    (s32)reg->smin_value < 0 && (s32)reg->smax_value >= 0) {
 		reg->s32_min_value = max_t(s32, reg->s32_min_value, (s32)reg->smin_value);
 		reg->s32_max_value = min_t(s32, reg->s32_max_value, (s32)reg->smax_value);
+		log_reg_state(env, reg, "__reg32_deduce_bounds #6");
 	}
 	/* if u32 range forms a valid s32 range (due to matching sign bit),
 	 * try to learn from that
@@ -2432,6 +2449,7 @@ static void __reg32_deduce_bounds(struct bpf_reg_state *reg)
 	if ((s32)reg->u32_min_value <= (s32)reg->u32_max_value) {
 		reg->s32_min_value = max_t(s32, reg->s32_min_value, reg->u32_min_value);
 		reg->s32_max_value = min_t(s32, reg->s32_max_value, reg->u32_max_value);
+		log_reg_state(env, reg, "__reg32_deduce_bounds #7");
 	}
 	/* If we cannot cross the sign boundary, then signed and unsigned bounds
 	 * are the same, so combine.  This works even in the negative case, e.g.
@@ -2440,10 +2458,11 @@ static void __reg32_deduce_bounds(struct bpf_reg_state *reg)
 	if ((u32)reg->s32_min_value <= (u32)reg->s32_max_value) {
 		reg->u32_min_value = max_t(u32, reg->s32_min_value, reg->u32_min_value);
 		reg->u32_max_value = min_t(u32, reg->s32_max_value, reg->u32_max_value);
+		log_reg_state(env, reg, "__reg32_deduce_bounds #8");
 	}
 }
 
-static void __reg64_deduce_bounds(struct bpf_reg_state *reg)
+static void __reg64_deduce_bounds(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	/* If u64 range forms a valid s64 range (due to matching sign bit),
 	 * try to learn from that. Let's do a bit of ASCII art to see when
@@ -2515,6 +2534,7 @@ static void __reg64_deduce_bounds(struct bpf_reg_state *reg)
 	if ((s64)reg->umin_value <= (s64)reg->umax_value) {
 		reg->smin_value = max_t(s64, reg->smin_value, reg->umin_value);
 		reg->smax_value = min_t(s64, reg->smax_value, reg->umax_value);
+		log_reg_state(env, reg, "__reg64_deduce_bounds #1");
 	}
 	/* If we cannot cross the sign boundary, then signed and unsigned bounds
 	 * are the same, so combine.  This works even in the negative case, e.g.
@@ -2523,6 +2543,7 @@ static void __reg64_deduce_bounds(struct bpf_reg_state *reg)
 	if ((u64)reg->smin_value <= (u64)reg->smax_value) {
 		reg->umin_value = max_t(u64, reg->smin_value, reg->umin_value);
 		reg->umax_value = min_t(u64, reg->smax_value, reg->umax_value);
+		log_reg_state(env, reg, "__reg64_deduce_bounds #2");
 	} else {
 		/* If the s64 range crosses the sign boundary, then it's split
 		 * between the beginning and end of the U64 domain. In that
@@ -2562,6 +2583,7 @@ static void __reg64_deduce_bounds(struct bpf_reg_state *reg)
 		if (reg->umax_value < (u64)reg->smin_value) {
 			reg->smin_value = (s64)reg->umin_value;
 			reg->umax_value = min_t(u64, reg->umax_value, reg->smax_value);
+			log_reg_state(env, reg, "__reg64_deduce_bounds #3");
 		} else if ((u64)reg->smax_value < reg->umin_value) {
 			/* This second condition considers the case where the u64 range
 			 * overlaps with the negative portion of the s64 range:
@@ -2574,11 +2596,12 @@ static void __reg64_deduce_bounds(struct bpf_reg_state *reg)
 	                 */
 			reg->smax_value = (s64)reg->umax_value;
 			reg->umin_value = max_t(u64, reg->umin_value, reg->smin_value);
+			log_reg_state(env, reg, "__reg64_deduce_bounds #4");
 		}
 	}
 }
 
-static void __reg_deduce_mixed_bounds(struct bpf_reg_state *reg)
+static void __reg_deduce_mixed_bounds(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	/* Try to tighten 64-bit bounds from 32-bit knowledge, using 32-bit
 	 * values on both sides of 64-bit range in hope to have tighter range.
@@ -2619,6 +2642,7 @@ static void __reg_deduce_mixed_bounds(struct bpf_reg_state *reg)
 		reg->smin_value = max_t(s64, reg->smin_value, new_smin);
 		reg->smax_value = min_t(s64, reg->smax_value, new_smax);
 	}
+	log_reg_state(env, reg, "__reg_deduce_mixed_bounds #1");
 
 	/* Here we would like to handle a special case after sign extending load,
 	 * when upper bits for a 64-bit range are all 1s or all 0s.
@@ -2656,14 +2680,15 @@ static void __reg_deduce_mixed_bounds(struct bpf_reg_state *reg)
 		reg->umax_value = reg->s32_max_value;
 		reg->var_off = tnum_intersect(reg->var_off,
 					      tnum_range(reg->smin_value, reg->smax_value));
+		log_reg_state(env, reg, "__reg_deduce_mixed_bounds #2");
 	}
 }
 
-static void __reg_deduce_bounds(struct bpf_reg_state *reg)
+static void __reg_deduce_bounds(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
-	__reg32_deduce_bounds(reg);
-	__reg64_deduce_bounds(reg);
-	__reg_deduce_mixed_bounds(reg);
+	__reg32_deduce_bounds(env, reg);
+	__reg64_deduce_bounds(env, reg);
+	__reg_deduce_mixed_bounds(env, reg);
 }
 
 /* Attempts to improve var_off based on unsigned min/max information */
@@ -2679,20 +2704,26 @@ static void __reg_bound_offset(struct bpf_reg_state *reg)
 	reg->var_off = tnum_or(tnum_clear_subreg(var64_off), var32_off);
 }
 
-static void reg_bounds_sync(struct bpf_reg_state *reg)
+static void reg_bounds_sync(struct bpf_verifier_env *env, struct bpf_reg_state *reg)
 {
 	/* We might have learned new bounds from the var_off. */
+	log_reg_state(env, reg, "reg_bounds_sync entry");
 	__update_reg_bounds(reg);
+	log_reg_state(env, reg, "reg_bounds_sync __update_reg_bounds #1");
 	/* We might have learned something about the sign bit. */
-	__reg_deduce_bounds(reg);
-	__reg_deduce_bounds(reg);
+	__reg_deduce_bounds(env, reg);
+	log_reg_state(env, reg, "reg_bounds_sync __reg_deduce_bounds #1");
+	__reg_deduce_bounds(env, reg);
+	log_reg_state(env, reg, "reg_bounds_sync __reg_deduce_bounds #2");
 	/* We might have learned some bits from the bounds. */
 	__reg_bound_offset(reg);
+	log_reg_state(env, reg, "reg_bounds_sync __reg_bound_offset");
 	/* Intersecting with the old var_off might have improved our bounds
 	 * slightly, e.g. if umax was 0x7f...f and var_off was (0; 0xf...fc),
 	 * then new var_off is (0; 0x7f...fc) which improves our umax.
 	 */
 	__update_reg_bounds(reg);
+	log_reg_state(env, reg, "reg_bounds_sync __update_reg_bounds #2");
 }
 
 static int reg_bounds_sanity_check(struct bpf_verifier_env *env,
@@ -2823,7 +2854,7 @@ static int __mark_reg_s32_range(struct bpf_verifier_env *env,
 	reg->smin_value = max_t(s64, reg->smin_value, s32_min);
 	reg->smax_value = min_t(s64, reg->smax_value, s32_max);
 
-	reg_bounds_sync(reg);
+	reg_bounds_sync(env, reg);
 
 	return reg_bounds_sanity_check(env, reg, "s32_range");
 }
@@ -6878,7 +6909,7 @@ static void zext_32_to_64(struct bpf_reg_state *reg)
 /* truncate register to smaller size (in bytes)
  * must be called with size < BPF_REG_SIZE
  */
-static void coerce_reg_to_size(struct bpf_reg_state *reg, int size)
+static void coerce_reg_to_size(struct bpf_verifier_env *env, struct bpf_reg_state *reg, int size)
 {
 	u64 mask;
 
@@ -6904,7 +6935,7 @@ static void coerce_reg_to_size(struct bpf_reg_state *reg, int size)
 	if (size < 4)
 		__mark_reg32_unbounded(reg);
 
-	reg_bounds_sync(reg);
+	reg_bounds_sync(env, reg);
 }
 
 static void set_sext64_default_val(struct bpf_reg_state *reg, int size)
@@ -7793,7 +7824,7 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 	    regs[value_regno].type == SCALAR_VALUE) {
 		if (!is_ldsx)
 			/* b/h/w load zero-extends, mark upper bits as known 0 */
-			coerce_reg_to_size(&regs[value_regno], size);
+			coerce_reg_to_size(env, &regs[value_regno], size);
 		else
 			coerce_reg_to_size_sx(&regs[value_regno], size);
 	}
@@ -11087,7 +11118,7 @@ static int do_refine_retval_range(struct bpf_verifier_env *env,
 		ret_reg->s32_max_value = meta->msize_max_value;
 		ret_reg->smin_value = -MAX_ERRNO;
 		ret_reg->s32_min_value = -MAX_ERRNO;
-		reg_bounds_sync(ret_reg);
+		reg_bounds_sync(env, ret_reg);
 		break;
 	case BPF_FUNC_get_smp_processor_id:
 		ret_reg->umax_value = nr_cpu_ids - 1;
@@ -11098,7 +11129,7 @@ static int do_refine_retval_range(struct bpf_verifier_env *env,
 		ret_reg->u32_min_value = 0;
 		ret_reg->smin_value = 0;
 		ret_reg->s32_min_value = 0;
-		reg_bounds_sync(ret_reg);
+		reg_bounds_sync(env, ret_reg);
 		break;
 	}
 
@@ -14682,7 +14713,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 
 	if (!check_reg_sane_offset(env, dst_reg, ptr_reg->type))
 		return -EINVAL;
-	reg_bounds_sync(dst_reg);
+	reg_bounds_sync(env, dst_reg);
 	bounds_ret = sanitize_check_bounds(env, insn, dst_reg);
 	if (bounds_ret == -EACCES)
 		return bounds_ret;
@@ -15408,7 +15439,7 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 	/* ALU32 ops are zero extended into 64bit register */
 	if (alu32)
 		zext_32_to_64(dst_reg);
-	reg_bounds_sync(dst_reg);
+	reg_bounds_sync(env, dst_reg);
 	return 0;
 }
 
@@ -15723,7 +15754,7 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 							 insn->dst_reg);
 				}
 				zext_32_to_64(dst_reg);
-				reg_bounds_sync(dst_reg);
+				reg_bounds_sync(env, dst_reg);
 			}
 		} else {
 			/* case: R = imm
@@ -16336,13 +16367,13 @@ static int reg_set_min_max(struct bpf_verifier_env *env,
 
 	/* fallthrough (FALSE) branch */
 	regs_refine_cond_op(false_reg1, false_reg2, rev_opcode(opcode), is_jmp32);
-	reg_bounds_sync(false_reg1);
-	reg_bounds_sync(false_reg2);
+	reg_bounds_sync(env, false_reg1);
+	reg_bounds_sync(env, false_reg2);
 
 	/* jump (TRUE) branch */
 	regs_refine_cond_op(true_reg1, true_reg2, opcode, is_jmp32);
-	reg_bounds_sync(true_reg1);
-	reg_bounds_sync(true_reg2);
+	reg_bounds_sync(env, true_reg1);
+	reg_bounds_sync(env, true_reg2);
 
 	err = reg_bounds_sanity_check(env, true_reg1, "true_reg1");
 	err = err ?: reg_bounds_sanity_check(env, true_reg2, "true_reg2");

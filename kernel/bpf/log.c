@@ -678,7 +678,7 @@ static bool type_is_map_ptr(enum bpf_reg_type t) {
  */
 #define verbose_a(fmt, ...) ({ verbose(env, "%s" fmt, sep, ##__VA_ARGS__); sep = ","; })
 
-static void print_reg_state(struct bpf_verifier_env *env,
+void print_reg_state(struct bpf_verifier_env *env,
 			    const struct bpf_func_state *state,
 			    const struct bpf_reg_state *reg)
 {
@@ -697,7 +697,7 @@ static void print_reg_state(struct bpf_verifier_env *env,
 	if (t == PTR_TO_ARENA)
 		return;
 	if (t == PTR_TO_STACK) {
-		if (state->frameno != reg->frameno)
+		if (state && state->frameno != reg->frameno)
 			verbose(env, "[%d]", reg->frameno);
 		if (tnum_is_const(reg->var_off)) {
 			verbose_snum(env, reg->var_off.value + reg->off);
