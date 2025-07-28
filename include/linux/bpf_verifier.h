@@ -1066,4 +1066,7 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 void print_insn_state(struct bpf_verifier_env *env, const struct bpf_verifier_state *vstate,
 		      u32 frameno);
 
+struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
+int bpf_insn_successors(struct bpf_prog *prog, u32 idx, u32 succ[2]);
+
 #endif /* _LINUX_BPF_VERIFIER_H */
