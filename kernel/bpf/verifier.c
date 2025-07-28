@@ -17826,7 +17826,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 static int check_cfg(struct bpf_verifier_env *env)
 {
 	int insn_cnt = env->prog->len;
-	int *insn_stack, *insn_state, *insn_postorder;
+	int *insn_stack, *insn_state;
 	int ex_insn_beg, i, ret = 0;
 
 	insn_state = env->cfg.insn_state = kvcalloc(insn_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
@@ -17836,14 +17836,6 @@ static int check_cfg(struct bpf_verifier_env *env)
 	insn_stack = env->cfg.insn_stack = kvcalloc(insn_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
 	if (!insn_stack) {
 		kvfree(insn_state);
-		return -ENOMEM;
-	}
-
-	insn_postorder = env->cfg.insn_postorder =
-		kvcalloc(insn_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
-	if (!insn_postorder) {
-		kvfree(insn_state);
-		kvfree(insn_stack);
 		return -ENOMEM;
 	}
 
@@ -17864,7 +17856,6 @@ walk_cfg:
 		case DONE_EXPLORING:
 			insn_state[t] = EXPLORED;
 			env->cfg.cur_stack--;
-			insn_postorder[env->cfg.cur_postorder++] = t;
 			break;
 		case KEEP_EXPLORING:
 			break;
@@ -17916,6 +17907,86 @@ err_free:
 	kvfree(insn_stack);
 	env->cfg.insn_state = env->cfg.insn_stack = NULL;
 	return ret;
+}
+
+struct postorder_stack {
+	struct {
+		u32 insn_idx:31;
+		u32 visited:1;
+	} *elems;
+	u32 capacity;
+};
+
+static int __compute_postorder(struct bpf_verifier_env *env, u32 start, struct postorder_stack *stack)
+{
+	u32 stack_sz, s, succ_cnt, succ[2];
+	void *tmp;
+
+	stack_sz = 1;
+	env->cfg.insn_state[start] = 1;
+	stack->elems[0].insn_idx = start;
+	stack->elems[0].visited = 0;
+	while (stack_sz) {
+		typeof(stack->elems) top = &stack->elems[stack_sz - 1];
+		if (top->visited) {
+			env->cfg.insn_postorder[env->cfg.cur_postorder++] = top->insn_idx;
+			stack_sz--;
+			continue;
+		}
+		top->visited = 1;
+		succ_cnt = bpf_insn_successors(env->prog, top->insn_idx, succ);
+		if (stack_sz + succ_cnt >= stack->capacity) {
+			stack->capacity *= 2;
+			tmp = kvrealloc(stack->elems,
+					sizeof(*stack->elems) * stack->capacity,
+					GFP_KERNEL_ACCOUNT);
+			if (!tmp)
+				return -ENOMEM;
+			stack->elems = tmp;
+		}
+		for (s = 0; s < succ_cnt; ++s) {
+			if (env->cfg.insn_state[succ[s]])
+				continue;
+			env->cfg.insn_state[succ[s]] = 1;
+			stack->elems[stack_sz].insn_idx = succ[s];
+			stack->elems[stack_sz].visited = 0;
+			stack_sz++;
+		}
+	}
+	return 0;
+}
+
+// TODO: instead of this, convert check_cfg to a per subprogram traversal
+static int compute_postorder(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *subprog, *subprog_end;
+	struct postorder_stack stack;
+	int err = 0;
+
+	env->cfg.cur_postorder = 0;
+	stack.capacity = env->prog->len;
+	stack.elems = kvmalloc(stack.capacity * sizeof(*stack.elems), GFP_KERNEL_ACCOUNT);
+	env->cfg.insn_postorder = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	env->cfg.insn_state = kvcalloc(env->prog->len, sizeof(int), GFP_KERNEL_ACCOUNT);
+	if (!stack.elems || !env->cfg.insn_postorder || !env->cfg.insn_state) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	subprog = env->subprog_info;
+	subprog_end = subprog + env->subprog_cnt;
+	for (; subprog < subprog_end; subprog++) {
+		subprog->postorder_start = env->cfg.cur_postorder;
+		err = __compute_postorder(env, subprog->start, &stack);
+		if (err)
+			goto out;
+	}
+	subprog_end->postorder_start = env->cfg.cur_postorder;
+
+out:
+	kvfree(stack.elems);
+	kvfree(env->cfg.insn_state);
+	return err;
 }
 
 static int check_abnormal_return(struct bpf_verifier_env *env)
@@ -24694,6 +24765,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 
 	ret = check_cfg(env);
 	if (ret < 0)
+		goto skip_full_check;
+
+	ret = compute_postorder(env);
+	if (ret)
 		goto skip_full_check;
 
 	ret = check_attach_btf_id(env);
