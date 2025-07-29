@@ -1068,5 +1068,6 @@ void print_insn_state(struct bpf_verifier_env *env, const struct bpf_verifier_st
 
 struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *env, int off);
 int bpf_insn_successors(struct bpf_prog *prog, u32 idx, u32 succ[2]);
+void bpf_fmt_stack_mask(char *buf, ssize_t buf_sz, u64 stack_mask);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

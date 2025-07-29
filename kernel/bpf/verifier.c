@@ -4196,7 +4196,7 @@ static void fmt_reg_mask(char *buf, ssize_t buf_sz, u32 reg_mask)
 	}
 }
 /* format stack slots bitmask, e.g., "-8,-24,-40" for 0x15 mask */
-static void fmt_stack_mask(char *buf, ssize_t buf_sz, u64 stack_mask)
+void bpf_fmt_stack_mask(char *buf, ssize_t buf_sz, u64 stack_mask)
 {
 	DECLARE_BITMAP(mask, 64);
 	bool first = true;
@@ -4279,7 +4279,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 		fmt_reg_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_reg_mask(bt));
 		verbose(env, "mark_precise: frame%d: regs=%s ",
 			bt->frame, env->tmp_str_buf);
-		fmt_stack_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_stack_mask(bt));
+		bpf_fmt_stack_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_stack_mask(bt));
 		verbose(env, "stack=%s before ", env->tmp_str_buf);
 		verbose(env, "%d: ", idx);
 		verbose_insn(env, insn);
@@ -4919,7 +4919,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env,
 					     bt_frame_reg_mask(bt, fr));
 				verbose(env, "mark_precise: frame%d: parent state regs=%s ",
 					fr, env->tmp_str_buf);
-				fmt_stack_mask(env->tmp_str_buf, TMP_STR_BUF_LEN,
+				bpf_fmt_stack_mask(env->tmp_str_buf, TMP_STR_BUF_LEN,
 					       bt_frame_stack_mask(bt, fr));
 				verbose(env, "stack=%s: ", env->tmp_str_buf);
 				print_verifier_state(env, st, fr, true);
