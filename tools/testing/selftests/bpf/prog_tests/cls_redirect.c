@@ -469,9 +469,16 @@ cleanup:
 static void test_cls_redirect_subprogs(void)
 {
 	struct test_cls_redirect_subprogs *skel;
+	LIBBPF_OPTS(bpf_object_open_opts, opts);
 	int err;
 
-	skel = test_cls_redirect_subprogs__open();
+	if (env.verbosity >= VERBOSE_SUPER) {
+		opts.kernel_log_buf = log;
+		opts.kernel_log_size = sizeof(log);
+		opts.kernel_log_level = 1 | 2 | 3;
+	}
+
+	skel = test_cls_redirect_subprogs__open_opts(&opts);
 	if (CHECK(!skel, "skel_open", "failed\n"))
 		return;
 
@@ -479,6 +486,8 @@ static void test_cls_redirect_subprogs(void)
 	skel->rodata->ENCAPSULATION_PORT = htons(ENCAP_PORT);
 
 	err = test_cls_redirect_subprogs__load(skel);
+	if (env.verbosity >= VERBOSE_SUPER)
+		printf("Verifier log:\n%s\n", log);
 	if (CHECK(err, "skel_load", "failed: %d\n", err))
 		goto cleanup;
 
