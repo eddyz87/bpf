@@ -1081,11 +1081,11 @@ void bpf_stack_liveness_free(struct bpf_verifier_env *env);
 int bpf_update_live_stack(struct bpf_verifier_env *env);
 int bpf_mark_stack_read(struct bpf_verifier_env *env, u32 frameno, u32 insn_idx, u64 mask);
 int bpf_mark_stack_write(struct bpf_verifier_env *env, u32 frameno, u32 insn_idx, u64 mask);
-
 struct bpf_cc_liveness *bpf_lookup_cc_liveness(struct bpf_verifier_env *env,
 					       struct bpf_verifier_state *st,
 					       u32 frameno);
 bool bpf_stack_can_be_read(struct bpf_verifier_env *env,
 			   struct bpf_cc_liveness *ccl, u32 insn_idx, u32 spi);
+char *bpf_fmt_ccl(struct bpf_verifier_env *env, struct bpf_cc_liveness *cc);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

@@ -18568,8 +18568,22 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 	return check_ids(old_id, cur_id, idmap);
 }
 
+static char *fmt_checkpoint(struct bpf_verifier_env *env, struct bpf_verifier_state *vst)
+{
+	char *buf_end = env->tmp_str_buf + sizeof(env->tmp_str_buf);
+	char *buf = env->tmp_str_buf;
+	int i;
+
+	buf += snprintf(buf, buf_end - buf, "(");
+	for (i = 0; i <= vst->curframe; i++)
+		buf += snprintf(buf, buf_end - buf, "%s%d", i ? "," : "", frame_insn_idx(vst, i));
+	snprintf(buf, buf_end - buf, ")");
+	return env->tmp_str_buf;
+}
+
 static void clean_func_state(struct bpf_verifier_env *env,
 			     struct bpf_cc_liveness *ccl,
+			     struct bpf_verifier_state *vst,
 			     struct bpf_func_state *st,
 			     u32 ip)
 {
@@ -18593,6 +18607,20 @@ static void clean_func_state(struct bpf_verifier_env *env,
 			__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
 			for (j = 0; j < BPF_REG_SIZE; j++)
 				st->stack[i].slot_type[j] = STACK_INVALID;
+		} else if (!(st->stack[i].spilled_ptr.live & REG_LIVE_READ)) {
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				verbose(env, "ckpt %s ", fmt_checkpoint(env, vst));
+				verbose(env, "cc %s ", bpf_fmt_ccl(env, ccl));
+				verbose(env, "insn %d frame %d spi %d can skip read mark\n",
+					ip, st->frameno, (i + 1) * -8);
+			}
+			/*
+			 * if (ip == 71) {
+			 * 	__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
+			 * 	for (j = 0; j < BPF_REG_SIZE; j++)
+			 * 		st->stack[i].slot_type[j] = STACK_INVALID;
+			 * }
+			 */
 		}
 	}
 }
@@ -18607,7 +18635,7 @@ static void clean_verifier_state(struct bpf_verifier_env *env,
 	for (i = 0; i <= st->curframe; i++) {
 		ccl = bpf_lookup_cc_liveness(env, st, i);
 		ip = frame_insn_idx(st, i);
-		clean_func_state(env, ccl, st->frame[i], ip);
+		clean_func_state(env, ccl, st, st->frame[i], ip);
 	}
 }
 

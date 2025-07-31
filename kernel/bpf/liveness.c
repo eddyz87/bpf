@@ -181,6 +181,11 @@ static char *fmt_callchain(struct bpf_verifier_env *env, struct callchain *cc)
 	return env->tmp_str_buf;
 }
 
+char *bpf_fmt_ccl(struct bpf_verifier_env *env, struct bpf_cc_liveness *ccl)
+{
+	return fmt_callchain(env, &ccl->callchain);
+}
+
 static void log_stack_mask(struct bpf_verifier_env *env, struct callchain *cc, char *pfx,
 				 u32 frame, u32 insn_idx, u64 mask)
 {
