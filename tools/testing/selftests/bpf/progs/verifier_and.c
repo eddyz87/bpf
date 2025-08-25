@@ -110,4 +110,20 @@ l0_%=:	r0 = 0;						\
 	: __clobber_all);
 }
 
+SEC("socket")
+__success
+__naked void foo(void)
+{
+	asm volatile ("					\
+	r0 = 1;						\
+	r1 = 2;						\
+	if r0 == r1 goto l0_%=;				\
+	exit;						\
+l0_%=:	r10 = 0;					\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
