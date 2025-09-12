@@ -19478,6 +19478,9 @@ hit:
 			 */
 			err = propagate_liveness(env, &sl->state, cur, NULL);
 
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "checkpoint hit: %d\n", env->insn_idx);
+
 			/* if previous state reached the exit with precision and
 			 * current state is equivalent to it (except precision marks)
 			 * the precision needs to be propagated back in
@@ -19579,6 +19582,8 @@ hit:
 			return 1;
 		}
 miss:
+		if (env->log.level & BPF_LOG_LEVEL2)
+			verbose(env, "checkpoint miss: %d\n", env->insn_idx);
 		/* when new state is not going to be added do not increase miss count.
 		 * Otherwise several loop iterations will remove the state
 		 * recorded earlier. The goal of these heuristics is to have
