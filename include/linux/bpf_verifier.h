@@ -590,6 +590,7 @@ struct bpf_insn_aux_data {
 	unsigned int orig_idx; /* original instruction index */
 	bool jmp_point;
 	bool prune_point;
+	bool jmp_prune_point;
 	/* ensure we check state equivalence and save state checkpoint and
 	 * this instruction, regardless of any heuristics
 	 */
@@ -824,6 +825,10 @@ struct bpf_verifier_env {
 	u32 free_list_size;
 	u32 explored_states_size;
 	u32 num_backedges;
+	u32 ckpt_hit;
+	u32 ckpt_miss;
+	u32 ckpt_jmp_hit;
+	u32 ckpt_jmp_miss;
 	bpfptr_t fd_array;
 
 	/* bit mask to keep track of whether a register has been accessed

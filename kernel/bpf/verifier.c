@@ -17827,6 +17827,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 	default:
 		/* conditional jump with two edges */
 		mark_prune_point(env, t);
+		env->insn_aux_data[t].jmp_prune_point = true;
 		if (is_may_goto_insn(insn))
 			mark_force_checkpoint(env, t);
 
@@ -19466,6 +19467,9 @@ skip_inf_loop_check:
 		if (states_equal(env, &sl->state, cur, loop ? RANGE_WITHIN : NOT_EXACT)) {
 hit:
 			sl->hit_cnt++;
+			env->ckpt_hit++;
+			if (env->insn_aux_data[insn_idx].jmp_prune_point)
+				env->ckpt_jmp_hit++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
 			 * Registers read by the continuation are read by us.
@@ -19584,6 +19588,9 @@ hit:
 miss:
 		if (env->log.level & BPF_LOG_LEVEL2)
 			verbose(env, "checkpoint miss: %d\n", env->insn_idx);
+		env->ckpt_miss++;
+		if (env->insn_aux_data[insn_idx].jmp_prune_point)
+			env->ckpt_jmp_miss++;
 		/* when new state is not going to be added do not increase miss count.
 		 * Otherwise several loop iterations will remove the state
 		 * recorded earlier. The goal of these heuristics is to have
@@ -23393,10 +23400,12 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		verbose(env, "\n");
 	}
 	verbose(env, "processed %d insns (limit %d) max_states_per_insn %d "
-		"total_states %d peak_states %d mark_read %d\n",
+		"total_states %d peak_states %d mark_read %d ckpt_hit %d ckpt_miss %d ckpt_jmp_hit %d ckpt_jmp_miss %d\n",
 		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
 		env->max_states_per_insn, env->total_states,
-		env->peak_states, env->longest_mark_read_walk);
+		env->peak_states, env->longest_mark_read_walk,
+		env->ckpt_hit, env->ckpt_miss,
+		env->ckpt_jmp_hit, env->ckpt_jmp_miss);
 }
 
 int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,

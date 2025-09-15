@@ -51,6 +51,10 @@ enum stat_id {
 	PROG_TYPE,
 	ATTACH_TYPE,
 	MEMORY_PEAK,
+	CKPT_HIT,
+	CKPT_MISS,
+	CKPT_JMP_HIT,
+	CKPT_JMP_MISS,
 
 	FILE_NAME,
 	PROG_NAME,
@@ -789,13 +793,14 @@ cleanup:
 }
 
 static const struct stat_specs default_csv_output_spec = {
-	.spec_cnt = 15,
+	.spec_cnt = 19,
 	.ids = {
 		FILE_NAME, PROG_NAME, VERDICT, DURATION,
 		TOTAL_INSNS, TOTAL_STATES, PEAK_STATES,
 		MAX_STATES_PER_INSN, MARK_READ_MAX_LEN,
 		SIZE, JITED_SIZE, PROG_TYPE, ATTACH_TYPE,
 		STACK, MEMORY_PEAK,
+		CKPT_HIT, CKPT_MISS, CKPT_JMP_HIT, CKPT_JMP_MISS,
 	},
 };
 
@@ -837,6 +842,10 @@ static struct stat_def {
 	[PROG_TYPE] = { "Program type", {"prog_type"}, },
 	[ATTACH_TYPE] = { "Attach type", {"attach_type", }, },
 	[MEMORY_PEAK] = { "Peak memory (MiB)", {"mem_peak", }, },
+	[CKPT_HIT] = { "Ckpt hit", {"ckpt_hit", }, },
+	[CKPT_MISS] = { "Ckpt miss", {"ckpt_miss", }, },
+	[CKPT_JMP_HIT] = { "Ckpt jmp hit", {"ckpt_jmp_hit", }, },
+	[CKPT_JMP_MISS] = { "Ckpt jmp miss", {"ckpt_jmp_miss", }, },
 };
 
 static bool parse_stat_id_var(const char *name, size_t len, int *id,
@@ -1015,12 +1024,17 @@ static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *
 
 		if (1 == sscanf(cur, "verification time %ld usec\n", &s->stats[DURATION]))
 			continue;
-		if (5 == sscanf(cur, "processed %ld insns (limit %*d) max_states_per_insn %ld total_states %ld peak_states %ld mark_read %ld",
+		if (5 == sscanf(cur, "processed %ld insns (limit %*d) max_states_per_insn %ld total_states %ld peak_states %ld mark_read %ld ckpt_hit %ld ckpt_miss %ld ckpt_jmp_hit %ld ckpt_jmp_miss %ld",
 				&s->stats[TOTAL_INSNS],
 				&s->stats[MAX_STATES_PER_INSN],
 				&s->stats[TOTAL_STATES],
 				&s->stats[PEAK_STATES],
-				&s->stats[MARK_READ_MAX_LEN]))
+				&s->stats[MARK_READ_MAX_LEN],
+				&s->stats[CKPT_HIT],
+				&s->stats[CKPT_MISS],
+				&s->stats[CKPT_JMP_HIT],
+				&s->stats[CKPT_JMP_MISS]
+				))
 			continue;
 
 		if (1 == sscanf(cur, "stack depth %511s", stack))
@@ -2299,6 +2313,10 @@ static int cmp_stat(const struct verif_stats *s1, const struct verif_stats *s2,
 	case PEAK_STATES:
 	case MAX_STATES_PER_INSN:
 	case MEMORY_PEAK:
+	case CKPT_HIT:
+	case CKPT_MISS:
+	case CKPT_JMP_HIT:
+	case CKPT_JMP_MISS:
 	case MARK_READ_MAX_LEN: {
 		long v1 = s1->stats[id];
 		long v2 = s2->stats[id];
@@ -2528,6 +2546,10 @@ static void prepare_value(const struct verif_stats *s, enum stat_id id,
 	case STACK:
 	case SIZE:
 	case JITED_SIZE:
+	case CKPT_HIT:
+	case CKPT_MISS:
+	case CKPT_JMP_HIT:
+	case CKPT_JMP_MISS:
 	case MEMORY_PEAK:
 		*val = s ? s->stats[id] : 0;
 		break;
@@ -2615,6 +2637,10 @@ static int parse_stat_value(const char *str, enum stat_id id, struct verif_stats
 	case MARK_READ_MAX_LEN:
 	case SIZE:
 	case JITED_SIZE:
+	case CKPT_HIT:
+	case CKPT_MISS:
+	case CKPT_JMP_HIT:
+	case CKPT_JMP_MISS:
 	case MEMORY_PEAK:
 	case STACK: {
 		long val;
