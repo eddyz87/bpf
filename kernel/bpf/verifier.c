@@ -25651,6 +25651,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	if (ret < 0)
 		goto skip_full_check;
 
+	ret = bpf_compute_idoms(env);
+	if (ret < 0)
+		goto skip_full_check;
+
 	ret = bpf_stack_liveness_init(env);
 	if (ret)
 		goto skip_full_check;
@@ -25817,6 +25821,7 @@ err_free_env:
 	kvfree(env->scc_info);
 	kvfree(env->succ);
 	kvfree(env->gotox_tmp_buf);
+	kvfree(env->idoms);
 	kvfree(env);
 	return ret;
 }
