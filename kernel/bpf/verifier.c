@@ -25259,6 +25259,11 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 				verbose(env, "%3d ", env->insn_aux_data[i].scc);
 			else
 				verbose(env, "    ");
+			if (env->insn_aux_data[i].loop_header >= 0)
+				verbose(env, "%3d ", env->insn_aux_data[i].loop_header);
+			else
+				verbose(env, "    " );
+			verbose(env, "%3d ", env->idoms[i]);
 			verbose(env, "%3d: ", i);
 			for (j = BPF_REG_0; j < BPF_REG_10; ++j)
 				if (insn_aux[i].live_regs_before & BIT(j))

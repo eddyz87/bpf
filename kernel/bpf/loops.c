@@ -167,6 +167,21 @@ static void mark_irreducible(struct bpf_verifier_env *env, int h)
 	env->insn_aux_data[h].loop->irreducible = true;
 }
 
+static void add_backedge(struct bpf_verifier_env *env, int from, int h)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_loop *loop = aux[h].loop;
+	int cnt = loop->backedges_cnt;
+
+	if (cnt == MAX_BACKEDGES) {
+		loop->backedges_overflow = true;
+		return;
+	}
+	loop->backedges[cnt].from = from;
+	loop->backedges[cnt].latch = -1;
+	loop->backedges_cnt++;
+}
+
 static int mark_header(struct bpf_verifier_env *env, int h)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
@@ -239,6 +254,33 @@ static bool is_cond_jmp_insn(struct bpf_insn *insn)
 	}
 }
 
+int bpf_loop_at_index(struct bpf_verifier_env *env, u32 idx)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+
+	return aux[idx].loop ? idx : aux[idx].loop_header;
+}
+
+static int find_dominating_condition(struct bpf_verifier_env *env, int n, int top)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+	int *idoms = env->idoms;
+	int common_dom, nloop;
+
+	nloop = bpf_loop_at_index(env, n);
+	common_dom = idoms_intersect(env, n, top);
+	if (common_dom != top)
+		return -1;
+	while (n >= 0) {
+		if (is_cond_jmp_insn(&insns[n]) && bpf_loop_at_index(env, n) == nloop)
+			return n;
+		if (n == top)
+			break;
+		n = idoms[n];
+	}
+	return -1;
+}
+
 /*
  * As described in "A New Algorithm for Identifying Loops in Decompilation" by Wei et al,
  * adapted to be non-recursive.
@@ -295,6 +337,7 @@ static int compute_loops_in_subprog(struct bpf_verifier_env *env, struct loops_d
 			err = assign_header(env, dfs, cur, s);
 			if (err)
 				return err;
+			add_backedge(env, cur, s);
 		} else if (aux[s].loop_header == -1) {
 			/*
 			 * start -> ... -> ... -> s -> ... -> end
@@ -341,8 +384,10 @@ static int compute_loops_in_subprog(struct bpf_verifier_env *env, struct loops_d
 int bpf_compute_loops(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int i, err = 0, len = env->prog->len;
+	int i, j, err = 0, len = env->prog->len;
+	struct bpf_backedge *backedge;
 	struct loops_dfs dfs = {};
+	struct bpf_loop *loop;
 
 	dfs.dfs_pos = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
 	dfs.state = kvcalloc(len, sizeof(struct dfs_state), GFP_KERNEL_ACCOUNT);
@@ -357,6 +402,16 @@ int bpf_compute_loops(struct bpf_verifier_env *env)
 		err = compute_loops_in_subprog(env, &dfs, i);
 		if (err)
 			goto out;
+	}
+	/* find latches */
+	for (i = 0; i < len; i++) {
+		loop = aux[i].loop;
+		if (!loop)
+			continue;
+		for (j = 0; j < loop->backedges_cnt; j++) {
+			backedge = &loop->backedges[j];
+			backedge->latch = find_dominating_condition(env, backedge->from, i);
+		}
 	}
 
 out:

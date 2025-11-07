@@ -519,8 +519,18 @@ struct bpf_iarray {
 	u32 items[];
 };
 
+#define MAX_BACKEDGES 16
+
+struct bpf_backedge {
+	int from;
+	int latch; /* -1 if no latch can be found */
+};
+
 struct bpf_loop {
+	struct bpf_backedge backedges[MAX_BACKEDGES];
+	int backedges_cnt;
 	bool irreducible;
+	bool backedges_overflow;
 };
 
 struct bpf_insn_aux_data {
@@ -597,7 +607,7 @@ struct bpf_insn_aux_data {
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
 	u64 live_spills_before;
-	u32 loop_header;
+	int loop_header;
 	struct bpf_loop *loop;
 };
 
@@ -1114,5 +1124,6 @@ void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env);
 
 int bpf_compute_idoms(struct bpf_verifier_env *env);
 int bpf_compute_loops(struct bpf_verifier_env *env);
+int bpf_loop_at_index(struct bpf_verifier_env *env, u32 idx);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
