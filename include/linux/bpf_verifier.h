@@ -1108,4 +1108,10 @@ void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env);
 int bpf_compute_idoms(struct bpf_verifier_env *env);
 int bpf_compute_loops(struct bpf_verifier_env *env);
 
+struct bpf_worklist;
+struct bpf_worklist *bpf_worklist_new(void);
+void bpf_worklist_free(struct bpf_worklist *wl);
+struct bpf_verifier_state *bpf_worklist_pop(struct bpf_worklist *wl);
+int bpf_worklist_push(struct bpf_verifier_env *env, struct bpf_worklist *wl, struct bpf_verifier_state *state);
+
 #endif /* _LINUX_BPF_VERIFIER_H */
