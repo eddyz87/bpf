@@ -20116,11 +20116,16 @@ static void log_program(struct bpf_verifier_env *env)
 	u32 insn_cnt = env->prog->len;
 	u32 i, j;
 
-	verbose(env, "Program dump (scc? idom insn#: live_regs_before):\n");
+	verbose(env, "Program dump (scc? loop_header? idom insn#: live_regs_before):\n");
 	for (i = 0; i < insn_cnt; ++i) {
 		verbose_linfo(env, i, "    ; ");
 		if (env->insn_aux_data[i].scc)
 			verbose(env, "%3d ", env->insn_aux_data[i].scc);
+		else
+			verbose(env, "    ");
+		verbose(env, "%3d ", env->idoms[i]);
+		if (env->insn_aux_data[i].loop_header >= 0)
+			verbose(env, "%3d ", env->insn_aux_data[i].loop_header);
 		else
 			verbose(env, "    ");
 		verbose(env, "%3d ", env->idoms[i]);
@@ -20304,6 +20309,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		goto skip_full_check;
 
 	ret = bpf_compute_idoms(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = bpf_compute_loops(env);
 	if (ret < 0)
 		goto skip_full_check;
 
