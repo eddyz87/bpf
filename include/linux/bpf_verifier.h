@@ -793,6 +793,8 @@ struct bpf_verifier_env {
 		 * see bpf_subprog_info->postorder_start.
 		 */
 		int *insn_postorder;
+		int *postorder_nums;
+		int *preorder_nums;
 		int cur_stack;
 		/* current position in the insn_postorder vector */
 		int cur_postorder;
