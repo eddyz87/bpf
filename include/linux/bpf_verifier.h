@@ -847,6 +847,7 @@ struct bpf_verifier_env {
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
+	int *idoms;
 	struct {
 		s8 spi;
 		s8 reg;
@@ -1104,5 +1105,7 @@ int bpf_commit_stack_write_marks(struct bpf_verifier_env *env);
 int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
 bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 spi);
 void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env);
+
+int bpf_compute_idoms(struct bpf_verifier_env *env);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
