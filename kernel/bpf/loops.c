@@ -170,11 +170,32 @@ static void mark_irreducible(struct bpf_verifier_env *env, int h)
 	env->insn_aux_data[h].loop->irreducible = true;
 }
 
+static void mark_entry(struct bpf_verifier_env *env, int s)
+{
+	env->insn_aux_data[s].loop_entry = true;
+}
+
+static void add_backedge(struct bpf_verifier_env *env, int from, int h)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_loop *loop = aux[h].loop;
+	int cnt = loop->backedges_cnt;
+
+	if (cnt == MAX_BACKEDGES) {
+		loop->backedges_overflow = true;
+		return;
+	}
+	loop->backedges[cnt].from = from;
+	loop->backedges[cnt].latch = -1;
+	loop->backedges_cnt++;
+}
+
 static int mark_as_header(struct bpf_verifier_env *env, int h)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 
 	if (!aux[h].loop) {
+		mark_entry(env, h);
 		aux[h].loop = kvzalloc_obj(struct bpf_loop, GFP_KERNEL_ACCOUNT);
 		if (!aux[h].loop)
 			return -ENOMEM;
@@ -211,6 +232,65 @@ static int assign_header(struct bpf_verifier_env *env, struct loops_dfs *dfs, in
 	}
 	aux[n].loop_header = h;
 	return 0;
+}
+
+static bool is_cond_jmp_insn(struct bpf_insn *insn)
+{
+	u8 class = BPF_CLASS(insn->code);
+	u8 opcode = BPF_OP(insn->code);
+
+	if (class != BPF_JMP && class != BPF_JMP32)
+		return false;
+
+	switch (opcode) {
+	case BPF_JEQ:
+	case BPF_JGE:
+	case BPF_JGT:
+	case BPF_JLE:
+	case BPF_JLT:
+	case BPF_JNE:
+	case BPF_JSET:
+	case BPF_JSGE:
+	case BPF_JSGT:
+	case BPF_JSLE:
+	case BPF_JSLT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+int bpf_loop_at_index(struct bpf_verifier_env *env, u32 idx)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+
+	return aux[idx].loop ? idx : aux[idx].loop_header;
+}
+
+static int find_dominating_condition(struct bpf_verifier_env *env, int n, int top)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+	int common_dom, n_loop, t_loop, f_loop;
+	int *idoms = env->idoms;
+
+	n_loop = bpf_loop_at_index(env, n);
+	common_dom = idoms_intersect(env, n, top);
+	if (common_dom != top)
+		return -1;
+	while (n >= 0) {
+		if (is_cond_jmp_insn(&insns[n]) && bpf_loop_at_index(env, n) == n_loop) {
+			t_loop = bpf_loop_at_index(env, n + insns[n].off + 1);
+			f_loop = bpf_loop_at_index(env, n + 1);
+			if (f_loop != n_loop && !bpf_is_nested_loop(env, f_loop, n_loop))
+				return n;
+			if (t_loop != n_loop && !bpf_is_nested_loop(env, t_loop, n_loop))
+				return n;
+		}
+		if (n == top)
+			break;
+		n = idoms[n];
+	}
+	return -1;
 }
 
 /*
@@ -274,6 +354,7 @@ static int compute_loops_in_subprog(struct bpf_verifier_env *env, struct loops_d
 			err = assign_header(env, dfs, cur, s);
 			if (err)
 				return err;
+			add_backedge(env, cur, s);
 		} else if (aux[s].loop_header == -1) {
 			/*
 			 * start -> ... -> ... -> s -> ... -> end
@@ -296,10 +377,14 @@ static int compute_loops_in_subprog(struct bpf_verifier_env *env, struct loops_d
 			if (err)
 				return err;
 		} else {
-			/* case E */
+			/*
+			 * case E: 's' is explored, not in current DFS path,
+			 * its innermost loop header is not in current DFS path,
+			 * hence 's' is another entry into the same loop.
+			 */
 			h = aux[s].loop_header;
 			mark_irreducible(env, h);
-			/* can also mark 's' as reentry, but no need for now */
+			mark_entry(env, s);
 			while (aux[h].loop_header != -1) {
 				h = aux[h].loop_header;
 				if (dfs_pos[h]) {
@@ -317,12 +402,26 @@ static int compute_loops_in_subprog(struct bpf_verifier_env *env, struct loops_d
 	return 0;
 }
 
-int bpf_compute_loops(struct bpf_verifier_env *env)
+bool bpf_is_nested_loop(struct bpf_verifier_env *env, int inner_header, int outer_header)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int idx;
+
+	for (idx = inner_header; idx >= 0; idx = aux[idx].loop_header)
+		if (aux[idx].loop_header == outer_header)
+			return true;
+
+	return false;
+}
+
+int bpf_compute_loops(struct bpf_verifier_env *env)
+{
+	int i, j, s, t, iloop, sloop, err = 0, len = env->prog->len;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_verifier_log *log = &env->log;
-	int i, err = 0, len = env->prog->len;
+	struct bpf_backedge *backedge;
 	struct loops_dfs dfs = {};
+	struct bpf_iarray *succ;
 	struct bpf_loop *loop;
 
 	dfs.dfs_pos = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
@@ -339,6 +438,47 @@ int bpf_compute_loops(struct bpf_verifier_env *env)
 		if (err)
 			goto out;
 	}
+	/* find latches */
+	for (i = 0; i < len; i++) {
+		loop = aux[i].loop;
+		if (!loop)
+			continue;
+		for (j = 0; j < loop->backedges_cnt; j++) {
+			backedge = &loop->backedges[j];
+			backedge->latch = find_dominating_condition(env, backedge->from, i);
+		}
+	}
+	/* find exits */
+	for (i = 0; i < len; i++) {
+		iloop = aux[i].loop ? i : aux[i].loop_header;
+		if (iloop < 0)
+			continue;
+		succ = bpf_insn_successors(env, i);
+		iarray_for_each(s, succ) {
+			sloop = aux[s].loop ? s : aux[s].loop_header;
+			if (iloop == sloop)
+				continue;
+			if (bpf_is_nested_loop(env, sloop, iloop))
+				continue;
+			/*
+			 * 'sloop' is either -1 or an outer loop at this point,
+			 * iterate 'iloop' outer loops up to 'sloop' and add i->s
+			 * edge as an exit.
+			 */
+			for (t = iloop; t >= 0 && t != sloop; t = aux[t].loop_header) {
+				loop = aux[t].loop;
+				if (loop->exits_cnt == MAX_EXITS) {
+					loop->exits_overflow = true;
+					continue;
+				}
+				loop->exits[loop->exits_cnt].from = i;
+				loop->exits[loop->exits_cnt].to = s;
+				loop->exits_cnt++;
+			}
+		}
+		if (bpf_is_ldimm64(env->prog->insnsi + i))
+			i++;
+	}
 
 	if (env->log.level & BPF_LOG_LEVEL2) {
 		for (i = 0; i < len; i++) {
@@ -351,6 +491,12 @@ int bpf_compute_loops(struct bpf_verifier_env *env)
 			if (loop->irreducible)
 				bpf_log(log, ", irreducible");
 			bpf_log(log, "\n");
+			for (j = 0; j < loop->backedges_cnt; j++)
+				bpf_log(log, "  backedge from %d, latch at %d\n",
+					loop->backedges[j].from, loop->backedges[j].latch);
+			for (j = 0; j < loop->exits_cnt; j++)
+				bpf_log(log, "  exit from %d to %d\n",
+					loop->exits[j].from, loop->exits[j].to);
 		}
 	}
 
