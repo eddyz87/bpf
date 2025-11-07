@@ -518,8 +518,18 @@ struct bpf_iarray {
 	u32 items[];
 };
 
+#define MAX_BACKEDGES 16
+
+struct bpf_backedge {
+	int from;
+	int latch; /* -1 if no latch can be found */
+};
+
 struct bpf_loop {
+	struct bpf_backedge backedges[MAX_BACKEDGES];
+	int backedges_cnt;
 	bool irreducible;
+	bool backedges_overflow;
 };
 
 struct bpf_insn_aux_data {
