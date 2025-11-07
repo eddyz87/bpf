@@ -519,6 +519,10 @@ struct bpf_iarray {
 	u32 items[];
 };
 
+struct bpf_loop {
+	bool irreducible;
+};
+
 struct bpf_insn_aux_data {
 	union {
 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
@@ -593,6 +597,8 @@ struct bpf_insn_aux_data {
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
 	u64 live_spills_before;
+	u32 loop_header;
+	struct bpf_loop *loop;
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
@@ -1107,5 +1113,6 @@ bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 spi);
 void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env);
 
 int bpf_compute_idoms(struct bpf_verifier_env *env);
+int bpf_compute_loops(struct bpf_verifier_env *env);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

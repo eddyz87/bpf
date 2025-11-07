@@ -21776,6 +21776,11 @@ static void clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len
 			aux_data[i].jt = NULL;
 		}
 
+		if (aux_data[i].loop) {
+			kvfree(aux_data[i].loop);
+			aux_data[i].loop = NULL;
+		}
+
 		if (bpf_is_ldimm64(&insns[i]))
 			i++;
 	}
@@ -25581,6 +25586,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 		goto skip_full_check;
 
 	ret = bpf_compute_idoms(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = bpf_compute_loops(env);
 	if (ret < 0)
 		goto skip_full_check;
 
