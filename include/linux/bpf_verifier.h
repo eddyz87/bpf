@@ -425,6 +425,7 @@ struct bpf_verifier_state {
 	/* first and last insn idx of this verifier state */
 	u32 first_insn_idx;
 	u32 last_insn_idx;
+	bool empty;
 	/* if this state is a backedge state then equal_state
 	 * records cached state to which this state is equal.
 	 */

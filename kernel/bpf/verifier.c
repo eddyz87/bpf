@@ -1763,6 +1763,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->parent = src->parent;
 	dst_state->first_insn_idx = src->first_insn_idx;
 	dst_state->last_insn_idx = src->last_insn_idx;
+	dst_state->empty = src->empty;
 	dst_state->dfs_depth = src->dfs_depth;
 	dst_state->callback_unroll_depth = src->callback_unroll_depth;
 	dst_state->may_goto_depth = src->may_goto_depth;
@@ -20580,6 +20581,280 @@ process_bpf_exit:
 	return 0;
 }
 
+static int transfer_insn(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct bpf_insn *insn;
+	u8 class;
+	int err;
+
+	insn = &env->prog->insnsi[cur->insn_idx];
+	class = BPF_CLASS(insn->code);
+	switch (class) {
+	case BPF_ALU:
+	case BPF_ALU64:
+		err = check_alu_op(env, insn);
+		if (err)
+			return err;
+		break;
+	case BPF_LDX:
+		break;
+	case BPF_STX:
+		break;
+	case BPF_ST:
+		break;
+	case BPF_LD:
+		break;
+	case BPF_JMP:
+	case BPF_JMP32:
+		break;
+	}
+	return 0;
+}
+
+static struct bpf_verifier_state *get_repr_state(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+{
+	struct bpf_verifier_state_list *sl;
+	struct list_head *pos, *tmp, *head;
+
+	head = explored_state(env, st->insn_idx);
+	list_for_each_safe(pos, tmp, head) {
+		sl = container_of(pos, struct bpf_verifier_state_list, node);
+		if (st->insn_idx == sl->state.insn_idx && same_callsites(st, &sl->state))
+			return &sl->state;
+	}
+	sl = kzalloc(sizeof(struct bpf_verifier_state_list), GFP_KERNEL_ACCOUNT);
+	if (!sl)
+		return NULL;
+	sl->state.empty = true;
+	list_add(&sl->node, head);
+	env->total_states++;
+	env->explored_states_size++;
+	update_peak_states(env);
+	return 0;
+}
+
+static bool join_scalars(struct bpf_reg_state *acc, struct bpf_reg_state *st, bool widen)
+{
+	if (range_within(acc, st) && tnum_in(acc->var_off, st->var_off))
+		return false;
+#define _JOIN(field, op, wide_value) \
+		if (acc->field op st->field) acc->field = widen ? wide_value : st->field;
+	_JOIN(umin_value, >, 0);
+	_JOIN(umax_value, <, U64_MAX);
+	_JOIN(smin_value, >, S64_MIN);
+	_JOIN(smax_value, <, S64_MAX);
+	_JOIN(u32_min_value, >, 0);
+	_JOIN(u32_max_value, <, U32_MAX);
+	_JOIN(s32_min_value, >, S32_MIN);
+	_JOIN(s32_max_value, <, S32_MAX);
+#undef _JOIN
+	acc->var_off = tnum_union(acc->var_off, st->var_off);
+	reg_bounds_sync(acc);
+	return true;
+}
+
+static enum bpf_reg_type peek_wider_type(enum bpf_reg_type a, enum bpf_reg_type b)
+{
+	bool a_stack = a == PTR_TO_STACK || a == ANYTHING;
+	bool b_stack = b == PTR_TO_STACK || b == ANYTHING;
+
+	if (a == b)
+		return a;
+	if (!a_stack && !b_stack)
+		return ANYTHING_BUT_STACK;
+	return ANYTHING;
+}
+
+static bool join_reg_state(struct bpf_reg_state *acc, struct bpf_reg_state *st, bool widen)
+{
+	enum bpf_reg_type new_type;
+	bool changed;
+
+	changed = false;
+	new_type = peek_wider_type(acc->type, st->type);
+	if (acc->type == ANYTHING)
+		return false;
+
+	if (acc->type == ANYTHING_BUT_STACK && new_type == ANYTHING_BUT_STACK)
+		return false;
+
+	if (acc->type != new_type) {
+		acc->type = new_type;
+		return true;
+	}
+
+	// TODO: what about id/off?
+	switch (acc->type) {
+	case SCALAR_VALUE:
+		return join_scalars(acc, st, widen);
+	case PTR_TO_STACK:
+		// TODO: use frameno as a mask
+		if (acc->frameno != st->frameno) {
+			acc->type = ANYTHING;
+			return true;
+		}
+		return join_scalars(acc, st, widen);
+	default:
+		acc->type = ANYTHING;
+		return true;
+	};
+}
+
+static int get_spill_size(struct bpf_stack_state *st)
+{
+	int i, spill_size;
+
+	spill_size = 0;
+	for (i = BPF_REG_SIZE - 1; i > 0 && st->slot_type[i - 1] == STACK_SPILL; i--)
+		spill_size++;
+	return spill_size;
+}
+
+static bool join_stack_state(struct bpf_stack_state *acc,
+			     struct bpf_stack_state *st,
+			     bool widen)
+{
+	int acc_spill, st_spill, i;
+	bool changed;
+
+	changed = false;
+	acc_spill = get_spill_size(acc);
+	st_spill = get_spill_size(st);
+	if (acc_spill == st_spill) {
+		changed |= join_reg_state(&acc->spilled_ptr, &st->spilled_ptr, widen);
+	} else {
+		for (i = 0; i < BPF_REG_SIZE; i++) {
+			if (acc->slot_type[i] != STACK_SPILL)
+				continue;
+			acc->slot_type[i] = STACK_MISC;
+			changed = true;
+		}
+	}
+	for (i = 0; i < BPF_REG_SIZE; i++) {
+		if (acc->slot_type == st->slot_type)
+			continue;
+		acc->slot_type[i] = STACK_MISC;
+		changed = true;
+	}
+	return changed;
+}
+
+static int join_func_states(struct bpf_verifier_env *env,
+			    struct bpf_func_state *acc,
+			    struct bpf_func_state *st,
+			    bool widen)
+{
+	bool changed, acc_changed;
+	int i, err;
+
+	acc_changed = false;
+	for (i = 0; i < BPF_REG_FP; i++) {
+		changed = join_reg_state(&acc->regs[i], &st->regs[i], widen);
+		acc_changed |= changed;
+		if (changed)
+			mark_reg_scratched(env, i);
+	}
+	err = grow_stack_state(env, acc, st->allocated_stack);
+	if (err)
+		return err;
+	for (i = 0; i < st->allocated_stack / BPF_REG_SIZE; i++) {
+		changed = join_stack_state(&acc->stack[i], &st->stack[i], widen);
+		acc_changed |= changed;
+		if (changed)
+			mark_stack_slot_scratched(env, i);
+	}
+	return acc_changed;
+}
+
+static int join_states(struct bpf_verifier_env *env,
+		       struct bpf_verifier_state *acc,
+		       struct bpf_verifier_state *st)
+{
+	bool changed, widen;
+	int err, frame;
+
+	if (acc->empty) {
+		acc->empty = false;
+		err = copy_verifier_state(acc, st);
+		if (err)
+			return err;
+		return true;
+	}
+
+	// TODO: callback entries for bpf_loop and alike need widening too.
+	widen = env->insn_aux_data[acc->insn_idx].loop;
+	changed = false;
+	for (frame = 0; frame <= st->curframe; frame++)
+		changed |= join_func_states(env, acc->frame[frame], st->frame[frame], widen);
+	return changed;
+}
+
+static int acc_state(struct bpf_verifier_env *env,
+		     struct bpf_worklist *worklist,
+		     struct bpf_verifier_state *st)
+{
+	struct bpf_verifier_state *repr;
+	int res;
+
+	repr = get_repr_state(env, st);
+	if (!repr)
+		return -ENOMEM;
+	mark_verifier_state_clean(env);
+	res = join_states(env, repr, st);
+	if (res <= 0) /* error or no state change */
+		return res;
+	if (env->log.level & BPF_LOG_LEVEL2)
+		print_insn_state(env, repr, repr->curframe);
+	return bpf_worklist_push(env, worklist, repr); /* state change */
+}
+
+static int do_check_with_widening(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *next, *initial, *cur = env->cur_state;
+	struct bpf_worklist *worklist;
+	int err;
+
+	worklist = bpf_worklist_new();
+	if (!worklist)
+		return -ENOMEM;
+
+	initial = get_repr_state(env, cur);
+	if (!initial)
+		return -ENOMEM;
+
+	err = copy_verifier_state(initial, cur);
+	if (err)
+		goto out;
+
+	err = bpf_worklist_push(env, worklist, initial);
+	if (err)
+		goto out;
+
+	while ((next = bpf_worklist_pop(worklist))) {
+		err = copy_verifier_state(cur, next);
+		if (err)
+			goto out;
+		err = transfer_insn(env);
+		if (err)
+			goto out;
+		while (env->head) {
+			err = acc_state(env, worklist, &env->head->st);
+			if (err)
+				goto out;
+			pop_stack(env, NULL, NULL, false);
+		}
+		err = acc_state(env, worklist, cur);
+		if (err)
+			goto out;
+	}
+
+	err = 0;
+out:
+	bpf_worklist_free(worklist);
+	return err;
+}
+
 static int find_btf_percpu_datasec(struct btf *btf)
 {
 	const struct btf_type *t;
@@ -23684,9 +23959,8 @@ static void free_states(struct bpf_verifier_env *env)
 	}
 }
 
-static int do_check_common(struct bpf_verifier_env *env, int subprog)
+static int prepare_initial_state(struct bpf_verifier_env *env, int subprog)
 {
-	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
 	struct bpf_subprog_info *sub = subprog_info(env, subprog);
 	struct bpf_prog_aux *aux = env->prog->aux;
 	struct bpf_verifier_state *state;
@@ -23694,7 +23968,6 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 	int ret, i;
 
 	env->prev_linfo = NULL;
-	env->pass_cnt++;
 
 	state = kzalloc(sizeof(struct bpf_verifier_state), GFP_KERNEL_ACCOUNT);
 	if (!state)
@@ -23725,7 +23998,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 		verbose(env, "Validating %s() func#%d...\n", sub_name, subprog);
 		ret = btf_prepare_func_args(env, subprog);
 		if (ret)
-			goto out;
+			return ret;
 
 		if (subprog_is_exc_cb(env, subprog)) {
 			state->frame[0]->in_exception_callback_fn = true;
@@ -23735,8 +24008,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 			 */
 			if (sub->arg_cnt != 1 || sub->args[0].arg_type != ARG_ANYTHING) {
 				verbose(env, "exception cb only supports single integer argument\n");
-				ret = -EINVAL;
-				goto out;
+				return -EINVAL;
 			}
 		}
 		for (i = BPF_REG_1; i <= sub->arg_cnt; i++) {
@@ -23778,8 +24050,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 			} else {
 				verifier_bug(env, "unhandled arg#%d type %d",
 					     i - BPF_REG_1, arg->arg_type);
-				ret = -EFAULT;
-				goto out;
+				return -EFAULT;
 			}
 		}
 	} else {
@@ -23804,6 +24075,31 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 			aux->ctx_arg_info[i].ref_obj_id = aux->ctx_arg_info[i].refcounted ?
 							  acquire_reference(env, 0) : 0;
 	}
+	return 0;
+}
+
+static int do_check_common(struct bpf_verifier_env *env, int subprog)
+{
+	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
+	int ret;
+
+	env->prev_linfo = NULL;
+	env->pass_cnt++;
+
+	ret = prepare_initial_state(env, subprog);
+	if (ret)
+		goto out;
+
+	ret = do_check_with_widening(env);
+	if (ret)
+		goto out;
+
+	free_states(env); // Forget anything about states with widening for now.
+	env->prev_linfo = NULL;
+
+	ret = prepare_initial_state(env, subprog);
+	if (ret)
+		goto out;
 
 	ret = do_check(env);
 out:
