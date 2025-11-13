@@ -20040,6 +20040,14 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (env->log.level & BPF_LOG_LEVEL2)
 		log_program(env);
 
+	ret = bpf_init_scev(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = bpf_compute_scev(env);
+	if (ret < 0)
+		goto skip_full_check;
+
 	ret = mark_fastcall_patterns(env);
 	if (ret < 0)
 		goto skip_full_check;
@@ -20175,6 +20183,7 @@ err_unlock:
 	bpf_clear_insn_aux_data(env, 0, env->prog->len);
 	vfree(env->insn_aux_data);
 err_free_env:
+	bpf_free_scev(env);
 	bpf_stack_liveness_free(env);
 	kvfree(env->cfg.postorder_nums);
 	kvfree(env->cfg.preorder_nums);
