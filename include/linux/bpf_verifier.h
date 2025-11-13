@@ -818,6 +818,7 @@ struct bpf_verifier_env {
 		 * vector of instruction indexes sorted in post-order, grouped by subprogram,
 		 * see bpf_subprog_info->postorder_start.
 		 */
+		int *insn_preorder;
 		int *insn_postorder;
 		int *postorder_nums;
 		int *preorder_nums;
