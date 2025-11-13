@@ -1,0 +1,1392 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright (c) 2025 Meta Platforms, Inc. and affiliates. */
+
+#include <linux/bpf_verifier.h>
+#include <linux/jhash.h>
+#include <linux/bug.h>
+
+#define REGS_NUM (MAX_BPF_REG + 64)
+#define UNKNOWN_EXPR_ID 0
+#define OPAQUE_EXPR_ID  1
+
+/*
+ * BPF instructions use 'code', 'src_reg', 'off' and 'imm' fields for instruction encoding.
+ * For scalar evolution purpose we want to reuse most of the opcode definitions,
+ * but also add a few custom operations (REG and IMM).
+ * Use the enum below to uniformly represent all opertions relevalnt for SCEV.
+ */
+enum expr_op {
+	/* leave range 0..255 for standard bpf opcodes */
+	UNKNOWN = 256, /* start custom opcodes from the second byte */
+	REG,
+	IMM,
+	SDIV, SMOD,
+	SEXT8, SEXT16, SEXT32,
+	ZEXT8, ZEXT16, ZEXT32,
+	BSWAP16, BSWAP32, BSWAP64,
+	/* during the loop body execution the value can be either of param[0] or param[1] */
+	ANY,
+	/* some value that verifier is not going to track precisely */
+	OPAQUE,
+	/* '*(u8/16/32 *)(r10 + X) = Y' writes define slot contents only partially */
+	SPILL8, SPILL16, SPILL32,
+	/*
+	 * SCEV expression corresponding to linear equation 'param[0] + param[1] * k',
+	 * where k is a loop iteration number. Loop here refers to innermost loop
+	 * containing instruction associated with this expression, as returned by
+	 * bpf_loop_at_index().
+	 */
+	LINEAR_SCEV,
+};
+
+struct expr {
+	u32 op;
+	union {
+		u32 params[2]; // TODO: make these s32, needed for linear_scev coef param
+		s64 imm;
+	};
+};
+
+struct expr_bucket {
+	u32 cnt;
+	u32 cap;
+	u32 ids[];
+};
+
+struct env {
+	bool empty;
+	u32 reg2expr[REGS_NUM];
+	u32 reg2scev[REGS_NUM]; // TODO: tracking up to 2 registers here should be sufficient
+};
+
+#define NUM_BUCKETS 256
+// TODO: 8 might be too high of a number, I might want to limit tree
+// size to e.g. 32 nodes, instead of limiting it's depth.
+#define EXPR_STACK_DEPTH 8
+
+struct expr_stack_elt {
+	u32 id:28;
+	u32 pre:1;
+	u32 next_param:2;
+	u32 rewritten_params[2];
+};
+
+struct scev {
+	/*
+	 * Expressions are identified by id, exprs_ht ensures that
+         * each expression exists as a unique instance.
+	 * This allows for fast equivalence check: id1 === id2.
+	 */
+	struct expr_bucket *exprs_ht[NUM_BUCKETS]; // Don't want to add struct hlist_node to expr
+	struct bpf_min_heap worklist;
+	struct env **envs;
+	struct expr *exprs;
+	bool *discovered;
+	int exprs_cnt;
+	int exprs_cap;
+	int envs_cnt;
+	int stack_sz;
+	struct expr_stack_elt expr_stack[EXPR_STACK_DEPTH];
+	u32 ids_buf[EXPR_STACK_DEPTH];
+};
+
+static u32 expr_hash(struct expr *e)
+{
+	return jhash_3words(e->op, e->params[0], e->params[1], 0);
+}
+
+static int expr_eq(struct expr *a, struct expr *b)
+{
+	return a->op == b->op && a->imm == b->imm;
+}
+
+static int add_expr(struct scev *scev, struct expr e)
+{
+	struct expr_bucket *bucket;
+	u32 i, id, hash, new_cap;
+	void *tmp;
+
+	hash = expr_hash(&e) % NUM_BUCKETS;
+	bucket = scev->exprs_ht[hash];
+
+	if (bucket) {
+		for (i = 0; i < bucket->cnt; i++) {
+			id = bucket->ids[i];
+			if (expr_eq(&e, &scev->exprs[id]))
+				return id;
+		}
+	}
+
+	if (!bucket || bucket->cap == bucket->cnt) {
+		new_cap = bucket ? bucket->cap * 2 : 32; // TODO: small step? kvrealloc?
+		bucket = krealloc(bucket, sizeof(*bucket) + sizeof(u32) * new_cap, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		if (!bucket)
+			return -ENOMEM;
+		scev->exprs_ht[hash] = bucket;
+		bucket->cap = new_cap;
+	}
+
+	if (scev->exprs_cnt == scev->exprs_cap) {
+		new_cap = scev->exprs_cap + 256;
+		tmp = kvrealloc(scev->exprs, sizeof(struct expr) * new_cap, GFP_KERNEL_ACCOUNT);
+		if (!tmp)
+			return -ENOMEM;
+		scev->exprs = tmp;
+		scev->exprs_cap = new_cap;
+	}
+
+	id = scev->exprs_cnt++;
+	scev->exprs[id] = e;
+	bucket->ids[bucket->cnt++] = id;
+	return id;
+}
+
+static int expr2(struct scev *scev, u32 op, int a, int b)
+{
+	if (a < 0)
+		return a;
+	if (b < 0)
+		return b;
+	return add_expr(scev, (struct expr){ .op = op, .params = {a, b} });
+}
+
+static int expr1(struct scev *scev, u32 op, int a)
+{
+	if (a < 0)
+		return a;
+	return expr2(scev, op, a, 0);
+}
+
+static int expr0(struct scev *scev, u32 op)
+{
+	return expr2(scev, op, 0, 0);
+}
+
+static bool is_expr1(struct expr *expr, u32 op, int a)
+{
+	return expr->op == op && expr->params[0] == a;
+}
+
+static int imm_expr(struct scev *scev, s64 value)
+{
+	return add_expr(scev, (struct expr){ .op = IMM, .imm = value });
+}
+
+static bool same_exprs(struct scev *scev, int id_a, int id_b)
+{
+	return id_a == id_b;
+}
+
+static bool is_imm(struct scev *scev, int id, s64 *imm)
+{
+	if (scev->exprs[id].op != IMM)
+		return false;
+	*imm = scev->exprs[id].imm;
+	return true;
+}
+
+static bool is_op(struct scev *scev, int id, u32 op)
+{
+	if (scev->exprs[id].op != op)
+		return false;
+	return true;
+}
+
+static bool is_unop(struct scev *scev, enum expr_op op, int id, u32 *p0)
+{
+	if (scev->exprs[id].op != op)
+		return false;
+	*p0 = scev->exprs[id].params[0];
+	return true;
+}
+
+static bool is_binop(struct scev *scev, enum expr_op op, int id, u32 *p0, u32 *p1)
+{
+	if (scev->exprs[id].op != op)
+		return false;
+	*p0 = scev->exprs[id].params[0];
+	*p1 = scev->exprs[id].params[1];
+	return true;
+}
+
+static bool is_reg(struct scev *scev, int id, u32 *reg)
+{
+	return is_unop(scev, REG, id, reg);
+}
+
+static bool is_add(struct scev *scev, int id, u32 *left, u32 *right)
+{
+	return is_binop(scev, BPF_ADD, id, left, right);
+}
+
+static bool is_zext32(struct scev *scev, int id, u32 *left)
+{
+	return is_unop(scev, ZEXT32, id, left);
+}
+
+static bool is_any(struct scev *scev, int id, u32 *left, u32 *right) {
+	return is_binop(scev, ANY, id, left, right);
+}
+
+static bool is_linear(struct scev *scev, int id, u32 *base, u32 *slope)
+{
+	return is_binop(scev, LINEAR_SCEV, id, base, slope);
+}
+
+static bool is_opaque(struct scev *scev, int id)
+{
+	return is_op(scev, id, OPAQUE);
+}
+
+static void log_reg(struct bpf_verifier_env *env, u32 reg)
+{
+	if (reg < MAX_BPF_REG)
+		bpf_log(&env->log, "r%d", reg);
+	else
+		bpf_log(&env->log, "*fp%d", (MAX_BPF_REG - reg - 1) * 8);
+}
+
+static const char *op_str(u32 op)
+{
+	switch (op) {
+	case BPF_ADD:  return "+";
+	case BPF_SUB:  return "-";
+	case BPF_MUL:  return "*";
+	case BPF_DIV:  return "/";
+	case SDIV:     return "s/";
+	case BPF_OR:   return "|";
+	case BPF_AND:  return "&";
+	case BPF_LSH:  return "<<";
+	case BPF_RSH:  return ">>";
+	case BPF_NEG:  return "-";
+	case BPF_MOD:  return "%";
+	case SMOD:     return "s%";
+	case BPF_XOR:  return "^";
+	case BPF_ARSH: return "s>>";
+	case SEXT8:    return "sext8";
+	case SEXT16:   return "sext16";
+	case SEXT32:   return "sext32";
+	case ZEXT8:    return "zext8";
+	case ZEXT16:   return "zext16";
+	case ZEXT32:   return "zext32";
+	case BSWAP16:  return "bswap16";
+	case BSWAP32:  return "bswap32";
+	case BSWAP64:  return "bswap64";
+	case SPILL8:   return "spill8";
+	case SPILL16:  return "spill16";
+	case SPILL32:  return "spill32";
+	case ANY:      return "any";
+	case LINEAR_SCEV:  return "linear";
+	}
+	return NULL;
+}
+
+static u32 op_params_num(u32 op)
+{
+	switch (op) {
+	case BPF_ADD:
+	case BPF_SUB:
+	case BPF_MUL:
+	case BPF_DIV:
+	case BPF_MOD:
+	case BPF_OR:
+	case BPF_XOR:
+	case BPF_AND:
+	case BPF_LSH:
+	case BPF_RSH:
+	case BPF_ARSH:
+	case SDIV:
+	case SMOD:
+	case ANY:
+	case LINEAR_SCEV:
+		return 2;
+	case BPF_NEG:
+	case SEXT8:
+	case SEXT16:
+	case SEXT32:
+	case ZEXT8:
+	case ZEXT16:
+	case ZEXT32:
+	case BSWAP16:
+	case BSWAP32:
+	case BSWAP64:
+	case SPILL8:
+	case SPILL16:
+	case SPILL32:
+		return 1;
+	case REG:
+	case IMM:
+	case OPAQUE:
+		return 0;
+	default:
+		return 0;
+	}
+}
+
+static bool expr_stack_push(struct scev *scev, u32 id)
+{
+	if (scev->stack_sz >= EXPR_STACK_DEPTH)
+		return false;
+	scev->expr_stack[scev->stack_sz].id = id;
+	scev->expr_stack[scev->stack_sz].pre = true;
+	scev->expr_stack[scev->stack_sz].next_param = 0;
+	scev->stack_sz++;
+	return true;
+}
+
+enum {
+	PRE = BIT(1), POST = BIT(2), DEPTH_LIMIT = BIT(3)
+};
+
+static bool expr_next(struct scev *scev, u32 *id, u32 *order)
+{
+	struct expr_stack_elt *elt;
+	struct expr *expr;
+	u32 num_params;
+
+	if (scev->stack_sz == 0)
+		return false;
+
+	elt = &scev->expr_stack[scev->stack_sz - 1];
+	*id = elt->id;
+	*order = 0;
+	expr = &scev->exprs[elt->id];
+	num_params = op_params_num(expr->op);
+	if (elt->pre) {
+		elt->pre = false;
+		*order = PRE;
+		return true;
+	}
+	if (elt->next_param == num_params) {
+		*order = POST;
+		scev->stack_sz--;
+		return true;
+	}
+	if (scev->stack_sz == EXPR_STACK_DEPTH) {
+		*order = POST | DEPTH_LIMIT;
+		scev->stack_sz--;
+		return true;
+	}
+	expr_stack_push(scev, expr->params[elt->next_param]);
+ 	elt->next_param++;
+	return expr_next(scev, id, order);
+}
+
+static void log_expr(struct bpf_verifier_env *env, u32 id)
+{
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	struct expr *expr;
+	const char *str;
+	u32 order;
+
+	scev->stack_sz = 0;
+	expr_stack_push(scev, id);
+	while (expr_next(scev, &id, &order)) {
+		if ((order & PRE) && scev->stack_sz > 1)
+			bpf_log(log, " ");
+		expr = &scev->exprs[id];
+		switch(expr->op) {
+		case UNKNOWN:
+			if (order & PRE)
+				bpf_log(log, "?");
+			break;
+		case OPAQUE:
+			if (order & PRE)
+				bpf_log(log, "_");
+			break;
+		case REG:
+			if (order & PRE)
+				log_reg(env, expr->params[0]);
+			break;
+		case IMM:
+			if (order & PRE)
+				bpf_log(log, "%lld", expr->imm);
+			break;
+		default:
+			if (order & PRE) {
+				str = op_str(expr->op);
+				bpf_log(log, "(");
+				if (str)
+					bpf_log(log, "%s", str);
+				else
+					bpf_log(log, "bad-expr-op %x", expr->op);
+			}
+			if (order & DEPTH_LIMIT)
+				bpf_log(log, "...");
+			if (order & POST)
+				bpf_log(log, ")");
+		}
+	}
+}
+
+enum print_env_flags {
+	PRINT_SCEV = BIT(1)
+};
+
+static bool reg_alive_at(struct bpf_verifier_env *env, u32 reg, u32 insn_idx)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	u64 live_stack = aux[insn_idx].live_stack_before;
+	u16 live_regs = aux[insn_idx].live_regs_before;
+	int spi;
+
+	spi = reg - MAX_BPF_REG;
+	return reg < MAX_BPF_REG
+	       ? (BIT(reg) & live_regs)
+	       : (BIT(spi) & live_stack);
+}
+
+static void print_env(struct bpf_verifier_env *env, struct env *e, u32 insn_idx, u32 flags)
+{
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	bool printed_some = false;
+	bool print_scev = flags & PRINT_SCEV;
+	bool is_self_scev;
+	bool is_self_reg;
+	int i, r;
+
+	if (e->empty) {
+		bpf_log(log, "  <empty>\n");
+		return;
+	}
+
+	for (i = 0; i < REGS_NUM; i++) {
+		if (!reg_alive_at(env, i, insn_idx))
+			continue;
+		is_self_reg = is_reg(scev, e->reg2expr[i], &r) && i == r;
+		is_self_scev = is_reg(scev, e->reg2scev[i], &r) && i == r;
+		if (is_self_reg && (!print_scev || is_self_scev))
+			continue;
+		printed_some = true;
+		bpf_log(log, "  ");
+		log_reg(env, i);
+		bpf_log(log, "=");
+		log_expr(env, e->reg2expr[i]);
+		if (print_scev && e->reg2expr[i] != UNKNOWN_EXPR_ID) {
+			bpf_log(log, " / ");
+			log_expr(env, e->reg2scev[i]);
+		}
+		bpf_log(log, "\n");
+	}
+	if (!printed_some)
+		bpf_log(log, "  <all regs unchanged>\n");
+}
+static struct env *get_loop_env(struct scev *scev, int insn_idx)
+{
+	struct env *e;
+
+	if (scev->envs[insn_idx])
+		return scev->envs[insn_idx];
+
+	e = kzalloc(sizeof(struct env), GFP_KERNEL_ACCOUNT);
+	if (!e)
+		return NULL;
+
+	e->empty = true;
+	scev->envs[insn_idx] = e;
+	return e;
+}
+
+/*
+ * TODO: in theory, only need to track live registers and stack slots here.
+ *       For live stack slots, can use liveness DFA operating on an approximation,
+ *	 taking into account only is_spill_ldx/is_spill_st{,x} instructions.
+ *       Should be enough, given that main pass will check assumptions.
+ */
+static void setup_initial_loop_env(struct bpf_verifier_env *env, struct env *e, int insn_idx)
+{
+	struct scev *scev = env->scev;
+	int i;
+
+	for (i = 0; i < MAX_BPF_REG; i++)
+		e->reg2expr[i] = expr1(scev, REG, i);
+	for (i = 0; i < 64; i++)
+		e->reg2expr[MAX_BPF_REG + i] = expr1(scev, REG, MAX_BPF_REG + i);
+}
+
+static int replace_reg(struct scev *scev, struct env *e, u32 reg, int id)
+{
+	if (id < 0)
+		return id;
+	e->reg2expr[reg] = id;
+	return 0;
+}
+
+static void forget_call_regs(struct env *e)
+{
+	int i;
+
+	for (i = BPF_REG_0; i <= BPF_REG_5; i++)
+		e->reg2expr[i] = UNKNOWN_EXPR_ID;
+}
+
+static u32 spill_spi(struct bpf_insn *insn)
+{
+	return -insn->off / BPF_REG_SIZE - 1;
+}
+
+static u32 off_to_reg(struct bpf_insn *insn)
+{
+	return spill_spi(insn) + MAX_BPF_REG;
+}
+
+static bool is_spill_off(int off)
+{
+	return off % BPF_REG_SIZE == 0 &&
+	       off <= -BPF_REG_SIZE &&
+	       off >= -MAX_BPF_STACK;
+}
+
+static void mark_opaque(struct env *e, int off, int size)
+{
+	int b, spi;
+
+	for (b = off; b < off + size; b++) {
+		if (b >= 0 || b < -MAX_BPF_STACK)
+			continue;
+		spi = (-b - 1) / BPF_REG_SIZE;
+		e->reg2expr[MAX_BPF_REG + spi] = OPAQUE_EXPR_ID;
+	}
+}
+
+static int mk_spill(struct scev *scev, u8 size, int id)
+{
+	switch (size) {
+	case BPF_B:  return expr1(scev, SPILL8,  id);
+	case BPF_H:  return expr1(scev, SPILL16, id);
+	case BPF_W:  return expr1(scev, SPILL32, id);
+	case BPF_DW: return id;
+	}
+	return UNKNOWN_EXPR_ID;
+}
+
+static int mk_fill(struct scev *scev, int id, u8 code)
+{
+	bool sx = BPF_MODE(code) == BPF_MEMSX;
+
+	switch (BPF_SIZE(code)) {
+	case BPF_B:  return expr1(scev, sx ? SEXT8  : ZEXT8,  id);
+	case BPF_H:  return expr1(scev, sx ? SEXT16 : ZEXT16, id);
+	case BPF_W:  return expr1(scev, sx ? SEXT32 : ZEXT32, id);
+	case BPF_DW: return sx ? UNKNOWN_EXPR_ID : id; /* DW sign-extended load is invalid */
+	}
+	return UNKNOWN_EXPR_ID;
+}
+
+static int maybe_store_fp(struct scev *scev, struct env *e, struct bpf_insn *insn, int id)
+{
+	u8 size = BPF_SIZE(insn->code);
+
+	if (insn->dst_reg != BPF_REG_FP)
+		return 0;
+	if (is_spill_off(insn->off))
+		return replace_reg(scev, e, off_to_reg(insn), mk_spill(scev, size, id));
+	mark_opaque(e, insn->off, bpf_size_to_bytes(size));
+	return 0;
+}
+
+static int maybe_load_fp(struct scev *scev, struct env *e, struct bpf_insn *insn)
+{
+	int id;
+
+	if (insn->src_reg == BPF_REG_FP && is_spill_off(insn->off))
+		id = mk_fill(scev, e->reg2expr[off_to_reg(insn)], insn->code);
+	else
+		id = OPAQUE_EXPR_ID;
+	return replace_reg(scev, e, insn->dst_reg, id);
+}
+
+static int transfer(struct bpf_verifier_env *env, struct env *e, int idx)
+{
+	const bool little_endian = htons(0x3412) == 0x1234;
+	struct bpf_insn *insn = &env->prog->insnsi[idx];
+	struct scev *scev = env->scev;
+	u32 *reg2expr = e->reg2expr;
+	u8 class = BPF_CLASS(insn->code);
+	u8 opcode = BPF_OP(insn->code);
+	u8 mode = BPF_SRC(insn->code);
+	u32 dst = insn->dst_reg;
+	u32 src = insn->src_reg;
+	u32 op, sext;
+	int i, id;
+	s64 imm;
+
+	switch (class) {
+	case BPF_ALU:
+	case BPF_ALU64:
+		switch (opcode) {
+		case BPF_MOV:
+			switch (insn->off) {
+			case 0: sext = 0; break;
+			case 8: sext = SEXT8; break;
+			case 16: sext = SEXT16; break;
+			case 32: sext = SEXT32; break;
+			default:
+				goto mark_dst_unknown; // TODO: this should nuke state instead.
+			}
+
+			if (mode == BPF_X && insn->imm == 0)
+				id = reg2expr[src];
+			else if (mode == BPF_K && src == 0 && insn->off == 0)
+				id = imm_expr(scev, insn->imm);
+			else
+				goto mark_dst_unknown;
+
+			if (sext)
+				id = expr1(scev, sext, id);
+			if (class == BPF_ALU)
+				id = expr1(scev, ZEXT32, id);
+
+			return replace_reg(scev, e, dst, id);
+
+		case BPF_ADD:
+		case BPF_SUB:
+		case BPF_MUL:
+		case BPF_DIV:
+		case BPF_MOD:
+		case BPF_OR:
+		case BPF_XOR:
+		case BPF_AND:
+		case BPF_LSH:
+		case BPF_RSH:
+		case BPF_ARSH:
+			if (opcode == BPF_DIV && insn->off == 1)
+				op = SDIV;
+			else if (opcode == BPF_MOD && insn->off == 1)
+				op = SMOD;
+			else if (insn->off == 0)
+				op = opcode;
+			else
+				goto mark_dst_unknown;
+
+			if (mode == BPF_X && insn->imm == 0)
+				id = reg2expr[src];
+			else if (mode == BPF_K && src == 0)
+				id = imm_expr(scev, insn->imm);
+			else
+				goto mark_dst_unknown;
+
+			id = expr2(scev, op, reg2expr[dst], id);
+
+			if (class == BPF_ALU)
+				id = expr1(scev, ZEXT32, id);
+
+			return replace_reg(scev, e, dst, id);
+
+		case BPF_NEG:
+			if (src == 0 && insn->off == 0 && insn->imm == 0)
+				id = expr1(scev, BPF_NEG, reg2expr[dst]);
+			else
+				goto mark_dst_unknown;
+
+			if (class == BPF_ALU)
+				id = expr1(scev, ZEXT32, id);
+
+			return replace_reg(scev, e, dst, id);
+
+		case BPF_END:
+			switch (insn->imm) {
+			case 16: op = BSWAP16; break;
+			case 32: op = BSWAP32; break;
+			case 64: op = BSWAP64; break;
+			default:
+				goto mark_dst_unknown;
+			}
+
+			if (class == BPF_ALU && mode == BPF_TO_LE && insn->off == 0 && little_endian)
+				op = 0; /* little-endian to little-endian is noop */
+			else if (class == BPF_ALU && mode == BPF_TO_BE && insn->off == 0 && !little_endian)
+				op = 0; /* big-endian to big-endian is noop */
+			else if (class == BPF_ALU64 && mode == 0 && insn->off == 0)
+				/* always swap */;
+			else
+				goto mark_dst_unknown;
+
+			id = reg2expr[dst];
+			if (op)
+				id = expr1(scev, op, reg2expr[dst]);
+
+			if (class == BPF_ALU)
+				id = expr1(scev, ZEXT32, id);
+
+			return replace_reg(scev, e, dst, id);
+		default:
+			goto mark_dst_unknown;
+		}
+		break;
+	case BPF_LDX:
+		switch (BPF_MODE(insn->code)) {
+		case BPF_MEM:
+		case BPF_MEMSX:
+			return maybe_load_fp(scev, e, insn);
+		default:
+			goto mark_dst_unknown;
+		}
+	case BPF_STX:
+		switch (BPF_MODE(insn->code)) {
+		case BPF_MEM:
+			return maybe_store_fp(scev, e, insn, reg2expr[src]);
+		case BPF_ATOMIC:
+			if (insn->imm == BPF_LOAD_ACQ)
+				return maybe_load_fp(scev, e, insn);
+			if (insn->imm == BPF_STORE_REL) {
+				return maybe_store_fp(scev, e, insn, reg2expr[src]);
+			}
+			/*
+			 * verifier does not track other atomic ops precisely,
+			 * hence mark the results as opaque.
+			 */
+			if (insn->dst_reg == BPF_REG_FP)
+				mark_opaque(e, insn->off, bpf_size_to_bytes(BPF_SIZE(insn->code)));
+			if (insn->imm == BPF_CMPXCHG)
+				return replace_reg(scev, e, BPF_REG_0, OPAQUE_EXPR_ID);
+			if (insn->imm & BPF_FETCH)
+				return replace_reg(scev, e, src, OPAQUE_EXPR_ID);
+			break;
+		}
+		break;
+	case BPF_ST:
+		if (insn->dst_reg == BPF_REG_FP) {
+			id = imm_expr(scev, insn->imm);
+			if (id < 0)
+				return id;
+			return maybe_store_fp(scev, e, insn, id);
+		}
+		break;
+	case BPF_JMP:
+	case BPF_JMP32:
+		if (opcode == BPF_CALL)
+			forget_call_regs(e);
+		/* for non-CALL there are no changes in register states */
+		break;
+	case BPF_LD:
+		switch (mode) {
+		case BPF_IMM:
+			if (BPF_SIZE(insn->code) == BPF_DW) {
+				imm = ((u64)(insn + 1)->imm << 32) | (u32)insn->imm;
+				return replace_reg(scev, e, dst, imm_expr(scev, imm));
+			}
+			goto mark_dst_unknown;
+		case BPF_LD | BPF_ABS:
+		case BPF_LD | BPF_IND:
+			forget_call_regs(e); // TODO: double check
+			break;
+		default:
+			goto mark_dst_unknown;
+		}
+		break;
+	default:
+		// unknown instruction, nuke state
+		for (i = 0; i < REGS_NUM; i++)
+			reg2expr[i] = UNKNOWN_EXPR_ID;
+		break;
+	}
+	return 0;
+
+mark_dst_unknown:
+	reg2expr[dst] = UNKNOWN_EXPR_ID;
+	return 0;
+}
+
+// TODO: maybe just assume that ANY is always:
+// - (ANY non-ANY non-ANY)
+// - (ANY non-ANY, (ANY ...))
+/*
+ * Construct minimal 'ANY' expression by traversing 'a' and 'b'
+ * and accumulating non-duplicated non-ANY entries.
+ */
+static int mk_any(struct scev *scev, u32 a, u32 b)
+{
+	struct expr_stack_elt *elt;
+	struct expr *expr;
+	u32 i, j, ids_buf_sz;
+	u32 roots[2] = {a, b};
+	int id;
+
+	ids_buf_sz = 0;
+	for (i = 0; i < ARRAY_SIZE(roots); i++) {
+		scev->stack_sz = 0;
+		expr_stack_push(scev, roots[i]);
+		while (scev->stack_sz) {
+			elt = &scev->expr_stack[--scev->stack_sz];
+			id = elt->id;
+			expr = &scev->exprs[elt->id];
+			if (expr->op == ANY) {
+				if (!expr_stack_push(scev, expr->params[0]) ||
+				    !expr_stack_push(scev, expr->params[1]))
+					return UNKNOWN_EXPR_ID;
+			} else {
+				for (j = 0; j < ids_buf_sz; j++) {
+					if (same_exprs(scev, scev->ids_buf[j], id))
+						goto next;
+				}
+				if (ids_buf_sz == ARRAY_SIZE(scev->ids_buf))
+					return UNKNOWN_EXPR_ID;
+				scev->ids_buf[ids_buf_sz++] = id;
+			}
+next:;
+		}
+	}
+	if (WARN_ON(ids_buf_sz == 0))
+		return -EFAULT;
+	id = scev->ids_buf[0];
+	for (i = 1; i < ids_buf_sz; i++) {
+		id = expr2(scev, ANY, id, scev->ids_buf[i]);
+		if (id < 0)
+			return id;
+	}
+	return id;
+}
+
+static int join(struct scev *scev, struct env *acc, struct env *cur)
+{
+	int i, id;
+
+	if (acc->empty) {
+		memcpy(acc, cur, sizeof(*acc));
+		acc->empty = false;
+		return 0;
+	}
+
+	for (i = 0; i < REGS_NUM; i++) {
+		if (!same_exprs(scev, acc->reg2expr[i], cur->reg2expr[i])) {
+			id = mk_any(scev, acc->reg2expr[i], cur->reg2expr[i]);
+			if (id < 0)
+				return id;
+			acc->reg2expr[i] = id;
+		}
+	}
+	return 0;
+}
+
+/* Mark any register modified in 'header_env' as unknown in 'acc'. */
+static void forget_non_invariants(struct scev *scev, struct env *acc, struct env *header_env)
+{
+	struct expr *header_expr;
+	int i;
+
+	if (acc->empty)
+		acc->empty = false;
+
+	for (i = 0; i < REGS_NUM; i++) {
+		header_expr = &scev->exprs[header_env->reg2expr[i]];
+		if (is_expr1(header_expr, REG, i))
+			continue;
+		acc->reg2expr[i] = UNKNOWN_EXPR_ID;
+	}
+}
+
+static int worklist_push(struct scev *scev, int idx)
+{
+	int err;
+
+	if (scev->discovered[idx])
+		return 0;
+
+	err = bpf_min_heap_push(&scev->worklist, idx);
+	if (err)
+		return err;
+
+	scev->discovered[idx] = true;
+	return 0;
+}
+
+static bool reg_alive_at_succ(struct bpf_verifier_env *env, u32 r, u32 insn_idx)
+{
+	struct bpf_iarray *succ = bpf_insn_successors(env, insn_idx);
+	u32 i;
+
+	for (i = 0; i < succ->cnt; i++)
+		if (reg_alive_at(env, r, succ->items[i]))
+			return true;
+	return false;
+}
+
+enum changes_at {
+	LOG_AT_TRANSFER,
+	LOG_AT_JOIN,
+};
+
+static void log_env_changes(struct bpf_verifier_env *env, enum changes_at at,
+			    struct env *old, struct env *new, int insn_idx)
+{
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	u64 null_pos = log->end_pos;
+	bool any_changes = false;
+	u32 old_id, new_id;
+	u64 len;
+	int r;
+
+	bpf_log(log, "%s %4d: ", at == LOG_AT_TRANSFER ? "t" : "j", insn_idx);
+	bpf_verbose_insn(env, &env->prog->insnsi[insn_idx]);
+	if (log->end_pos)
+		log->end_pos--;
+	len = log->end_pos - null_pos;
+	bpf_log(log, "%*s", max(37 - (int)len, 1), " ");
+	bpf_log(log, " ; ");
+	for (r = 0; r < REGS_NUM; r++) {
+		old_id = old->reg2expr[r];
+		new_id = new->reg2expr[r];
+		if (at == LOG_AT_TRANSFER && !reg_alive_at_succ(env, r, insn_idx))
+			continue;
+		if (at == LOG_AT_JOIN && !reg_alive_at(env, r, insn_idx))
+			continue;
+		if (same_exprs(scev, old_id, new_id))
+			continue;
+		if (any_changes)
+			bpf_log(log, ", ");
+		log_reg(env, r);
+		bpf_log(log, " ");
+		log_expr(env, old_id);
+		bpf_log(log, " -> ");
+		log_expr(env, new_id);
+		any_changes = true;
+	}
+	bpf_log(log, "\n");
+	if (!any_changes)
+		bpf_vlog_reset(log, null_pos);
+}
+
+static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
+{
+	struct env *succ_env, *header_env, *to_env, *nested_header_env;
+	struct bpf_min_heap *worklist = &env->scev->worklist;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct scev *scev = env->scev;
+	struct bpf_loop_exit *exit;
+	struct bpf_loop *nested_loop;
+	struct env *cur_env = NULL;
+	struct env *old_env = NULL;
+	struct bpf_iarray *succ;
+	bool log_level2 = env->log.level & BPF_LOG_LEVEL2;
+	int s, e, err, idx, succ_idx;
+	bool first;
+
+	if (log_level2)
+		bpf_log(&env->log, "Computing SCEV for loop at %d:\n", cur_header);
+	cur_env = kzalloc(sizeof(*cur_env), GFP_KERNEL_ACCOUNT);
+	if (!cur_env)
+		goto nomem;
+	if (log_level2) {
+		old_env = kzalloc(sizeof(*old_env), GFP_KERNEL_ACCOUNT);
+		if (!old_env)
+			goto nomem;
+	}
+	header_env = get_loop_env(scev, cur_header);
+	if (!header_env)
+		goto nomem;
+	setup_initial_loop_env(env, header_env, cur_header);
+	err = worklist_push(scev, cur_header);
+	if (err)
+		goto out;
+
+	first = true;
+	for (;;) {
+		if (!bpf_min_heap_pop(worklist, &idx))
+			break;
+
+		/* Iterate instructions within a single basic block starting at 'idx' mutating 'cur_env'. */
+		memcpy(cur_env, scev->envs[idx], sizeof(*cur_env));
+		for (;;) {
+			if (log_level2)
+				memcpy(old_env, cur_env, sizeof(*old_env));
+			err = transfer(env, cur_env, idx);
+			if (err)
+				goto out;
+			if (log_level2)
+				log_env_changes(env, LOG_AT_TRANSFER, old_env, cur_env, idx);
+			succ = bpf_insn_successors(env, idx);
+			if (succ->cnt != 1)
+				break;
+			succ_idx = succ->items[0];
+			if (aux[idx].bb_end || aux[succ_idx].need_scev)
+				break;
+			idx = succ_idx;
+		}
+
+		succ = bpf_insn_successors(env, idx);
+		for (s = 0; s < succ->cnt; s++) {
+			succ_idx = succ->items[s];
+			succ_env = get_loop_env(scev, succ_idx);
+			if (!succ_env)
+				goto nomem;
+			/*
+			 * For successors belonging to the same loop,
+			 * do join(state at succ_idx, state at idx)
+			 * and schedule furhter traversal.
+			 */
+			if (bpf_loop_at_index(env, succ_idx) == cur_header) {
+				if (log_level2)
+					memcpy(old_env, succ_env, sizeof(*old_env));
+				err = join(scev, succ_env, cur_env);
+				if (err)
+					goto out;
+				err = worklist_push(scev, succ_idx);
+				if (err)
+					goto out;
+				if (log_level2)
+					log_env_changes(env, LOG_AT_JOIN, old_env, succ_env, succ_idx);
+				continue;
+			}
+			/*
+			 * For edges to a nested loop:
+			 * - assume whole nested loop to be a set of edges 'idx -> exit',
+			 *   where 'exit' is a nested loop exit to_'cur_loop';
+			 * - join state at 'exit' with state at 'idx';
+			 * - at 'exit' forget anything non-invariant in the nested loop;
+			 * - schedule traversal from 'exit'.
+			 */
+			// TODO: this check won't work for irreducible loops, instead:
+			//       - check for bpf_is_nested_loop(aux[succ_idx].loop_header, cur_loop)
+			//       - get topmost nested loop header for aux[succ_idx].loop_header
+			//       - proceed with it as 'nested_loop'.
+			if (aux[succ_idx].loop_header == cur_header) {
+				nested_loop = aux[succ_idx].loop;
+				nested_header_env = get_loop_env(scev, succ_idx);
+				if (!nested_header_env)
+					goto nomem;
+				for (e = 0; e < nested_loop->exits_cnt; e++) {
+					exit = &nested_loop->exits[e];
+					// TODO: double-check, inner loop can't exit to our header, right?
+					if (aux[exit->to].loop_header != cur_header)
+						continue;
+					to_env = get_loop_env(scev, exit->to);
+					if (!to_env)
+						goto nomem;
+					if (log_level2)
+						memcpy(old_env, to_env, sizeof(*old_env));
+					err = join(scev, to_env, cur_env);
+					if (err)
+						goto out;
+					forget_non_invariants(scev, to_env, nested_header_env);
+					err = worklist_push(scev, exit->to);
+					if (err)
+						goto out;
+					if (log_level2)
+						log_env_changes(env, LOG_AT_JOIN, old_env, to_env, exit->to);
+				}
+				continue;
+			}
+		}
+	}
+
+	err = 0;
+out:
+	kfree(cur_env);
+	kfree(old_env);
+	return err;
+nomem:
+	err = -ENOMEM;
+	goto out;
+}
+
+static void mark_latches(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_loop *loop;
+	int len = env->prog->len;
+	int i, j, latch;
+
+	for (i = 0; i < len; i++) {
+		loop = aux[i].loop;
+		if (!loop)
+			continue;
+		aux[i].need_scev = true;
+		for (j = 0; j < loop->backedges_cnt; j++) {
+			latch = loop->backedges[j].latch;
+			if (latch >= 0) {
+				aux[latch].need_scev = true;
+				aux[latch].is_latch = true;
+			}
+		}
+	}
+}
+
+static bool is_any_imm_reg(struct scev *scev, u32 id)
+{
+	u32 l, r, reg, order;
+	s64 imm;
+
+	scev->stack_sz = 0;
+	expr_stack_push(scev, id);
+	while (expr_next(scev, &id, &order)) {
+		if (order & DEPTH_LIMIT)
+			return false;
+		if (!(order & PRE) ||
+		    is_imm(scev, id, &imm) ||
+		    is_reg(scev, id, &reg) ||
+		    is_opaque(scev, id) ||
+		    is_any(scev, id, &l, &r))
+			continue;
+	}
+	return true;
+}
+
+/*
+ * Can implement explicit stack version, but it is harder to read.
+ * Stick with recursive version for now.
+ */
+static int transform_expr_once(struct scev *scev, u32 lvl, u32 root, void *priv,
+                               int (*fn)(struct scev *scev, u32 id, void *priv))
+{
+	struct expr expr;
+	int p0, p1, id;
+
+	if (lvl >= EXPR_STACK_DEPTH)
+		return UNKNOWN_EXPR_ID;
+
+        expr = scev->exprs[root]; /* snapshot the expr before potential realloc */
+	switch (op_params_num(expr.op)) {
+	case 0:
+		id = root;
+		break;
+	case 1:
+		p0 = transform_expr_once(scev, lvl + 1, expr.params[0], priv, fn);
+		id = expr1(scev, expr.op, p0);
+		break;
+	case 2:
+		p0 = transform_expr_once(scev, lvl + 1, expr.params[0], priv, fn);
+		p1 = transform_expr_once(scev, lvl + 1, expr.params[1], priv, fn);
+		id = expr2(scev, expr.op, p0, p1);
+		break;
+	}
+	return id < 0 ? id : fn(scev, id, priv);
+}
+
+static int transform_expr(struct scev *scev, u32 root, void *priv,
+                          int (*fn)(struct scev *scev, u32 id, void *priv))
+{
+	int id_old, id_new = root;
+
+	do {
+		id_old = id_new;
+		id_new = transform_expr_once(scev, 0, id_old, priv, fn);
+		if (id_new < 0)
+			return id_new;
+	} while (id_old != id_new);
+	return id_new;
+}
+
+// TODO: apply simplify in replace_reg?
+static int simplify(struct scev *scev, u32 id, void *priv)
+{
+	u32 l, r, base, slope;
+	s64 imm1, imm2;
+
+	/* (+ (linear base slope) imm) -> (linear (+ base imm) slope) */
+	if (is_add(scev, id, &l, &r) &&
+	    is_linear(scev, l, &base, &slope) &&
+	    is_imm(scev, r, &imm1))
+		return expr2(scev, LINEAR_SCEV, expr2(scev, BPF_ADD, base, r), slope);
+
+	/* (+ imm imm) -> imm */
+	if (is_add(scev, id, &l, &r) &&
+	    is_imm(scev, l, &imm1) &&
+	    is_imm(scev, r, &imm2))
+		return imm_expr(scev, imm1 + imm2);
+
+	if (is_zext32(scev, id, &l) && is_imm(scev, l, &imm1))
+		return imm_expr(scev, (u64)(u32)imm1);
+
+	return id;
+}
+
+static int compute_header_scevs(struct bpf_verifier_env *env, struct env *header_env)
+{
+	struct scev *scev = env->scev;
+	u32 ra, rb, l, r, ra_expr;
+	s64 imm;
+	int id;
+
+	for (ra = 0; ra < REGS_NUM; ra++) {
+		id = transform_expr(scev, header_env->reg2expr[ra], NULL, simplify);
+		if (id < 0)
+			return id;
+		header_env->reg2expr[ra] = id;
+		ra_expr = header_env->reg2expr[ra];
+		/* rA = (+ rA IMM) */
+		if (is_add(scev, ra_expr, &l, &r) &&
+		    is_reg(scev, l, &rb) &&
+		    is_imm(scev, r, &imm) &&
+		    ra == rb) {
+			id = expr2(scev, LINEAR_SCEV, l, r);
+			if (id < 0)
+				return id;
+			header_env->reg2scev[ra] = id;
+			continue;
+		}
+		/* rA = rA */
+		if (is_reg(scev, ra_expr, &rb) && ra == rb) {
+			header_env->reg2scev[ra] = ra_expr;
+			continue;
+		}
+		/* rA = (any 1 2 3 4 ...) */
+		/*
+		 * bpf_log(log, "compute_header_scevs: ra_expr = ");
+		 * log_expr(env, id);
+		 * bpf_log(log, " is_any_of_imm? %d\n", is_any_of_imm(scev, ra_expr));
+		 */
+		if (is_any_imm_reg(scev, ra_expr)) {
+			header_env->reg2scev[ra] = ra_expr;
+			continue;
+		}
+
+	}
+	return 0;
+}
+static int instantiate_header_scevs(struct scev *scev, u32 id, void *priv)
+{
+	u32 reg, base, slope, *reg2scev = priv;
+
+	/* (reg r) -> (linear ...), where r is a LINEAR_SCEV in the header */
+	if (is_reg(scev, id, &reg) &&
+	    is_linear(scev, reg2scev[reg], &base, &slope))
+		return reg2scev[reg];
+	return id;
+}
+
+static int compute_insn_scevs(struct bpf_verifier_env *env, struct env *eheader, struct env *einsn)
+{
+	struct scev *scev = env->scev;
+	int id, reg;
+
+	for (reg = 0; reg < REGS_NUM; reg++) {
+		id = einsn->reg2expr[reg];
+		id = transform_expr_once(scev, 0, id, eheader->reg2scev, instantiate_header_scevs);
+		if (id < 0)
+			return id;
+		id = transform_expr(scev, id, NULL, simplify);
+		if (id < 0)
+			return id;
+		einsn->reg2scev[reg] = id;
+	}
+
+	return 0;
+}
+
+static void log_scevs(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	struct bpf_loop *loop;
+	int i, j, len, latch;
+
+	len = env->prog->len;
+	for (i = 0; i < len; i++) {
+		loop = aux[i].loop;
+		if (!loop)
+			continue;
+		bpf_log(log, "scev at header %d:\n", i);
+		print_env(env, scev->envs[i], i, PRINT_SCEV);
+		for (j = 0; j < loop->backedges_cnt; j++) {
+			latch = loop->backedges[j].latch;
+			if (latch < 0)
+				continue;
+			bpf_log(log, " scev at latch %d:\n", latch);
+			print_env(env, scev->envs[latch], latch, PRINT_SCEV);
+		}
+	}
+}
+
+int bpf_compute_scev(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct scev *scev = env->scev;
+	int *postorder = env->cfg.insn_postorder;
+	int cnt = env->cfg.cur_postorder;
+	int i, idx, err, header;
+
+	mark_latches(env);
+	/*
+	 * Visit loop headers in postorder, to guarantee that scevs
+         * for innermost loops are computed first.
+	 */
+	for (i = 0; i < cnt; i++) {
+		idx = postorder[i];
+		if (!aux[idx].loop)
+			continue;
+		err = compute_scev_for_loop(env, idx);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * Compute scevs from exprs collected on a previous step. Iterate instructions in
+	 * reverse post-order so that each loop header is processed before instructions
+	 * reachable from it.
+	 */
+	for (i = cnt - 1; i >= 0; i--) {
+		idx = postorder[i];
+		if (!aux[idx].need_scev)
+			continue;
+		header = bpf_loop_at_index(env, idx);
+		err = aux[idx].loop
+		      ? compute_header_scevs(env, scev->envs[header])
+		      : compute_insn_scevs(env, scev->envs[header], scev->envs[idx]);
+		if (err)
+			return err;
+	}
+
+	if (env->log.level & (BPF_LOG_LEVEL2 | BPF_LOG_STATS))
+		log_scevs(env);
+
+	return 0;
+}
+
+static int reverse_ranked_compare(int a, int b, void *arg)
+{
+	int *rank = arg;
+
+	return rank[b] - rank[a];
+}
+
+void bpf_free_scev(struct bpf_verifier_env *env)
+{
+	struct scev *scev = env->scev;
+	int i;
+
+	if (!scev)
+		return;
+	for (i = 0; i < scev->envs_cnt; i++)
+		kfree(scev->envs[i]);
+	for (i = 0; i < ARRAY_SIZE(scev->exprs_ht); i++)
+		kfree(scev->exprs_ht[i]);
+	bpf_min_heap_free(&scev->worklist);
+	kvfree(scev->envs);
+	kvfree(scev->exprs);
+	kvfree(scev->discovered);
+	kfree(scev);
+	env->scev = NULL;
+}
+
+int bpf_init_scev(struct bpf_verifier_env *env)
+{
+	struct scev *scev;
+
+	scev = kzalloc(sizeof(struct scev), GFP_KERNEL_ACCOUNT);
+	if (!scev)
+		return -ENOMEM;
+	env->scev = scev;
+	/* Order worklist in reverse post-order. */
+	bpf_min_heap_init(&scev->worklist, reverse_ranked_compare, env->cfg.postorder_nums);
+	if (expr0(scev, UNKNOWN) < 0 || expr0(scev, OPAQUE)  < 0)
+		goto nomem;
+	scev->envs = kvcalloc(env->prog->len, sizeof(*scev->envs), GFP_KERNEL_ACCOUNT);
+	scev->discovered = kvcalloc(env->prog->len, sizeof(*scev->discovered), GFP_KERNEL_ACCOUNT);
+	if (!scev->envs || !scev->discovered)
+		goto nomem;
+	/*
+	 * Remember original program length, in case bpf_free_scev()
+         * is called after bpf program rewrites that increase program
+         * length.
+	 */
+	scev->envs_cnt = env->prog->len;
+	return 0;
+nomem:
+	bpf_free_scev(env);
+	return -ENOMEM;
+}
