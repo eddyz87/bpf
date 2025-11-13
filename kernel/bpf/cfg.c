@@ -659,20 +659,23 @@ struct dfs_state {
  */
 int bpf_compute_postorder(struct bpf_verifier_env *env)
 {
-	int *stack = NULL, *postorder = NULL, *postorder_nums = NULL, *preorder_nums = NULL;
 	int subprog_idx, stack_sz, cur, s, cur_postorder, cur_preorder, start;
+	int *postorder_nums = NULL, *preorder_nums = NULL;
+	int *stack = NULL, *preorder, *postorder = NULL;
 	struct dfs_state *state = NULL;
 	struct bpf_iarray *succ = NULL;
 
 	postorder_nums = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
 	preorder_nums = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
 	postorder = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
+	preorder = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
 	stack = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
 	state = kvzalloc_objs(struct dfs_state, env->prog->len, GFP_KERNEL_ACCOUNT);
-	if (!postorder_nums || !preorder_nums || !postorder || !stack || !state) {
+	if (!postorder_nums || !preorder_nums || !preorder || !postorder || !stack || !state) {
 		kfree(postorder_nums);
 		kfree(preorder_nums);
 		kfree(postorder);
+		kfree(preorder);
 		kfree(stack);
 		kfree(state);
 		return -ENOMEM;
@@ -701,7 +704,9 @@ int bpf_compute_postorder(struct bpf_verifier_env *env)
 				state[s].traversed = true;
 				state[s].next_succ = 0;
 				stack[stack_sz] = s;
-				preorder_nums[s] = cur_preorder++;
+				preorder_nums[s] = cur_preorder;
+				preorder[cur_preorder] = s;
+				cur_preorder++;
 				stack_sz++;
 				continue;
 			}
@@ -712,6 +717,7 @@ int bpf_compute_postorder(struct bpf_verifier_env *env)
 	env->cfg.postorder_nums = postorder_nums;
 	env->cfg.preorder_nums = preorder_nums;
 	env->cfg.insn_postorder = postorder;
+	env->cfg.insn_preorder = preorder;
 	env->cfg.cur_postorder = cur_postorder;
 	kfree(stack);
 	kfree(state);
