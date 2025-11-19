@@ -1134,6 +1134,25 @@ int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_
 bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 spi);
 void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env);
 
+static inline u32 bpf_spill_base_idx(struct bpf_insn *insn)
+{
+	return -insn->off / BPF_REG_SIZE - 1;
+}
+
+static inline bool bpf_is_spill_base_ldx(struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_LDX &&
+	       BPF_MODE(insn->code) == BPF_MEM &&
+	       insn->src_reg == BPF_REG_SB;
+}
+
+static inline bool bpf_is_spill_base_stx(struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_STX &&
+	       BPF_MODE(insn->code) == BPF_MEM &&
+	       insn->dst_reg == BPF_REG_SB;
+}
+
 int bpf_compute_idoms(struct bpf_verifier_env *env);
 int bpf_compute_loops(struct bpf_verifier_env *env);
 int bpf_loop_at_index(struct bpf_verifier_env *env, u32 idx);

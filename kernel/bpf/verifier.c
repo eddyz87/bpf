@@ -3842,25 +3842,6 @@ static int check_reg_arg(struct bpf_verifier_env *env, u32 regno,
 	return __check_reg_arg(env, state->regs, regno, t);
 }
 
-static u32 spill_base_idx(struct bpf_insn *insn)
-{
-	return -insn->off / BPF_REG_SIZE - 1;
-}
-
-static bool is_spill_base_ldx(struct bpf_insn *insn)
-{
-	return BPF_CLASS(insn->code) == BPF_LDX &&
-	       BPF_MODE(insn->code) == BPF_MEM &&
-	       insn->src_reg == BPF_REG_SB;
-}
-
-static bool is_spill_base_stx(struct bpf_insn *insn)
-{
-	return BPF_CLASS(insn->code) == BPF_STX &&
-	       BPF_MODE(insn->code) == BPF_MEM &&
-	       insn->dst_reg == BPF_REG_SB;
-}
-
 static int insn_stack_access_flags(int frameno, int spi)
 {
 	return INSN_F_STACK_ACCESS | (spi << INSN_F_SPI_SHIFT) | frameno;
@@ -4314,7 +4295,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 	u8 mode = BPF_MODE(insn->code);
 	u32 dreg = insn->dst_reg;
 	u32 sreg = insn->src_reg;
-	u32 spill = spill_base_idx(insn);
+	u32 spill = bpf_spill_base_idx(insn);
 	u32 spi, i, fr;
 
 	if (insn->code == 0)
@@ -4377,7 +4358,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			   * dreg still needs precision before this insn
 			   */
 		}
-	} else if (is_spill_base_ldx(insn)) {
+	} else if (bpf_is_spill_base_ldx(insn)) {
 		if (!bt_is_reg_set(bt, dreg))
 			return 0;
 		bt_clear_reg(bt, dreg);
@@ -4402,7 +4383,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 		spi = insn_stack_access_spi(hist->flags);
 		fr = insn_stack_access_frameno(hist->flags);
 		bt_set_frame_slot(bt, fr, spi);
-	} else if (is_spill_base_stx(insn)) {
+	} else if (bpf_is_spill_base_stx(insn)) {
 		if (!bt_is_spill_set(bt, spill))
 			return 0;
 		bt_clear_spill(bt, spill);
@@ -23835,8 +23816,8 @@ static int convert_spill_base(struct bpf_verifier_env *env)
 	stack_depth = cur_subprog->stack_depth;
 	stack_depth_extra = 0;
 	for (i = 0; i < insn_cnt; i++, insn++) {
-		is_ldx = is_spill_base_ldx(insn);
-		is_stx = is_spill_base_stx(insn);
+		is_ldx = bpf_is_spill_base_ldx(insn);
+		is_stx = bpf_is_spill_base_stx(insn);
 		if (is_ldx || is_stx) {
 			stack_depth_extra = max(stack_depth_extra, -insn->off);
 			if (is_ldx)
@@ -25066,9 +25047,9 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		}
 		break;
 	case BPF_LDX:
-		if (is_spill_base_ldx(insn)) {
+		if (bpf_is_spill_base_ldx(insn)) {
 			info->def = dst;
-			info->spill_use = BIT(spill_base_idx(insn));
+			info->spill_use = BIT(bpf_spill_base_idx(insn));
 			return;
 		}
 		switch (mode) {
@@ -25088,9 +25069,9 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		}
 		break;
 	case BPF_STX:
-		if (is_spill_base_stx(insn)) {
+		if (bpf_is_spill_base_stx(insn)) {
 			info->use = src;
-			info->spill_def = BIT(spill_base_idx(insn));
+			info->spill_def = BIT(bpf_spill_base_idx(insn));
 			return;
 		}
 		switch (mode) {
