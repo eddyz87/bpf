@@ -304,4 +304,146 @@ __naked void maybe_exit_scc_bug1(void)
 	::: __clobber_all);
 }
 
+SEC("xdp")
+__success
+__log_level(2)
+__msg("scev at header 1: r0=(+ r0 1)")
+__naked void scev_simple_loop1(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+loop_%=:						\
+	if r0 == 10 goto exit_%=;			\
+	r0 += 1;					\
+	goto loop_%=;					\
+exit_%=:						\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__msg("scev at header 2: r0=(+ sp-8 1) sp-8=(+ sp-8 1)")
+__msg(" scev at latch 3: r0=sp-8 sp-8=sp-8")
+__naked void scev_simple_loop2(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u64 *)(r11 - 8) = r0;				\
+loop_%=:						\
+	r0 = *(u64 *)(r11 - 8);				\
+	if r0 == 10 goto exit_%=;			\
+	r0 = *(u64 *)(r11 - 8);				\
+	r0 += 1;					\
+	*(u64 *)(r11 - 8) = r0;				\
+	goto loop_%=;					\
+exit_%=:						\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__msg("scev at header 2: r0=r0 r1=(+ r1 1)")
+__naked void scev_meet_agrees(void)
+{
+	asm volatile ("					\
+	call %[bpf_get_prandom_u32];			\
+	r1 = 0;						\
+1:							\
+	if r1 == 2 goto 3f;				\
+	if r0 == 7 goto 2f;				\
+	r1 += 1;					\
+	goto 1b;					\
+2:							\
+	r1 += 1;					\
+	goto 1b;					\
+3:							\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__failure
+__log_level(2)
+__msg("scev at header 1: <all regs unknown>")
+__naked void scev_meet_disagrees(void)
+{
+	asm volatile ("					\
+	r6 = 0;						\
+1:							\
+	if r6 == 2 goto 3f;				\
+	call %[bpf_get_prandom_u32];			\
+	if r0 == 7 goto 1b;				\
+	r6 += 1;					\
+	goto 1b;					\
+3:							\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__failure
+__log_level(2)
+__msg("scev at header 1: r6=(bswap32 (bswap32 (zext32 (- (- (zext32 (+ (>> (<< (+ r6 1) 32) 32) 1)))))))")
+__naked void scev_expr_chain(void)
+{
+	asm volatile ("					\
+	r6 = 0;						\
+1:							\
+	if r6 == 2 goto 2f;				\
+	r6 += 1;					\
+	r6 <<= 32;					\
+	r6 >>= 32;					\
+	w6 += 1;					\
+	r6 = -r6;					\
+	w6 = -w6;					\
+	r6 = bswap32 r6;				\
+	r6 = bswap32 r6;				\
+	goto 1b;					\
+2:							\
+	r0 = 0;						\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__msg("scev at header 4: r6=r6 r7=(+ r7 1)")
+__msg("scev at header 1: r6=(+ r6 1)")
+__naked void scev_nested_loop1(void)
+{
+	asm volatile ("					\
+	r6 = 0;						\
+1:							\
+	if r6 == 2 goto 2f;				\
+	r6 += 1;					\
+	r7 = 0;						\
+3:							\
+	if r7 == 2 goto 4f;				\
+	r7 += 1;					\
+	goto 3b;					\
+4:							\
+	goto 1b;					\
+2:							\
+	r0 = r7;					\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
