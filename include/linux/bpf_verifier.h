@@ -520,17 +520,27 @@ struct bpf_iarray {
 };
 
 #define MAX_BACKEDGES 16
+#define MAX_EXITS 16
 
 struct bpf_backedge {
 	int from;
 	int latch; /* -1 if no latch can be found */
 };
 
+struct bpf_loop_exit {
+	int from; /* instruction inside the loop */
+	int to; /* instruction outside the loop */
+};
+
 struct bpf_loop {
 	struct bpf_backedge backedges[MAX_BACKEDGES];
+	/* edges exiting from this loop, includes edges from nested loops */
+	struct bpf_loop_exit exits[MAX_EXITS];
 	int backedges_cnt;
+	int exits_cnt;
 	bool irreducible;
 	bool backedges_overflow;
+	bool exits_overflow;
 };
 
 struct bpf_insn_aux_data {
@@ -1125,5 +1135,6 @@ void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env);
 int bpf_compute_idoms(struct bpf_verifier_env *env);
 int bpf_compute_loops(struct bpf_verifier_env *env);
 int bpf_loop_at_index(struct bpf_verifier_env *env, u32 idx);
+bool bpf_is_nested_loop(struct bpf_verifier_env *env, int inner_header, int outer_header);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
