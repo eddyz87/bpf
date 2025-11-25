@@ -381,12 +381,25 @@ static int compute_loops_in_subprog(struct bpf_verifier_env *env, struct loops_d
 	return 0;
 }
 
-int bpf_compute_loops(struct bpf_verifier_env *env)
+bool bpf_is_nested_loop(struct bpf_verifier_env *env, int inner_header, int outer_header)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	int i, j, err = 0, len = env->prog->len;
+	int idx;
+
+	for (idx = inner_header; idx >= 0; idx = aux[idx].loop_header)
+		if (aux[idx].loop_header == outer_header)
+			return true;
+
+	return false;
+}
+
+int bpf_compute_loops(struct bpf_verifier_env *env)
+{
+	int i, j, s, t, iloop, sloop, err = 0, len = env->prog->len;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_backedge *backedge;
 	struct loops_dfs dfs = {};
+	struct bpf_iarray *succ;
 	struct bpf_loop *loop;
 
 	dfs.dfs_pos = kvcalloc(len, sizeof(int), GFP_KERNEL_ACCOUNT);
@@ -411,6 +424,53 @@ int bpf_compute_loops(struct bpf_verifier_env *env)
 		for (j = 0; j < loop->backedges_cnt; j++) {
 			backedge = &loop->backedges[j];
 			backedge->latch = find_dominating_condition(env, backedge->from, i);
+		}
+	}
+	/* find exits */
+	for (i = 0; i < len; i++) {
+		iloop = aux[i].loop ? i : aux[i].loop_header;
+		if (iloop < 0)
+			continue;
+		succ = bpf_insn_successors(env, i);
+		iarray_for_each(s, succ) {
+			sloop = aux[s].loop ? s : aux[s].loop_header;
+			if (iloop == sloop)
+				continue;
+			if (bpf_is_nested_loop(env, sloop, iloop))
+				continue;
+			/*
+			 * 'sloop' is either -1 or an outer loop at this point,
+			 * iterate 'iloop' outer loops up to 'sloop' and add i->s
+			 * edge as an exit.
+			 */
+			for (t = iloop; t >= 0 && t != sloop; t = aux[t].loop_header) {
+				loop = aux[t].loop;
+				if (loop->exits_cnt == MAX_EXITS) {
+					loop->exits_overflow = true;
+					continue;
+				}
+				loop->exits[loop->exits_cnt].from = i;
+				loop->exits[loop->exits_cnt].to = s;
+				loop->exits_cnt++;
+			}
+		}
+		if (bpf_is_ldimm64(env->prog->insnsi + i))
+			i++;
+	}
+
+	if (env->log.level & BPF_LOG_LEVEL2) {
+		for (i = 0; i < len; i++) {
+			loop = aux[i].loop;
+			if (!loop)
+				continue;
+			for (j = 0; j < loop->backedges_cnt; j++) {
+				bpf_log(&env->log, "loop at %d backedge from %d, latch at %d\n",
+					i, loop->backedges[j].from, loop->backedges[j].latch);
+			}
+			for (j = 0; j < loop->exits_cnt; j++) {
+				bpf_log(&env->log, "loop at %d exit from %d to %d\n",
+					i, loop->exits[j].from, loop->exits[j].to);
+			}
 		}
 	}
 
