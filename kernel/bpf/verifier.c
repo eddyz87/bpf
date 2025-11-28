@@ -18234,6 +18234,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 	struct bpf_prog_aux *aux = env->prog->aux;
 	struct bpf_verifier_state *state;
 	struct bpf_reg_state *regs;
+	u32 log_pos = env->log.end_pos;
 	int ret, i;
 
 	env->prev_linfo = NULL;
@@ -18369,7 +18370,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 	ret = do_check(env);
 out:
 	if (!ret && pop_log)
-		bpf_vlog_reset(&env->log, 0);
+		bpf_vlog_reset(&env->log, log_pos);
 	free_states(env);
 	return ret;
 }
