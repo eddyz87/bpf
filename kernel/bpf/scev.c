@@ -721,7 +721,7 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 		}
 	}
 
-	if (log->level & BPF_LOG_LEVEL2) {
+	if (log->level & (BPF_LOG_LEVEL2 | BPF_LOG_STATS)) {
 		struct bpf_loop *loop = aux[cur_header].loop;
 		int i, latch;
 
@@ -729,8 +729,12 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 		print_env(env, scev->envs[cur_header]);
 		for (i = 0; i < loop->backedges_cnt; i++) {
 			latch = loop->backedges[i].latch;
-			bpf_log(log, "scev at latch %d:", latch);
+			if (latch < 0)
+				continue;
+			bpf_log(log, " scev at latch %d:", latch);
 			print_env(env, scev->envs[latch]);
+			bpf_log(log, "      latch at %d: ", latch);
+			bpf_verbose_insn(env, &env->prog->insnsi[latch]);
 		}
 	}
 
