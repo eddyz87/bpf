@@ -234,6 +234,8 @@ static struct env {
 	char stat_cgroup[PATH_MAX];
 	int memory_peak_fd;
 	__u32 dump_mode;
+	int loop_info_fd;
+	bool collect_loop_info;
 } env;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -279,6 +281,7 @@ enum {
 	OPT_LOG_FIXED = 1000,
 	OPT_LOG_SIZE = 1001,
 	OPT_DUMP = 1002,
+	OPT_LOOP_STATS = 1003,
 };
 
 static const struct argp_option opts[] = {
@@ -304,6 +307,7 @@ static const struct argp_option opts[] = {
 	{ "top-src-lines", 'S', "N", 0, "Emit N most frequent source code lines" },
 	{ "set-global-vars", 'G', "GLOBAL", 0, "Set global variables provided in the expression, for example \"var1 = 1\"" },
 	{ "dump", OPT_DUMP, "DUMP_MODE", OPTION_ARG_OPTIONAL, "Print BPF program dump (xlated, jited)" },
+	{ "loop-stats", OPT_LOOP_STATS, "FILE", 0, "File to collect loop stats in" },
 	{},
 };
 
@@ -445,6 +449,15 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			fprintf(stderr, "Unrecognized dump mode '%s'\n", arg);
 			return -EINVAL;
 		}
+		break;
+	case OPT_LOOP_STATS:
+		env.loop_info_fd = open(arg, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+		if (env.loop_info_fd < 0) {
+			fprintf(stderr, "Can't open file '%s' for writing: %d / %s\n",
+				arg, errno, strerror(errno));
+			return -EINVAL;
+		}
+		env.collect_loop_info = true;
 		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -993,14 +1006,39 @@ static char verif_log_buf[64 * 1024];
 
 #define MAX_PARSED_LOG_LINES 100
 
-static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *s)
+static int parse_verif_log(char * const buf, size_t buf_sz, struct verif_stats *s,
+			   const char *base_filename, const char *prog_name)
 {
 	const char *cur;
 	int pos, lines, sub_stack, cnt = 0;
 	char *state = NULL, *token, stack[512];
+	bool prog_printed = false;
+	int len, line_len;
+	char *line_end;
 
 	buf[buf_sz - 1] = '\0';
 
+	if (env.collect_loop_info) {
+		len = strlen(buf);
+		for (pos = 0; pos < len;) {
+			cur = buf + pos;
+			line_end = strchr(cur, '\n');
+			line_len = line_end ? line_end - cur + 1 : len - pos;
+			pos += line_len;
+			if (memmem(cur, line_len, "scev", sizeof("scev") - 1) == NULL &&
+			    memmem(cur, line_len, "latch", sizeof("latch") - 1) == NULL)
+				continue;
+			if (!prog_printed) {
+				prog_printed = true;
+				dprintf(env.loop_info_fd, "file %s, prog %s:\n", base_filename, prog_name);
+			}
+			dprintf(env.loop_info_fd, "  ");
+			write(env.loop_info_fd, cur, line_len - 1);
+			dprintf(env.loop_info_fd, "\n");
+		}
+		if (prog_printed)
+			dprintf(env.loop_info_fd, "\n");
+	}
 	for (pos = strlen(buf) - 1, lines = 0; pos >= 0 && lines < MAX_PARSED_LOG_LINES; lines++) {
 		/* find previous endline or otherwise take the start of log buf */
 		for (cur = &buf[pos]; cur > buf && cur[0] != '\n'; cur--, pos--) {
@@ -1687,7 +1725,7 @@ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf
 			dump(info.id, DUMP_XLATED, base_filename, prog_name);
 	}
 
-	parse_verif_log(buf, buf_sz, stats);
+	parse_verif_log(buf, buf_sz, stats, base_filename, prog_name);
 
 	if (env.verbose) {
 		printf("PROCESSING %s/%s, DURATION US: %ld, VERDICT: %s, VERIFIER LOG:\n%s\n",
@@ -3380,5 +3418,7 @@ int main(int argc, char **argv)
 		free(env.presets[i].atoms);
 	}
 	free(env.presets);
+	if (env.collect_loop_info)
+		close(env.loop_info_fd);
 	return -err;
 }
