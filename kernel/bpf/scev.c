@@ -3,6 +3,7 @@
 
 #include <linux/bpf_verifier.h>
 #include <linux/jhash.h>
+#include <linux/bug.h>
 
 #define REGS_NUM (MAX_BPF_REG + 64)
 #define UNKNOWN_EXPR_ID 0
@@ -34,12 +35,19 @@ enum expr_op {
 	BSWAP16 = 10 << 8,
 	BSWAP32 = 11 << 8,
 	BSWAP64 = 12 << 8,
+	/*
+	 * SCEV expression corresponding to linear equation 'param[0] + param[1] * k',
+	 * where k is a loop iteration number. Loop here refers to innermost loop
+	 * containing instruction associated with this expression, as returned by
+	 * bpf_loop_at_index().
+	 */
+	LINEAR_SCEV = 13 << 8,
 };
 
 struct expr {
 	u32 op;
 	union {
-		u32 params[2];
+		u32 params[2]; // TODO: make these s32, needed for linear_scev coef param
 		s64 imm;
 	};
 };
@@ -51,13 +59,20 @@ struct expr_bucket {
 };
 
 struct env {
-	bool initial;
 	bool empty;
 	u32 reg2expr[REGS_NUM];
+	u32 reg2scev[REGS_NUM]; // TODO: tracking up to 2 registers here should be sufficient
 };
 
 #define NUM_BUCKETS 256
 #define EXPR_STACK_DEPTH 64
+
+struct expr_stack_elt {
+	u32 id:28;
+	u32 pre:1;
+	u32 next_param:2;
+	u32 rewritten_params[2];
+};
 
 struct scev {
 	/*
@@ -74,10 +89,7 @@ struct scev {
 	int exprs_cap;
 	int envs_cnt;
 	int stack_sz;
-	struct {
-		u32 id:29;
-		u32 next_param:2;
-	} expr_stack[EXPR_STACK_DEPTH];
+	struct expr_stack_elt expr_stack[EXPR_STACK_DEPTH];
 };
 
 static void log_reg(struct bpf_verifier_env *env, u32 reg)
@@ -112,6 +124,7 @@ static const char *op_str(u32 op)
 	case BSWAP16:  return "bswap16";
 	case BSWAP32:  return "bswap32";
 	case BSWAP64:  return "bswap64";
+	case LINEAR_SCEV:  return "linear";
 	}
 	return NULL;
 }
@@ -132,6 +145,7 @@ static u32 op_params_num(u32 op)
 	case BPF_ARSH:
 	case SDIV:
 	case SMOD:
+	case LINEAR_SCEV:
 		return 2;
 	case BPF_NEG:
 	case SEXT8:
@@ -155,6 +169,7 @@ static bool expr_stack_push(struct scev *scev, u32 id)
 	if (scev->stack_sz >= EXPR_STACK_DEPTH)
 		return false;
 	scev->expr_stack[scev->stack_sz].id = id;
+	scev->expr_stack[scev->stack_sz].pre = true;
 	scev->expr_stack[scev->stack_sz].next_param = 0;
 	scev->stack_sz++;
 	return true;
@@ -166,35 +181,36 @@ enum {
 
 static bool expr_next(struct scev *scev, u32 *id, u32 *order)
 {
-	u32 next_param, num_params;
+	struct expr_stack_elt *elt;
 	struct expr *expr;
+	u32 num_params;
 
 	if (scev->stack_sz == 0)
 		return false;
 
-	*id = scev->expr_stack[scev->stack_sz - 1].id;
+	elt = &scev->expr_stack[scev->stack_sz - 1];
+	*id = elt->id;
 	*order = 0;
-	expr = &scev->exprs[*id];
-	next_param = scev->expr_stack[scev->stack_sz - 1].next_param;
+	expr = &scev->exprs[elt->id];
 	num_params = op_params_num(expr->op);
-	if (num_params && scev->stack_sz == EXPR_STACK_DEPTH) {
-		*order = PRE | POST | DEPTH_LIMIT;
+	if (elt->pre) {
+		elt->pre = false;
+		*order = PRE;
+		return true;
+	}
+	if (elt->next_param == num_params) {
+		*order = POST;
 		scev->stack_sz--;
 		return true;
 	}
-	if (next_param == 0)
-		*order |= PRE;
-	if (next_param == num_params)
-		*order |= POST;
-	if (next_param < num_params) {
- 		scev->expr_stack[scev->stack_sz - 1].next_param++;
-		scev->expr_stack[scev->stack_sz].id = expr->params[next_param];
-		scev->expr_stack[scev->stack_sz].next_param = 0;
-		scev->stack_sz++;
+	if (scev->stack_sz == EXPR_STACK_DEPTH) {
+		*order = POST | DEPTH_LIMIT;
+		scev->stack_sz--;
 		return true;
 	}
-	scev->stack_sz--;
-	return true;
+	expr_stack_push(scev, expr->params[elt->next_param]);
+ 	elt->next_param++;
+	return expr_next(scev, id, order);
 }
 
 static void log_expr(struct bpf_verifier_env *env, u32 id)
@@ -208,16 +224,21 @@ static void log_expr(struct bpf_verifier_env *env, u32 id)
 	scev->stack_sz = 0;
 	expr_stack_push(scev, id);
 	while (expr_next(scev, &id, &order)) {
+		if ((order & PRE) && scev->stack_sz > 1)
+			bpf_log(log, " ");
 		expr = &scev->exprs[id];
 		switch(expr->op) {
 		case UNKNOWN:
-			bpf_log(log, "?");
+			if (order & PRE)
+				bpf_log(log, "?");
 			break;
 		case REG:
-			log_reg(env, expr->params[0]);
+			if (order & PRE)
+				log_reg(env, expr->params[0]);
 			break;
 		case IMM:
-			bpf_log(log, "%lld", expr->imm);
+			if (order & PRE)
+				bpf_log(log, "%lld", expr->imm);
 			break;
 		default:
 			if (order & PRE) {
@@ -233,11 +254,14 @@ static void log_expr(struct bpf_verifier_env *env, u32 id)
 			if (order & POST)
 				bpf_log(log, ")");
 		}
-		bpf_log(log, " ");
 	}
 }
 
-static void print_env(struct bpf_verifier_env *env, struct env *e)
+enum print_env_flags {
+	PRINT_SCEV = BIT(1)
+};
+
+static void print_env(struct bpf_verifier_env *env, struct env *e, u32 flags)
 {
 	struct bpf_verifier_log *log = &env->log;
 	int i, num_unknown;
@@ -257,6 +281,10 @@ static void print_env(struct bpf_verifier_env *env, struct env *e)
 		log_reg(env, i);
 		bpf_log(log, "=");
 		log_expr(env, e->reg2expr[i]);
+		if (flags & PRINT_SCEV) {
+			bpf_log(log, " / ");
+			log_expr(env, e->reg2scev[i]);
+		}
 	}
 	if (num_unknown == REGS_NUM)
 		bpf_log(log, " <all regs unknown>");
@@ -680,7 +708,7 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 
 		if (log->level & BPF_LOG_LEVEL2) {
 			bpf_log(log, "scev expr %d:", idx);
-			print_env(env, before_env);
+			print_env(env, before_env, 0);
 		}
 
 		/* Iterate instructions within a single basic block starting at 'idx' mutating 'cur_env'. */
@@ -752,23 +780,6 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 		}
 	}
 
-	if (log->level & (BPF_LOG_LEVEL2 | BPF_LOG_STATS)) {
-		struct bpf_loop *loop = aux[cur_header].loop;
-		int i, latch;
-
-		bpf_log(log, "scev at header %d:", cur_header);
-		print_env(env, scev->envs[cur_header]);
-		for (i = 0; i < loop->backedges_cnt; i++) {
-			latch = loop->backedges[i].latch;
-			if (latch < 0)
-				continue;
-			bpf_log(log, " scev at latch %d:", latch);
-			print_env(env, scev->envs[latch]);
-			bpf_log(log, "      latch at %d: ", latch);
-			bpf_verbose_insn(env, &env->prog->insnsi[latch]);
-		}
-	}
-
 	err = 0;
 out:
 	kfree(cur_env);
@@ -789,6 +800,7 @@ static void mark_latches(struct bpf_verifier_env *env)
 		loop = aux[i].loop;
 		if (!loop)
 			continue;
+		aux[i].need_scev = true;
 		for (j = 0; j < loop->backedges_cnt; j++) {
 			latch = loop->backedges[j].latch;
 			if (latch >= 0)
@@ -797,12 +809,186 @@ static void mark_latches(struct bpf_verifier_env *env)
 	}
 }
 
+static bool is_imm(struct scev *scev, int id, s64 *imm)
+{
+	if (scev->exprs[id].op != IMM)
+		return false;
+	*imm = scev->exprs[id].imm;
+	return true;
+}
+
+static bool is_unop(struct scev *scev, enum expr_op op, int id, u32 *p0)
+{
+	if (scev->exprs[id].op != op)
+		return false;
+	*p0 = scev->exprs[id].params[0];
+	return true;
+}
+
+static bool is_binop(struct scev *scev, enum expr_op op, int id, u32 *p0, u32 *p1)
+{
+	if (scev->exprs[id].op != op)
+		return false;
+	*p0 = scev->exprs[id].params[0];
+	*p1 = scev->exprs[id].params[1];
+	return true;
+}
+
+static bool is_reg(struct scev *scev, int id, u32 *reg)
+{
+	return is_unop(scev, REG, id, reg);
+}
+
+static bool is_add(struct scev *scev, int id, u32 *left, u32 *right) {
+	return is_binop(scev, BPF_ADD, id, left, right);
+}
+
+static bool is_linear(struct scev *scev, int id, u32 *base, u32 *slope)
+{
+	return is_binop(scev, LINEAR_SCEV, id, base, slope);
+}
+
+static int compute_header_scevs(struct bpf_verifier_env *env, struct env *header_env)
+{
+	struct scev *scev = env->scev;
+	u32 ra, rb, l, r;
+	s64 imm;
+	int id;
+
+	for (ra = 0; ra < REGS_NUM; ra++) {
+		/* rA = (+ rA IMM) */
+		if (is_add(scev, header_env->reg2expr[ra], &l, &r) &&
+		    is_reg(scev, l, &rb) &&
+		    is_imm(scev, r, &imm) &&
+		    ra == rb) {
+			id = expr2(scev, LINEAR_SCEV, l, r);
+			if (id < 0)
+				return id;
+			header_env->reg2scev[ra] = id;
+			continue;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Can implement explicit stack version, but it is harder to read.
+ * Stick with recursive version for now.
+ */
+static int __transform_expr(struct scev *scev, u32 lvl, u32 root, void *priv,
+                            int (*fn)(struct scev *scev, u32 id, void *priv))
+{
+	struct expr *expr;
+	int p0, p1, id;
+
+	if (lvl >= EXPR_STACK_DEPTH)
+		return UNKNOWN_EXPR_ID;
+
+        expr = &scev->exprs[root];
+	switch (op_params_num(expr->op)) {
+	case 0:
+		id = root;
+		break;
+	case 1:
+		p0 = __transform_expr(scev, lvl + 1, expr->params[0], priv, fn);
+		id = expr1(scev, expr->op, p0);
+		break;
+	case 2:
+		p0 = __transform_expr(scev, lvl + 1, expr->params[0], priv, fn);
+		p1 = __transform_expr(scev, lvl + 1, expr->params[1], priv, fn);
+		id = expr2(scev, expr->op, p0, p1);
+		break;
+	}
+	return id < 0 ? id : fn(scev, id, priv);
+}
+
+static int transform_expr(struct scev *scev, u32 root, void *priv,
+                          int (*fn)(struct scev *scev, u32 id, void *priv))
+{
+	int id1, id2;
+
+	for (id1 = root, id2 = -1; id1 != id2; id1 = id2) {
+		id2 = __transform_expr(scev, 0, id1, priv, fn);
+		if (id2 < 0)
+			return id2;
+	}
+	return id2;
+}
+
+static int simplify(struct scev *scev, u32 id, void *priv)
+{
+	u32 l, r, reg, base, slope, *reg2scev = priv;
+	s64 imm1, imm2;
+
+	/* (reg r) -> (linear ...), where r is a LINEAR_SCEV in the header */
+	if (is_reg(scev, id, &reg) &&
+	    is_linear(scev, reg2scev[reg], &base, &slope))
+		return reg2scev[reg];
+
+	/* (+ (linear base slope) imm) -> (linear (+ base imm) slope) */
+	if (is_add(scev, id, &l, &r) &&
+	    is_linear(scev, l, &base, &slope) &&
+	    is_imm(scev, r, &imm1))
+		return expr2(scev, LINEAR_SCEV, expr2(scev, BPF_ADD, base, imm1), slope);
+
+	/* (+ imm imm) -> imm */
+	if (is_add(scev, id, &l, &r) &&
+	    is_imm(scev, l, &imm1) &&
+	    is_imm(scev, r, &imm2))
+		return imm_expr(scev, imm1 + imm2);
+
+	return id;
+}
+
+static int compute_insn_scevs(struct bpf_verifier_env *env, struct env *eheader, struct env *einsn)
+{
+	struct scev *scev = env->scev;
+	int id, reg;
+
+	for (reg = 0; reg < REGS_NUM; reg++) {
+		id = transform_expr(scev, einsn->reg2expr[reg], eheader->reg2scev, simplify);
+		if (id < 0)
+			return id;
+		einsn->reg2scev[reg] = id;
+	}
+
+	return 0;
+}
+
+static void log_scevs(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	struct bpf_loop *loop;
+	int i, j, len, latch;
+
+	len = env->prog->len;
+	for (i = 0; i < len; i++) {
+		loop = aux[i].loop;
+		if (!loop)
+			continue;
+		bpf_log(log, "scev at header %d:", i);
+		print_env(env, scev->envs[i], PRINT_SCEV);
+		for (j = 0; j < loop->backedges_cnt; j++) {
+			latch = loop->backedges[j].latch;
+			if (latch < 0)
+				continue;
+			bpf_log(log, " scev at latch %d:", latch);
+			print_env(env, scev->envs[latch], PRINT_SCEV);
+			bpf_log(log, "      latch at %d: ", latch);
+			bpf_verbose_insn(env, &env->prog->insnsi[latch]);
+		}
+	}
+}
+
 int bpf_compute_scev(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct scev *scev = env->scev;
 	int *postorder = env->cfg.insn_postorder;
 	int cnt = env->cfg.cur_postorder;
-	int i, idx, err;
+	int i, idx, err, header;
 
 	mark_latches(env);
 	/*
@@ -817,6 +1003,26 @@ int bpf_compute_scev(struct bpf_verifier_env *env)
 		if (err)
 			return err;
 	}
+
+	/*
+	 * Compute scevs from exprs collected on a previous step. Iterate instructions in
+	 * reverse post-order so that each loop header is processed before instructions
+	 * reachable from it.
+	 */
+	for (i = cnt - 1; i >= 0; i--) {
+		idx = postorder[i];
+		if (!aux[idx].need_scev)
+			continue;
+		header = bpf_loop_at_index(env, idx);
+		err = aux[idx].loop
+		      ? compute_header_scevs(env, scev->envs[header])
+		      : compute_insn_scevs(env, scev->envs[header], scev->envs[idx]);
+		if (err)
+			return err;
+	}
+
+	if (env->log.level & (BPF_LOG_LEVEL2 | BPF_LOG_STATS))
+		log_scevs(env);
 
 	return 0;
 }
