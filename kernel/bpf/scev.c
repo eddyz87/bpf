@@ -57,7 +57,7 @@ struct env {
 };
 
 #define NUM_BUCKETS 256
-#define EXPR_PRINT_STACK_DEPTH 64
+#define EXPR_STACK_DEPTH 64
 
 struct scev {
 	/*
@@ -73,10 +73,11 @@ struct scev {
 	int exprs_cnt;
 	int exprs_cap;
 	int envs_cnt;
+	int stack_sz;
 	struct {
 		u32 id:29;
 		u32 next_param:2;
-	} expr_print_stack[64];
+	} expr_stack[EXPR_STACK_DEPTH];
 };
 
 static void log_reg(struct bpf_verifier_env *env, u32 reg)
@@ -149,37 +150,77 @@ static u32 op_params_num(u32 op)
 	}
 }
 
+static bool expr_stack_push(struct scev *scev, u32 id)
+{
+	if (scev->stack_sz >= EXPR_STACK_DEPTH)
+		return false;
+	scev->expr_stack[scev->stack_sz].id = id;
+	scev->expr_stack[scev->stack_sz].next_param = 0;
+	scev->stack_sz++;
+	return true;
+}
+
+enum {
+	PRE = BIT(1), POST = BIT(2), DEPTH_LIMIT = BIT(3)
+};
+
+static bool expr_next(struct scev *scev, u32 *id, u32 *order)
+{
+	u32 next_param, num_params;
+	struct expr *expr;
+
+	if (scev->stack_sz == 0)
+		return false;
+
+	*id = scev->expr_stack[scev->stack_sz - 1].id;
+	*order = 0;
+	expr = &scev->exprs[*id];
+	next_param = scev->expr_stack[scev->stack_sz - 1].next_param;
+	num_params = op_params_num(expr->op);
+	if (num_params && scev->stack_sz == EXPR_STACK_DEPTH) {
+		*order = PRE | POST | DEPTH_LIMIT;
+		scev->stack_sz--;
+		return true;
+	}
+	if (next_param == 0)
+		*order |= PRE;
+	if (next_param == num_params)
+		*order |= POST;
+	if (next_param < num_params) {
+ 		scev->expr_stack[scev->stack_sz - 1].next_param++;
+		scev->expr_stack[scev->stack_sz].id = expr->params[next_param];
+		scev->expr_stack[scev->stack_sz].next_param = 0;
+		scev->stack_sz++;
+		return true;
+	}
+	scev->stack_sz--;
+	return true;
+}
+
 static void log_expr(struct bpf_verifier_env *env, u32 id)
 {
 	struct bpf_verifier_log *log = &env->log;
-	u32 next_param, num_params, stack_sz;
 	struct scev *scev = env->scev;
 	struct expr *expr;
 	const char *str;
+	u32 order;
 
-	scev->expr_print_stack[0].id = id;
-	scev->expr_print_stack[0].next_param = 0;
-	stack_sz = 1;
-	while (stack_sz) {
-		id = scev->expr_print_stack[stack_sz - 1].id;
+	scev->stack_sz = 0;
+	expr_stack_push(scev, id);
+	while (expr_next(scev, &id, &order)) {
 		expr = &scev->exprs[id];
-		next_param = scev->expr_print_stack[stack_sz - 1].next_param;
-		num_params = op_params_num(expr->op);
 		switch(expr->op) {
 		case UNKNOWN:
 			bpf_log(log, "?");
-			stack_sz--;
 			break;
 		case REG:
 			log_reg(env, expr->params[0]);
-			stack_sz--;
 			break;
 		case IMM:
 			bpf_log(log, "%lld", expr->imm);
-			stack_sz--;
 			break;
 		default:
-			if (next_param == 0) {
+			if (order & PRE) {
 				str = op_str(expr->op);
 				bpf_log(log, "(");
 				if (str)
@@ -187,22 +228,12 @@ static void log_expr(struct bpf_verifier_env *env, u32 id)
 				else
 					bpf_log(log, "bad-expr-op %x", expr->op);
 			}
-			if (next_param == num_params) {
-				bpf_log(log, ")");
-				stack_sz--;
-				break;
-			}
-			bpf_log(log, " ");
-			scev->expr_print_stack[stack_sz - 1].next_param++;
-			if (stack_sz < EXPR_PRINT_STACK_DEPTH) {
-				scev->expr_print_stack[stack_sz].id = expr->params[next_param];
-				scev->expr_print_stack[stack_sz].next_param = 0;
-				stack_sz++;
-			} else {
+			if (order & DEPTH_LIMIT)
 				bpf_log(log, "...");
-			}
-
+			if (order & POST)
+				bpf_log(log, ")");
 		}
+		bpf_log(log, " ");
 	}
 }
 
