@@ -843,6 +843,9 @@ struct bpf_verifier_env {
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
+	int cache_miss_frame;
+	int cache_miss_reg;
+	int cache_miss_spi;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -882,6 +885,15 @@ __printf(3, 4) void verbose_linfo(struct bpf_verifier_env *env,
 		BPF_WARN_ONCE(1, "verifier bug: " fmt "\n", ##args);				\
 		bpf_log(&env->log, "verifier bug: " fmt "\n", ##args);				\
 	})
+
+void bpf_print_reg_state(struct bpf_verifier_env *env,
+			 const struct bpf_func_state *state,
+			 const struct bpf_reg_state *reg);
+
+void bpf_print_stack_state(struct bpf_verifier_env *env,
+			   const struct bpf_func_state *fstate,
+			   struct bpf_stack_state *stack,
+			   int i);
 
 static inline struct bpf_func_state *cur_func(struct bpf_verifier_env *env)
 {

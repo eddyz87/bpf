@@ -19259,6 +19259,8 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 
 		spi = i / BPF_REG_SIZE;
 
+		env->cache_miss_spi = spi;
+
 		if (exact != NOT_EXACT &&
 		    (i >= cur->allocated_stack ||
 		     old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
@@ -19366,6 +19368,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			return false;
 		}
 	}
+	env->cache_miss_spi = -1;
 	return true;
 }
 
@@ -19451,11 +19454,14 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	if (old->callback_depth > cur->callback_depth)
 		return false;
 
-	for (i = 0; i < MAX_BPF_REG; i++)
+	for (i = 0; i < MAX_BPF_REG; i++) {
 		if (((1 << i) & live_regs) &&
 		    !regsafe(env, &old->regs[i], &cur->regs[i],
-			     &env->idmap_scratch, exact))
+			     &env->idmap_scratch, exact)) {
+			env->cache_miss_reg = i;
 			return false;
+		}
+	}
 
 	if (!stacksafe(env, old, cur, &env->idmap_scratch, exact))
 		return false;
@@ -19476,6 +19482,10 @@ static bool states_equal(struct bpf_verifier_env *env,
 {
 	u32 insn_idx;
 	int i;
+
+	env->cache_miss_frame = -1;
+	env->cache_miss_reg = -1;
+	env->cache_miss_spi = -1;
 
 	if (old->curframe != cur->curframe)
 		return false;
@@ -19501,8 +19511,10 @@ static bool states_equal(struct bpf_verifier_env *env,
 		insn_idx = frame_insn_idx(old, i);
 		if (old->frame[i]->callsite != cur->frame[i]->callsite)
 			return false;
-		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
+		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact)) {
+			env->cache_miss_frame = i;
 			return false;
+		}
 	}
 	return true;
 }
@@ -19708,6 +19720,32 @@ static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf
 	return false;
 }
 
+static void log_callchain(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+{
+	int i;
+
+	verbose(env, "(");
+	for (i = 0; i <= st->curframe; i++)
+		verbose(env, "%s%d", i ? ", " : "", frame_insn_idx(st, i));
+	verbose(env, ")");
+}
+
+static void log_miss_reg(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+{
+	int frame = env->cache_miss_frame;
+	int reg = env->cache_miss_reg;
+	int spi = env->cache_miss_spi;
+
+	if (frame < 0 || frame > st->curframe) {
+		verbose(env, "<bad miss frame>");
+		return;
+	}
+	if (reg >= 0)
+		bpf_print_reg_state(env, st->frame[frame], &st->frame[frame]->regs[reg]);
+	if (spi >= 0 && spi < st->frame[frame]->allocated_stack / BPF_REG_SIZE)
+		bpf_print_stack_state(env, st->frame[frame], &st->frame[frame]->stack[spi], spi);
+}
+
 static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
@@ -19875,6 +19913,10 @@ skip_inf_loop_check:
 hit:
 			sl->hit_cnt++;
 
+			verbose(env, "cache hit at ");
+			log_callchain(env, cur);
+			verbose(env, ": loop=%d\n", loop);
+
 			/* if previous state reached the exit with precision and
 			 * current state is equivalent to it (except precision marks)
 			 * the precision needs to be propagated back in
@@ -19977,6 +20019,20 @@ hit:
 			return 1;
 		}
 miss:
+		if ((env->log.level & BPF_LOG_LEVEL2) && same_callsites(cur, &sl->state)) {
+			verbose(env, "cache miss at ");
+			log_callchain(env, cur);
+			verbose(env, ": frame=%d, reg=%d, spi=%d, loop=%d",
+				env->cache_miss_frame, env->cache_miss_reg, env->cache_miss_spi, loop);
+			if (env->cache_miss_reg >= 0 || env->cache_miss_spi >= 0) {
+				verbose(env, " (cur: ");
+				log_miss_reg(env, cur);
+				verbose(env, ") vs (old: ");
+				log_miss_reg(env, &sl->state);
+				verbose(env, ")");
+			}
+			verbose(env, "\n");
+		}
 		/* when new state is not going to be added do not increase miss count.
 		 * Otherwise several loop iterations will remove the state
 		 * recorded earlier. The goal of these heuristics is to have
@@ -24906,6 +24962,7 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 	if (env->log.level & BPF_LOG_LEVEL2) {
 		verbose(env, "Live regs before insn:\n");
 		for (i = 0; i < insn_cnt; ++i) {
+			verbose_linfo(env, i, "    ; ");
 			if (env->insn_aux_data[i].scc)
 				verbose(env, "%3d ", env->insn_aux_data[i].scc);
 			else
