@@ -237,6 +237,19 @@ bool FN(is_subset)(struct cnum_t bigger, struct cnum_t smaller)
 	return smaller.base + smaller.size <= bigger.size;
 }
 
+struct cnum_t FN(intersect_linear)(struct cnum_t c, u16 base, u16 step)
+{
+	ut start = c.base, end = c.base + c.size;
+	ut s = start % step, e = end % step;
+	ut dstart = s > base ? base + step - s :  base - s;
+	ut dend = e < base ? e - base + step : e - base;
+
+	if (check_add_overflow(start, dstart, &start) ||
+	    check_sub_overflow(end, dend, &end))
+		return c;
+	return FN(intersect)(c, (struct cnum_t){ start, end - start });
+}
+
 #undef EMPTY
 #undef cnum_t
 #undef ut

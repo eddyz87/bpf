@@ -303,7 +303,9 @@ static bool range_within(const struct bpf_reg_state *old,
 			 const struct bpf_reg_state *cur)
 {
 	return cnum64_is_subset(old->r64, cur->r64) &&
-	       cnum32_is_subset(old->r32, cur->r32);
+	       cnum32_is_subset(old->r32, cur->r32) &&
+	       cur->step % old->step == 0 &&
+	       (cur->base - old->base) % old->step == 0;
 }
 
 /* If in the old state two registers had the same id, then they need to have

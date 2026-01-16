@@ -49,6 +49,7 @@ bool cnum32_is_empty(struct cnum32 cnum);
 struct cnum32 cnum32_add(struct cnum32 a, struct cnum32 b);
 struct cnum32 cnum32_negate(struct cnum32 a);
 bool cnum32_is_subset(struct cnum32 outer, struct cnum32 inner);
+struct cnum32 cnum32_intersect_linear(struct cnum32 c, u16 base, u16 step);
 
 /* Same as cnum32 but for 64-bit ranges */
 struct cnum64 {
@@ -75,6 +76,7 @@ bool cnum64_is_empty(struct cnum64 cnum);
 struct cnum64 cnum64_add(struct cnum64 a, struct cnum64 b);
 struct cnum64 cnum64_negate(struct cnum64 a);
 bool cnum64_is_subset(struct cnum64 outer, struct cnum64 inner);
+struct cnum64 cnum64_intersect_linear(struct cnum64 c, u16 base, u16 step);
 
 struct cnum32 cnum32_from_cnum64(struct cnum64 cnum);
 struct cnum64 cnum64_cnum32_intersect(struct cnum64 a, struct cnum32 b);
