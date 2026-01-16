@@ -8,6 +8,47 @@
 #define REGS_NUM (MAX_BPF_REG + 64)
 #define UNKNOWN_EXPR_ID 0
 
+// Plan
+// ====
+//
+// Integration with the main loop
+// ----------- ---- --- ---- ----
+//
+// New register representation [min, max, step].
+// At header widen according to computed SCEVs:
+// - for each register with SCEV
+// - if latch expression gives a bound for # of times backedge is taken
+// - if header == latch, # of times header is executed == # of times backedge is taken
+// - if header != latch, # of times header is executed == # of times backedge is taken + 1
+// - compute reg min and max using # of times header is executed using SCEV at header
+// - widen reg to [min, max, step]
+//
+// At latch:
+// - if SCEV at latch shows that register is monotonic
+// - if value of register has upper or lower bound (depending on a direction)
+// - schedule both back and out branches
+//
+// At header is_state_visited():
+// - if SCEV at header shows that register is monotonic
+// - if value of register has upper or lower bound (depending on a direction)
+// - allow converging to an old state
+//
+// Assumptions tracking
+// ----------- --------
+//
+// - A mapping loop_id -> non-spill slots in the verifier env
+// - When loop header is reached:
+//   - create a new state (force a checkpoint)
+//   - widen all registers for which stack mask is ok for loop_id
+//   - remember cumulative stack mask in the state
+// - Upon non-spill/fill stack access:
+//   - if current state has associated stack mask
+//   - if stack access violates this mask
+//   - find the forced checkpoint parent and redo widening with remaining ok registers/SCEVs
+//   - return -EAGAIN to signal do_check() that next state has to be popped from the stack
+// - in is_state_visited() evict old state if it's stack mask is invalid
+// - in pop_stack() skip old states if their stack masks are invalid
+
 // TODO: An alternative is to use bpf_insn as a whole, hijack the illegal opcode
 //         { .code = (BPF_LD | BPF_W | BPF_IMM), .imm = <custom-opcode> }
 //       for custom operations.
