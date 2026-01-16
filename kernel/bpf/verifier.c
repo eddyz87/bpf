@@ -30,6 +30,7 @@
 #include <net/xdp.h>
 #include <linux/trace_events.h>
 #include <linux/kallsyms.h>
+#include <linux/count_zeros.h>
 
 #include "disasm.h"
 
@@ -2179,6 +2180,9 @@ static void ___mark_reg_known(struct bpf_reg_state *reg, u64 imm)
 	reg->s32_max_value = (s32)imm;
 	reg->u32_min_value = (u32)imm;
 	reg->u32_max_value = (u32)imm;
+
+	reg->base = 0;
+	reg->step = 1;
 }
 
 /* Mark the unknown part of a register (variable offset or scalar value) as
@@ -2316,6 +2320,12 @@ static bool reg_is_init_pkt_pointer(const struct bpf_reg_state *reg,
 	return reg->type == which &&
 	       reg->id == 0 &&
 	       tnum_equals_const(reg->var_off, 0);
+}
+
+static void reg_step_reset(struct bpf_reg_state *reg)
+{
+	reg->base = 0;
+	reg->step = 1;
 }
 
 /* Reset the min/max bounds of a register */
@@ -2684,11 +2694,36 @@ static void __reg_deduce_mixed_bounds(struct bpf_reg_state *reg)
 	}
 }
 
+static void __deduce_bounds_from_step(struct bpf_reg_state *reg)
+{
+	u32 umin32 = reg->u32_min_value;
+	u32 umax32 = reg->u32_max_value;
+	u64 umin = reg->umin_value;
+	u64 umax = reg->umax_value;
+	u16 base = reg->base;
+	u16 step = reg->step;
+	u32 trailing_zero_bits;
+
+	// TODO: describe how you got these formulas
+	reg->umin_value += (umin > base) * (step - (umin - base) % step) % step;
+	reg->umax_value -= (umax > base) * (umax - base) % step;
+	reg->u32_min_value += (umin32 > base) * (step - (umin32 - base) % step) % step;
+	reg->u32_max_value -= (umax32 > base) * (umax32 - base) % step;
+
+	if (base == 0)
+		trailing_zero_bits = count_trailing_zeros(step);
+	else
+		trailing_zero_bits = min(count_trailing_zeros(base),
+					 count_trailing_zeros(step));
+	reg->var_off = tnum_and(reg->var_off, tnum_const(~0ULL << trailing_zero_bits));
+}
+
 static void __reg_deduce_bounds(struct bpf_reg_state *reg)
 {
 	__reg32_deduce_bounds(reg);
 	__reg64_deduce_bounds(reg);
 	__reg_deduce_mixed_bounds(reg);
+	__deduce_bounds_from_step(reg);
 }
 
 /* Attempts to improve var_off based on unsigned min/max information */
@@ -2768,6 +2803,7 @@ out:
 	if (env->test_reg_invariants)
 		return -EFAULT;
 	__mark_reg_unbounded(reg);
+	reg_step_reset(reg);
 	return 0;
 }
 
@@ -2810,6 +2846,7 @@ static void __mark_reg_unknown_imprecise(struct bpf_reg_state *reg)
 	reg->frameno = 0;
 	reg->precise = false;
 	__mark_reg_unbounded(reg);
+	reg_step_reset(reg);
 }
 
 /* Mark a register as having a completely unknown (scalar) value,
@@ -15921,6 +15958,39 @@ static int maybe_fork_scalars(struct bpf_verifier_env *env, struct bpf_insn *ins
 	return 0;
 }
 
+static void scalar_step_add(struct bpf_reg_state *dst_reg, struct bpf_reg_state *src_reg)
+{
+	u64 amount = src_reg->var_off.value;
+
+	if (tnum_is_const(src_reg->var_off))
+		dst_reg->base = (dst_reg->base + amount) % dst_reg->step;
+	else
+		reg_step_reset(dst_reg);
+}
+
+static void scalar_step_mul(struct bpf_reg_state *dst_reg, struct bpf_reg_state *src_reg)
+{
+	u64 amount = src_reg->var_off.value;
+
+	if (tnum_is_const(src_reg->var_off) && (s64)amount >= 0 &&
+	    !check_mul_overflow(dst_reg->step, amount, &dst_reg->step) &&
+	    dst_reg->step != 0)
+		dst_reg->base = (dst_reg->base * amount) % dst_reg->step;
+	else
+		reg_step_reset(dst_reg);
+}
+
+static void scalar_step_lsh(struct bpf_reg_state *dst_reg, struct bpf_reg_state *src_reg)
+{
+	u64 amount = src_reg->var_off.value;
+
+	if (tnum_is_const(src_reg->var_off) && amount <= 64 &&
+	    !check_mul_overflow(dst_reg->step, 1ull << amount, &dst_reg->step))
+		dst_reg->base = (dst_reg->base * (1ull << amount)) % dst_reg->step;
+	else
+		reg_step_reset(dst_reg);
+}
+
 /* WARNING: This function does calculations on 64-bit values, but the actual
  * execution may occur on 32-bit values. Therefore, things like bitshifts
  * need extra checks in the 32-bit case.
@@ -15965,11 +16035,13 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 		scalar32_min_max_add(dst_reg, &src_reg);
 		scalar_min_max_add(dst_reg, &src_reg);
 		dst_reg->var_off = tnum_add(dst_reg->var_off, src_reg.var_off);
+		scalar_step_add(dst_reg, &src_reg);
 		break;
 	case BPF_SUB:
 		scalar32_min_max_sub(dst_reg, &src_reg);
 		scalar_min_max_sub(dst_reg, &src_reg);
 		dst_reg->var_off = tnum_sub(dst_reg->var_off, src_reg.var_off);
+		reg_step_reset(dst_reg);
 		break;
 	case BPF_NEG:
 		env->fake_reg[0] = *dst_reg;
@@ -15977,11 +16049,13 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 		scalar32_min_max_sub(dst_reg, &env->fake_reg[0]);
 		scalar_min_max_sub(dst_reg, &env->fake_reg[0]);
 		dst_reg->var_off = tnum_neg(env->fake_reg[0].var_off);
+		reg_step_reset(dst_reg);
 		break;
 	case BPF_MUL:
 		dst_reg->var_off = tnum_mul(dst_reg->var_off, src_reg.var_off);
 		scalar32_min_max_mul(dst_reg, &src_reg);
 		scalar_min_max_mul(dst_reg, &src_reg);
+		scalar_step_mul(dst_reg, &src_reg);
 		break;
 	case BPF_DIV:
 		/* BPF div specification: x / 0 = 0 */
@@ -16024,6 +16098,7 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 		dst_reg->var_off = tnum_and(dst_reg->var_off, src_reg.var_off);
 		scalar32_min_max_and(dst_reg, &src_reg);
 		scalar_min_max_and(dst_reg, &src_reg);
+		reg_step_reset(dst_reg);
 		break;
 	case BPF_OR:
 		if (tnum_is_const(src_reg.var_off)) {
@@ -16034,29 +16109,34 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 		dst_reg->var_off = tnum_or(dst_reg->var_off, src_reg.var_off);
 		scalar32_min_max_or(dst_reg, &src_reg);
 		scalar_min_max_or(dst_reg, &src_reg);
+		reg_step_reset(dst_reg);
 		break;
 	case BPF_XOR:
 		dst_reg->var_off = tnum_xor(dst_reg->var_off, src_reg.var_off);
 		scalar32_min_max_xor(dst_reg, &src_reg);
 		scalar_min_max_xor(dst_reg, &src_reg);
+		reg_step_reset(dst_reg);
 		break;
 	case BPF_LSH:
 		if (alu32)
 			scalar32_min_max_lsh(dst_reg, &src_reg);
 		else
 			scalar_min_max_lsh(dst_reg, &src_reg);
+		scalar_step_lsh(dst_reg, &src_reg);
 		break;
 	case BPF_RSH:
 		if (alu32)
 			scalar32_min_max_rsh(dst_reg, &src_reg);
 		else
 			scalar_min_max_rsh(dst_reg, &src_reg);
+		reg_step_reset(dst_reg);
 		break;
 	case BPF_ARSH:
 		if (alu32)
 			scalar32_min_max_arsh(dst_reg, &src_reg);
 		else
 			scalar_min_max_arsh(dst_reg, &src_reg);
+		reg_step_reset(dst_reg);
 		break;
 	case BPF_END:
 		scalar_byte_swap(dst_reg, insn);
@@ -19453,6 +19533,18 @@ static int check_btf_info(struct bpf_verifier_env *env,
 static bool range_within(const struct bpf_reg_state *old,
 			 const struct bpf_reg_state *cur)
 {
+	/*
+	 * Both `old` and `cur` define some sets of points.
+	 * Return true, if points defined by `cur` are a subset of points defined by `old`:
+	 * - bounds for `cur` should be within bounds for `old`;
+	 * - cur->step should be dividable by old->step;
+	 * - cur->base should start at integer number of old->step
+	 *   steps from old->base.
+	 *
+	 * E.g. the following ranges are compatible:
+	 * - old [0, 10] step 2
+	 * - new [2, 10] step 4
+	 */
 	return old->umin_value <= cur->umin_value &&
 	       old->umax_value >= cur->umax_value &&
 	       old->smin_value <= cur->smin_value &&
@@ -19460,7 +19552,9 @@ static bool range_within(const struct bpf_reg_state *old,
 	       old->u32_min_value <= cur->u32_min_value &&
 	       old->u32_max_value >= cur->u32_max_value &&
 	       old->s32_min_value <= cur->s32_min_value &&
-	       old->s32_max_value >= cur->s32_max_value;
+	       old->s32_max_value >= cur->s32_max_value &&
+	       cur->step % old->step == 0 &&
+	       (cur->base - old->base) % old->step == 0;
 }
 
 /* If in the old state two registers had the same id, then they need to have
