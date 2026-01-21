@@ -16322,6 +16322,26 @@ clear_id:
 	return 0;
 }
 
+int bpf_inc_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 amount,
+		      u16 base, u16 step)
+{
+	struct bpf_reg_state *fake_reg = &env->fake_reg[0];
+
+	__mark_reg_unknown_imprecise(fake_reg);
+	fake_reg->umin_value = 0;
+	fake_reg->umax_value = amount;
+	reg_bounds_sync(fake_reg);
+
+	scalar32_min_max_add(reg, fake_reg);
+	scalar_min_max_add(reg, fake_reg);
+	reg->var_off = tnum_add(reg->var_off, fake_reg->var_off);
+	reg->base = base;
+	reg->step = step;
+	reg_bounds_sync(reg);
+
+	return reg_bounds_sanity_check(env, reg, "bpf_reg_init_with_range");
+}
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
