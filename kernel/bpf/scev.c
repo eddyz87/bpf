@@ -921,6 +921,7 @@ static void mark_latches(struct bpf_verifier_env *env)
 		if (!loop)
 			continue;
 		aux[i].need_scev = true;
+		aux[i].prune_point = true;
 		for (j = 0; j < loop->backedges_cnt; j++) {
 			latch = loop->backedges[j].latch;
 			if (latch >= 0) {
@@ -1167,4 +1168,290 @@ int bpf_init_scev(struct bpf_verifier_env *env)
 nomem:
 	bpf_free_scev(env);
 	return -ENOMEM;
+}
+
+static struct bpf_reg_state *scev_regno_to_reg(struct bpf_func_state *st, u32 r)
+{
+	int spi, slots_available;
+
+	if (r < MAX_BPF_REG)
+		return &st->regs[r];
+
+	slots_available = st->allocated_stack / BPF_REG_SIZE;
+	spi = r - MAX_BPF_REG;
+	if (spi < slots_available)
+		return &st->stack[spi].spilled_ptr;
+
+	WARN(1, "SCEV register %d spi %d points outside of allocated stack (%d slots)\n",
+	     r, spi, slots_available);
+	return NULL;
+}
+
+/*
+ * Latch is a condition deciding if execution remains inside a loop.
+ * Linear latch represents a condition 'if <reg> <op> <loop invariant> goto <loop-header>',
+ * where equation '<base> + i * <step> <op> <bound>' describes values taken by register <reg>,
+ * 'i' is the loop iteration number, starting from 0.
+ */
+struct linear_latch {
+	u32 base_expr;
+	u32 step_expr;
+	u32 bound_expr;
+	u32 reg_expr;
+	u32 reg;
+	u32 op;
+};
+
+static bool loop_invariant(struct scev *scev, u32 id)
+{
+	s64 imm;
+	u32 reg;
+
+	// TODO: recursively traverse expressions
+	return is_reg(scev, id, &reg) || is_imm(scev, id, &imm);
+}
+
+static int match_linear_latch(struct bpf_verifier_env *env,
+			      u32 latch_idx,
+			      struct linear_latch *latch)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[latch_idx];
+	struct env *latch_env = env->scev->envs[latch_idx];
+	struct scev *scev = env->scev;
+	u32 true_branch_tgt;
+	u32 l, r, op, base;
+	u32 src_reg_scev;
+	u32 dst_reg_scev;
+	int id;
+
+	// TODO: 32-bit variant
+	if (BPF_CLASS(insn->code) != BPF_JMP)
+		return false;
+	op = BPF_OP(insn->code);
+	/* Flip the condition if true branch jumps out of the loop */
+	true_branch_tgt = latch_idx + bpf_jmp_offset(insn) + 1;
+	if (bpf_loop_at_index(env, true_branch_tgt) != bpf_loop_at_index(env, latch_idx))
+		op = bpf_rev_opcode(op);
+	// TODO: signed variants
+	switch (op) {
+	case BPF_JLT:
+	case BPF_JLE:
+	case BPF_JGT:
+	case BPF_JGE:
+	case BPF_JNE:
+		break;
+	default:
+		return false;
+	}
+
+	latch->op = op;
+
+	// TODO: this assumes linear dst < invariant src
+	//          handle invariant dst < linear src
+	dst_reg_scev = latch_env->reg2scev[insn->dst_reg];
+	src_reg_scev = latch_env->reg2scev[insn->src_reg];
+	if (!is_linear(scev, dst_reg_scev, &base, &latch->step_expr))
+		return false;
+
+	if (BPF_SRC(insn->code) == BPF_K) {
+		id = imm_expr(scev, insn->imm);
+		if (id < 0)
+			return id;
+		latch->bound_expr = id;
+	} else {
+		latch->bound_expr = src_reg_scev;
+	}
+
+	if (is_reg(scev, base, &latch->reg)) {
+		id = imm_expr(scev, 0);
+		if (id < 0)
+			return id;
+		latch->base_expr = id;
+		latch->reg_expr = base;
+	} else if (is_add(scev, base, &l, &r) && // TODO: is_sub
+		   is_reg(scev, l, &latch->reg)) {
+		latch->base_expr = r;
+		latch->reg_expr = l;
+	} else {
+		return false;
+	}
+
+	if (!loop_invariant(scev, latch->base_expr) ||
+	    !loop_invariant(scev, latch->step_expr) ||
+	    !loop_invariant(scev, latch->bound_expr))
+		return false;
+
+	return true;
+}
+
+static bool eval_expr(struct scev *scev, struct bpf_func_state *st, u32 id, s64 *result)
+{
+	struct bpf_reg_state *reg;
+	u32 regno;
+	s64 imm;
+
+	if (is_reg(scev, id, &regno)) {
+		reg = scev_regno_to_reg(st, regno);
+		if (tnum_is_const(reg->var_off)) {
+			*result = reg->var_off.value;
+			return true;
+		}
+	} else if (is_imm(scev, id, &imm)) {
+		*result = imm;
+		return true;
+	}
+	return false;
+}
+
+static bool compute_max_iters(struct bpf_verifier_env *env,
+			      struct bpf_func_state *st,
+			      struct linear_latch *latch,
+			      u64 *max_iters)
+{
+	struct scev *scev = env->scev;
+	s64 base, step, diff, bound, initial;
+	u8 op = latch->op;
+
+	// TODO: group base_expr and reg_expr as a one thing: (+ reg base)
+	//       in eval_expr() support the addition op.
+	if (!eval_expr(scev, st, latch->base_expr, &base) ||
+	    !eval_expr(scev, st, latch->step_expr, &step) ||
+	    !eval_expr(scev, st, latch->bound_expr, &bound) ||
+	    !eval_expr(scev, st, latch->reg_expr, &initial))
+		return false;
+
+	diff = bound - base - initial; // TODO: check overflow
+	if (step == 0) // TODO: still can infer 0 or inf
+		return false;
+
+	if (step < 0) {
+		/* Multiply both sides of the equation by -1, e.g. -2*i > -3 becomes 2*i < 3 */
+		op = bpf_flip_opcode(op);
+		step = -step; // TODO: check overflow
+		diff = -diff; // TODO: check overflow
+	}
+	switch (latch->op) {
+	case BPF_JLT:
+		*max_iters = diff <= 0 ? 0 : (diff - 1) / step;
+		break;
+	case BPF_JLE:
+		*max_iters = diff <  0 ? 0 : diff / step;
+		break;
+	case BPF_JGT:
+		*max_iters = diff >= 0 ? 0 : U64_MAX;
+		break;
+	case BPF_JGE:
+		*max_iters = diff >  0 ? 0 : U64_MAX;
+		break;
+	case BPF_JNE:
+		*max_iters = diff % step ? U64_MAX : max(0, diff / step - 1);
+		break;
+	default:
+		return false;
+	}
+
+	/*
+	 *   while (i < 10) {             do {
+	 *     i++;               vs        i++;
+	 *   }                            } while (i < 10);
+	 */
+	if (base != 0)
+		*max_iters += 1;
+
+	return true;
+}
+
+static void mark_scev_reg_scratched(struct bpf_verifier_env *env, u32 r)
+{
+		if (r < MAX_BPF_REG)
+			mark_reg_scratched(env, r);
+		else
+			mark_stack_slot_scratched(env, r - __MAX_BPF_REG);
+}
+
+int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	struct bpf_reg_state *reg;
+	struct env *header_env;
+	struct bpf_loop *loop;
+	struct linear_latch latch;
+	u32 r, base, base_reg, slope;
+	int latch_idx, linear_latch;
+	s64 slope_imm;
+	u64 max_iters;
+	bool widened;
+
+	/* If insn_idx is a loop header for a loop with a single backedge */
+	loop = aux[insn_idx].loop;
+	if (!loop || loop->irreducible || loop->backedges_cnt != 1)
+		return 0;
+
+	/* If this backedge has a latch */
+	latch_idx = loop->backedges[0].latch;
+	if (latch_idx < 0)
+		return 0;
+
+	linear_latch = match_linear_latch(env, latch_idx, &latch);
+	if (linear_latch < 0)
+		return linear_latch;
+
+	if (!linear_latch) {
+		if (log->level & BPF_LOG_LEVEL2)
+			bpf_log(log, "loop header at %d, non-linear latch at %d\n",
+				insn_idx, latch_idx);
+		return 0;
+	}
+
+	if (!compute_max_iters(env, st, &latch, &max_iters)) {
+		if (log->level & BPF_LOG_LEVEL2)
+			bpf_log(log, "loop header at %d, can't compute iterations count\n", insn_idx);
+		return 0;
+	}
+
+	if (max_iters == U64_MAX) {
+		if (log->level & BPF_LOG_LEVEL2)
+			bpf_log(log, "loop header at %d, inf iterations count\n", insn_idx);
+		return 0;
+	}
+
+	if (log->level & BPF_LOG_LEVEL2)
+		bpf_log(log, "loop header at %d, iterations count is %llu\n", insn_idx, max_iters);
+
+	widened = false;
+	header_env = scev->envs[insn_idx];
+	for (r = 0; r < REGS_NUM; r++) {
+		u64 reg_base, reg_step;
+
+		/* If SCEV for r is (linear <reg> <slope>)*/
+		if (!is_linear(scev, header_env->reg2scev[r], &base, &slope) ||
+		    !is_reg(scev, base, &base_reg) ||
+		    !is_imm(scev, slope, &slope_imm) || // TODO: match loop invariants here
+		    slope_imm > U16_MAX)
+			continue;
+
+		if (r == latch.reg)
+			widened = true;
+
+		reg = scev_regno_to_reg(st, r);
+		if (reg->type != SCALAR_VALUE)
+			continue;
+		if (reg->umin_value == reg->umax_value) {
+			reg_step = slope_imm;
+			reg_base = reg->umax_value % reg_step;
+		} else {
+			reg_step = 1;
+			reg_base = 0;
+		}
+		bpf_inc_reg_range(env, reg, slope_imm * max_iters /* TODO: check overflow */, reg_base, reg_step);
+		if (log->level & BPF_LOG_LEVEL2) {
+			bpf_log(log, "loop header at %d, widening ", insn_idx);
+			log_reg(env, r);
+			bpf_log(log, " by %lld\n", slope_imm * max_iters);
+		}
+		mark_scev_reg_scratched(env, r);
+	}
+	return widened ? 1 : 0;
 }
