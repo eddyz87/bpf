@@ -146,4 +146,154 @@ __naked void nested_loop1(void)
 	: __clobber_all);
 }
 
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("entering loop 1")
+__msg("loop header at 1, iterations count is 9")
+__msg("loop header at 1, widening r0 by 9")
+__msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=9,var_off=(0x0; 0xf))")
+__msg("2: (a5) if r0 < 0xa goto pc-2         ; R0=10")
+__msg("3: (95) exit")
+
+__msg("from 2 to 1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=9,var_off=(0x0; 0xf))")
+__msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=9,var_off=(0x0; 0xf))")
+__msg("1: (07) r0 += 1")
+__msg("2: safe")
+__msg("processed 6 insns")
+__naked void loop_jlt_latch_post(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 < 10 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, iterations count is 7")
+__msg("loop header at 1, widening r0 by 7")
+__msg("processed 6 insns")
+__naked void loop_jlt_latch_post_with_base(void)
+{
+	asm volatile ("					\
+	r0 = 2;						\
+1:	r0 += 1;					\
+	if r0 < 10 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, iterations count is 10")
+__msg("loop header at 1, widening r0 by 10")
+__msg("processed 6 insns")
+__naked void loop_jle_latch_post(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 <= 10 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, iterations count is 9")
+__msg("loop header at 1, widening r0 by 9")
+__msg("processed 6 insns")
+__naked void loop_jne_latch_post(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 != 10 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, iterations count is 9")
+__msg("loop header at 1, widening r0 by 9")
+__msg("processed 9 insns")
+__naked void loop_jge_latch_pre(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	if r0 >= 10 goto 2f;				\
+	r0 += 1;					\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, iterations count is 9")
+__msg("loop header at 1, widening r0 by 9")
+__msg("processed 7 insns")
+__naked void loop_jge_latch_post(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 >= 10 goto 2f;				\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, iterations count is 9")
+__msg("loop header at 1, widening r0 by 9")
+__msg("processed 9 insns")
+__naked void loop_jeq_latch_pre(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	if r0 == 10 goto 2f;				\
+	r0 += 1;					\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, iterations count is 10")
+__msg("loop header at 1, widening r0 by 10")
+__msg("processed 9 insns")
+__naked void loop_jgt_latch_pre(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	if r0 > 10 goto 2f;				\
+	r0 += 1;					\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+
 char _license[] SEC("license") = "GPL";

@@ -17153,14 +17153,10 @@ static bool has_exited_loop(struct bpf_verifier_env *env)
 	int prev_loop_idx;
 	u32 i;
 
-	verbose(env, "has_exited_loop: prev_insn_idx = %d, insn_idx = %d\n",
-		prev_insn_idx, insn_idx);
 	if (prev_insn_idx == -1)
 		return false;
 
 	prev_loop_idx = bpf_loop_at_index(env, prev_insn_idx);
-	verbose(env, "has_exited_loop: prev_loop_idx = %d\n",
-		prev_loop_idx);
 	if (prev_loop_idx < 0)
 		return false;
 
