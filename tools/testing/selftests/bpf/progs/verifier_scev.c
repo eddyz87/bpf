@@ -4,6 +4,18 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include "bpf_misc.h"
+
+struct map_val {
+	char foo[1024];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct map_val);
+} map SEC(".maps");
+
 SEC("xdp")
 __success
 __log_level(2)
@@ -15,6 +27,31 @@ __naked void simple_loop1(void)
 loop_%=:						\
 	if r0 == 10 goto exit_%=;			\
 	r0 += 1;					\
+	goto loop_%=;					\
+exit_%=:						\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__msg("8: (7b) *(u64 *)(r1 +0) = r0         ; def: fp0-8 may_def: fp0-8")
+__msg("at 8 invalidating SCEVs for *fp-8 because of indirect write")
+__naked void indirect_write_invalidates_scev(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u64 *)(r10 - 8) = r0;				\
+loop_%=:						\
+	r0 = *(u64 *)(r10 - 8);				\
+	if r0 == 10 goto exit_%=;			\
+	r0 += 1;					\
+	*(u64 *)(r10 - 8) = r0;				\
+	r1 = r10;					\
+	r1 += -8;					\
+	*(u64 *)(r1 + 0) = r0;				\
 	goto loop_%=;					\
 exit_%=:						\
 	r0 = 0;						\
@@ -93,7 +130,6 @@ __naked void meet_disagrees(void)
 }
 
 SEC("xdp")
-__failure
 __log_level(2)
 __msg("scev at header 1: r6=(bswap32 (bswap32 (zext32 (- (- (zext32 (+ (>>...) 1))))))) / ?")
 __naked void expr_chain(void)
@@ -140,6 +176,491 @@ __naked void nested_loop1(void)
 	goto 1b;					\
 2:							\
 	r0 = r7;					\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 10 post-cond")
+__msg("loop header at 1, widening r0 to 0..9 alignment 0")
+__msg("processed 6 insns")
+__naked void post_cond_jlt(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 < 10 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 8")
+__msg("loop header at 1, widening r0 to 2..9 alignment 0")
+__msg("1: R0=scalar(smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=9,{{.*}})")
+__msg("processed 6 insns")
+__naked void post_cond_jlt_with_base(void)
+{
+	asm volatile ("					\
+	r0 = 2;						\
+1:	r0 += 1;					\
+	if r0 < 10 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 11")
+__msg("loop header at 1, widening r0 to 0..10 alignment 0")
+__msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=10,{{.*}})") // TODO: __msg_next
+__msg("processed 6 insns")
+__naked void post_cond_jle(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 <= 10 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 10")
+__msg("loop header at 1, widening r0 to 0..9 alignment 0")
+__msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=9,{{.*}})")
+__msg("processed 7 insns")
+__naked void post_cond_jge(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 >= 10 goto 2f;				\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 11")
+__msg("loop header at 1, widening r0 to 0..10 alignment 0")
+__msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=10,{{.*}})")
+__msg("processed 10 insns")
+__naked void pre_cond_jge(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	if r0 >= 10 goto 2f;				\
+	r0 += 1;					\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 2 post-cond")
+__naked void post_cond_jgt(void)
+{
+	asm volatile ("					\
+	r0 = 2;						\
+1:	r0 += -1;					\
+	if r0 > 0 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("scev at header 1: r0=(+ r0 1) / (linear r0 1)")
+__msg(" scev at latch 2: r0=(+ r0 1) / (linear (+ r0 1) 1)")
+__msg("      latch at 2: (55) if r0 != 0x3 goto pc-2")
+__msg("loop header at 1, widening r0")
+__msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=2,{{.*}})")
+__msg("1: (07) r0 += 1                       ; R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,{{.*}})")
+__msg("2: (55) if r0 != 0x3 goto pc-2")
+__msg("3: (95) exit")
+__msg("loop header at 1, clamping r0")
+__msg("from 2 to 1:")
+__msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=2,{{.*}})")
+__msg("1: (07) r0 += 1")
+__msg("2: safe")
+__msg("processed 6 insns")
+__naked void post_cond_jne(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 != 3 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("scev at header 1: r0=(+ r0 -1) / (linear r0 -1)")
+__msg(" scev at latch 2: r0=(+ r0 -1) / (linear (+ r0 -1) -1)")
+__msg("loop header at 1, header_count is 3 post-cond")
+__msg("loop header at 1, widening r0 to 1..3 alignment 0")
+__msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,var_off=(0x0; 0x3)) loop_stack=1")
+__msg("loop header at 1, clamping r0 to 1..2 alignment 0")
+__msg("processed 6 insns")
+__naked void post_cond_jne_neg_step(void)
+{
+	asm volatile ("					\
+	r0 = 3;						\
+1:	r0 += -1;					\
+	if r0 != 0 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("scev at header 1: r0=(+ r0 1) / (linear r0 1)")
+__msg(" scev at latch 1: r0=(+ r0 1) / (linear r0 1)")
+__msg("      latch at 1: (15) if r0 == 0x3 goto pc+2")
+__msg("loop header at 1, widening r0")
+__msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=3,{{.*}})")
+__msg("1: (15) if r0 == 0x3 goto pc+2        ; R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=2,{{.*}})")
+__msg("2: (07) r0 += 1                       ; R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,{{.*}})")
+__msg("3: (05) goto pc-3")
+__msg("loop header at 1, clamping r0")
+__msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,{{.*}})")
+__msg("1: (15) if r0 == 0x3 goto pc+2        ; R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=2,{{.*}})")
+__msg("2: (07) r0 += 1                       ; R0=scalar(smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=3,{{.*}})")
+__msg("3: (05) goto pc-3")
+__msg("1: safe")
+__msg("from 1 to 4: R0=3")
+__msg("4: R0=3")
+__msg("4: (95) exit")
+__msg("processed 10 insns")
+__naked void pre_cond_je1(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	if r0 == 3 goto 2f;				\
+	r0 += 1;					\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is [0..3] post-cond")
+__naked void one_backedge_two_exits(void)
+{
+	asm volatile ("					\
+	r6 = 0;						\
+1:	call %[bpf_get_prandom_u32];			\
+	if r0 == 0 goto 2f;				\
+	r6 += 1;					\
+	if r6 != 3 goto 1b;				\
+2:	r0 = r6;					\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("scev at header 11: r0=(+ r0 1) / (linear r0 1) r1=(+ r1 2) / (linear r1 2) r2=(+ r6 (linear r1 2)) / ?")
+__msg(" scev at latch 16: r0=(+ r0 1) / (linear (+ r0 1) 1) r1=(+ r1 2) / (linear (+ r1 2) 2) r2=(+ r6 r1) / (+ r6 (linear r1 2))")
+__msg("      latch at 16: (a5) if r0 < 0x8 goto pc-6")
+__msg("loop header at 11, widening r0")
+__msg("loop header at 11, widening r1")
+__msg("11: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=7,var_off=(0x0; 0x7)) R1=scalar(smin=smin32=0,smax=umax=smax32=umax32=14,var_off=(0x0; 0xe))")
+/* loop exit */
+__msg("16: (a5) if r0 < 0x8 goto pc-6")
+__msg("exiting loop 11")
+/* TODO: after finalize loop regs is done, match that r0 is 8 and r1 is 16 at the loop exit */
+__msg("17: (95) exit")
+/* second iteration (checkpoint is at latch) */
+__msg("loop header at 11, clamping r0")
+__msg("loop header at 11, clamping r1")
+__msg("11: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=7,var_off=(0x0; 0x7)) R1=scalar(smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=14,var_off=(0x0; 0xe))")
+/* iteration convergence */
+__msg("16: safe")
+__not_msg("{{^}}11:")
+/* map lookup error path */
+__msg("from 7 to 17: R0=0")
+__msg("17: R0=0")
+__msg("17: (95) exit")
+__naked void correlated_regs(void)
+{
+	asm volatile ("					\
+	r1 = 0;						\
+	*(u64*)(r10 - 8) = r1;				\
+	r2 = r10;					\
+	r2 += -8;					\
+	r1 = %[map] ll;					\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == 0 goto 2f;				\
+	r6 = r0;					\
+	r0 = 0;						\
+	r1 = 0;						\
+1:	r2 = r6;					\
+	r2 += r1;					\
+	*(u8 *)(r2 + 0) = 1;				\
+	r0 += 1;					\
+	r1 += 2;					\
+	if r0 < 8 goto 1b;				\
+2:	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map)
+	: __clobber_all);
+}
+
+/*
+ * k = 0
+ * for (i = 0; i < 4; i++):
+ *   for (j = 0; j < 4; j++):
+ *     k += 1
+ *     k <<= 1   // make SCEV construction not possible
+ *     k >>= 1
+ * map[k] = 1    // make k precise
+ */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("19: (72) *(u8 *)(r4 +0) = 1           ; R4=map_value(id={{.*}},map=map,ks=4,vs=1024,imm=16)")
+__not_msg("19: ")
+__msg("processed 106 insns")
+__naked void nested_loops_precise_var1(void)
+{
+	asm volatile ("					\
+	*(u64*)(r10 - 8) = 0;				\
+	r1 = %[map] ll;					\
+	r2 = r10;					\
+	r2 += -8;					\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == 0 goto 3f;				\
+	r1 = 0;						\
+	r3 = 0;						\
+	/* outer loop */				\
+1:	r2 = 0;						\
+	/* inner loop */				\
+2:	r2 += 1;					\
+	r3 += 1;					\
+	r3 <<= 1;					\
+	r3 >>= 1;					\
+	if r2 < 4 goto 2b;				\
+	r1 += 1;					\
+	if r1 < 4 goto 1b;				\
+	r4 = r0;					\
+	r4 += r3;					\
+	*(u8 *)(r4 + 0) = 1;				\
+	r0 = 0;						\
+3:	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 1 pre-cond")
+__naked void pre_cond_jgt(void)
+{
+	asm volatile ("					\
+	r0 = -1;					\
+1:	if r0 > 1 goto 2f;				\
+	r0 += 1;					\
+	goto 1b;					\
+2:	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 2 post-cond")
+__naked void loop_jslt_latch_post(void)
+{
+	asm volatile ("					\
+	r0 = -2;					\
+1:	r0 += 1;					\
+	if r0 s< 0 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 1 post-cond")
+__naked void loop_jslt_latch_post1(void)
+{
+	asm volatile ("					\
+	r0 = -1;					\
+1:	r0 += 1;					\
+	if r0 s< 0 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, 0 iterations count")
+__naked void loop_jslt_latch_post2(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+1:	r0 += 1;					\
+	if r0 s< 0 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 3 post-cond")
+__naked void loop_jsle_latch_post(void)
+{
+	asm volatile ("					\
+	r0 = -2;					\
+1:	r0 += 1;					\
+	if r0 s<= 0 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__msg("loop header at 2, header_count is 100 post-cond")
+__msg("loop header at 4, header_count is [0..100] post-cond")
+__msg("loop header at 6, header_count is [0..100] post-cond")
+__msg("processed 26 insns")
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void nested_loop_with_two_exits(void)
+{
+	asm volatile ("					\
+	call %[bpf_get_prandom_u32];			\
+	r6 = 0;						\
+1:	r6 += 1;					\
+	r7 = 0;						\
+2:	r7 += 1;					\
+	r8 = 0;						\
+3:	r8 += 1;					\
+	call %[bpf_get_prandom_u32];			\
+	if r0 == 42 goto +1;				\
+	goto 4f;					\
+	if r8 < 100 goto 3b;				\
+	if r7 < 100 goto 2b;				\
+4:	if r6 < 100 goto 1b;				\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__naked void exit_loop_into_loop_header(void)
+{
+	asm volatile ("					\
+	r1 = 0;						\
+	r2 = 0;						\
+loop_a_%=:						\
+	r1 += 1;					\
+	if r1 < 10 goto loop_a_%=;			\
+loop_b_%=:						\
+	r2 += 1;					\
+	if r2 < 10 goto loop_b_%=;			\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/*
+ * This exercises verifier.c:loop_stack_{pop,push}() implementation,
+ * at 'goto d' loops 'b' and 'a' have to be popped from stack,
+ * while loops 'c' and 'd' have to be pushed to stack.
+ *
+ *   loop a:                  // header 5
+ *     loop b:                // header 6
+ *       if (rand) goto d;    // 8 -> 12, side entry into inner loop d
+ *       ...
+ *   loop c:                  // header 11
+ *     loop d:                // header 12
+ *       ...
+ */
+SEC("xdp")
+__log_level(2)
+__msg("loop at 5")
+__msg("loop at 6 nested in 5")
+__msg("loop at 11 irreducible")
+__msg("loop at 12 nested in 11")
+/* entry via if r0 == 5 goto d_%= false branch */
+__msg("loop header at 12, header_count is 3 post-cond")
+__msg("loop header at 12, widening r9 to 0..2 alignment 0")
+__msg("12: R8=1 R9=scalar(smin=smin32=0,smax=umax=smax32=umax32=2,var_off=(0x0; 0x3)) loop_stack=11,12")
+/* entry via if r0 == 5 goto d_%= true branch */
+__msg("loop header at 12, header_count is 3 post-cond")
+__msg("loop header at 12, widening r9 to 0..2 alignment 0")
+__msg("from 8 to 12: R8=0 R9=scalar(smin=smin32=0,smax=umax=smax32=umax32=2,var_off=(0x0; 0x3)) R10=fp0 loop_stack=11,12")
+__naked void enter_nested_loop_from_side(void)
+{
+	asm volatile ("					\
+	call %[bpf_get_prandom_u32];			\
+	r6 = 0;						\
+	r7 = 0;						\
+	r8 = 0;						\
+	r9 = 0;						\
+a_%=:	r6 += 1;					\
+b_%=:	r7 += 1;					\
+	call %[bpf_get_prandom_u32];			\
+	if r0 == 5 goto d_%=;				\
+	if r7 < 3 goto b_%=;				\
+	if r6 < 3 goto a_%=;				\
+c_%=:	r8 += 1;					\
+d_%=:	r9 += 1;					\
+	if r9 < 3 goto d_%=;				\
+	if r8 < 3 goto c_%=;				\
+	r0 = 0;						\
 	exit;						\
 "	:
 	: __imm(bpf_get_prandom_u32)
