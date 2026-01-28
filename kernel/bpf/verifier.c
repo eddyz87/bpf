@@ -20678,9 +20678,6 @@ miss:
 	if (env->bpf_capable)
 		mark_all_scalars_imprecise(env, cur);
 
-	/* find singular ids and clear them */
-	clear_singular_ids(env, cur);
-
 	/* add new state to the head of linked list */
 	new = &new_sl->state;
 	err = copy_verifier_state(new, cur);
@@ -20699,6 +20696,8 @@ miss:
 		kfree(new_sl);
 		return err;
 	}
+	/* find singular ids and clear them */
+	clear_singular_ids(env, new);
 
 	cur->parent = new;
 	cur->first_insn_idx = insn_idx;
