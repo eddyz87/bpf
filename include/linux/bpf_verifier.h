@@ -1643,6 +1643,8 @@ int bpf_compute_idoms(struct bpf_verifier_env *env);
 int bpf_compute_loops(struct bpf_verifier_env *env);
 int bpf_loop_at_index(struct bpf_verifier_env *env, u32 idx);
 bool bpf_is_nested_loop(struct bpf_verifier_env *env, int inner_header, int outer_header);
+int bpf_flip_opcode(u32 opcode);
+u8 bpf_rev_opcode(u8 opcode);
 
 /*
  * Simple binary heap implementation as described by
