@@ -1642,4 +1642,7 @@ int bpf_jit_subprogs(struct bpf_verifier_env *env);
 int bpf_fixup_call_args(struct bpf_verifier_env *env);
 int bpf_do_misc_fixups(struct bpf_verifier_env *env);
 
+int bpf_flip_opcode(u32 opcode);
+u8 bpf_rev_opcode(u8 opcode);
+
 #endif /* _LINUX_BPF_VERIFIER_H */
