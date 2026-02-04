@@ -1440,8 +1440,6 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
 			widened = true;
 
 		reg = scev_regno_to_reg(st, r);
-		if (reg->type != SCALAR_VALUE)
-			continue;
 		if (cnum64_is_const(reg->r64)) {
 			reg_step = slope_imm;
 			reg_base = reg_umax(reg) % reg_step;
@@ -1489,8 +1487,6 @@ int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
 
 		entry_reg = scev_regno_to_reg(entry_st, r);
 		reg = scev_regno_to_reg(st, r);
-		if (reg->type != SCALAR_VALUE)
-			continue;
 
 		// TODO: handle negative cases, swap min and max if necessary
 		umax_value = reg_umax(entry_reg) + slope_imm * max_iters;
