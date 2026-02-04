@@ -4,6 +4,18 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include "bpf_misc.h"
+
+struct map_val {
+	char foo[48];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct map_val);
+} map SEC(".maps");
+
 SEC("xdp")
 __success
 __log_level(2)
@@ -295,5 +307,34 @@ __naked void loop_jgt_latch_pre(void)
 "	::: __clobber_all);
 }
 
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void loop_correlated_regs(void)
+{
+	asm volatile ("					\
+	r1 = 0;						\
+	*(u64*)(r10 - 8) = r1;				\
+	r2 = r10;					\
+	r2 += -8;					\
+	r1 = %[map] ll;					\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == 0 goto 2f;				\
+	r6 = r0;					\
+	r0 = 0;						\
+	r1 = 0;						\
+1:	r2 = r6;					\
+	r2 += r1;					\
+	*(u8 *)(r2 + 0) = 1;				\
+	r0 += 1;					\
+	r1 += 2;					\
+	if r0 < 8 goto 1b;				\
+2:	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map)
+	: __clobber_all);
+}
 
 char _license[] SEC("license") = "GPL";
