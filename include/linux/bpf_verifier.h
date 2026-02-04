@@ -1135,6 +1135,7 @@ void bpf_fmt_stack_mask(char *buf, ssize_t buf_sz, u64 stack_mask);
 bool bpf_calls_callback(struct bpf_verifier_env *env, int insn_idx);
 void bpf_verbose_insn(struct bpf_verifier_env *env, struct bpf_insn *insn);
 int bpf_inc_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 amount, u16 base, u16 step);
+int bpf_clamp_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 min, u64 max);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);
