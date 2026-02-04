@@ -921,7 +921,7 @@ static void mark_latches(struct bpf_verifier_env *env)
 		if (!loop)
 			continue;
 		aux[i].need_scev = true;
-		aux[i].prune_point = true;
+		aux[i].force_checkpoint = true;
 		for (j = 0; j < loop->backedges_cnt; j++) {
 			latch = loop->backedges[j].latch;
 			if (latch >= 0) {
@@ -1369,7 +1369,8 @@ static void mark_scev_reg_scratched(struct bpf_verifier_env *env, u32 r)
 			mark_stack_slot_scratched(env, r - __MAX_BPF_REG);
 }
 
-int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx)
+int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx,
+			u32 *pmax_iters)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_verifier_log *log = &env->log;
@@ -1420,6 +1421,8 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
 	if (log->level & BPF_LOG_LEVEL2)
 		bpf_log(log, "loop header at %d, iterations count is %llu\n", insn_idx, max_iters);
 
+	*pmax_iters = max_iters;
+
 	widened = false;
 	header_env = scev->envs[insn_idx];
 	for (r = 0; r < REGS_NUM; r++) {
@@ -1454,4 +1457,49 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
 		mark_scev_reg_scratched(env, r);
 	}
 	return widened ? 1 : 0;
+}
+
+int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx,
+			struct bpf_verifier_state *entry_state, u32 max_iters)
+{
+	struct bpf_func_state *entry_st = entry_state->frame[entry_state->curframe];
+	struct bpf_verifier_log *log = &env->log;
+	struct bpf_reg_state *reg, *entry_reg;
+	struct scev *scev = env->scev;
+	struct env *header_env;
+	u32 r, base, base_reg, slope;
+	u64 umax_value;
+	s64 slope_imm;
+
+	if (entry_state->curframe != st->frameno) {
+		verifier_bug(env, "clamping registers for a wrong frame: %d vs %d\n",
+			     entry_state->curframe, st->frameno);
+		return -EFAULT;
+	}
+
+	header_env = scev->envs[insn_idx];
+	for (r = 0; r < REGS_NUM; r++) {
+		/* If SCEV for r is (linear <reg> <slope>)*/
+		if (!is_linear(scev, header_env->reg2scev[r], &base, &slope) ||
+		    !is_reg(scev, base, &base_reg) ||
+		    !is_imm(scev, slope, &slope_imm) || // TODO: match loop invariants here
+		    slope_imm > U16_MAX)
+			continue;
+
+		entry_reg = scev_regno_to_reg(entry_st, r);
+		reg = scev_regno_to_reg(st, r);
+		if (reg->type != SCALAR_VALUE)
+			continue;
+
+		// TODO: handle negative cases, swap min and max if necessary
+		umax_value = entry_reg->umax_value + slope_imm * max_iters;
+		bpf_clamp_reg_range(env, reg, entry_reg->umin_value, umax_value);
+		if (log->level & BPF_LOG_LEVEL2) {
+			bpf_log(log, "loop header at %d, clamping ", insn_idx);
+			log_reg(env, r);
+			bpf_log(log, " to %lld\n", slope_imm * max_iters);
+		}
+		mark_scev_reg_scratched(env, r);
+	}
+	return 0;
 }

@@ -21275,6 +21275,17 @@ static bool has_entered_loop(struct bpf_verifier_env *env)
 		bpf_loop_at_index(env, prev_insn_idx) != bpf_loop_at_index(env, insn_idx));
 }
 
+static bool is_next_loop_iteration(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int prev_insn_idx = env->prev_insn_idx;
+	int insn_idx = env->insn_idx;
+
+	return aux[insn_idx].loop &&
+	       (prev_insn_idx != -1 &&
+		bpf_loop_at_index(env, prev_insn_idx) == bpf_loop_at_index(env, insn_idx));
+}
+
 static bool has_exited_loop(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
@@ -21304,7 +21315,8 @@ static bool has_exited_loop(struct bpf_verifier_env *env)
 	return false;
 }
 
-static int loop_stack_push(struct bpf_verifier_env *env, bool terminates)
+static int loop_stack_push(struct bpf_verifier_env *env,
+			   struct bpf_verifier_state *entry_state, bool terminates, u32 max_iters)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 	u32 cnt = cur->loop_stack_cnt;
@@ -21314,6 +21326,8 @@ static int loop_stack_push(struct bpf_verifier_env *env, bool terminates)
 		verbose(env, "Too many nested loops (%d) at %d", cnt, env->insn_idx);
 		return -E2BIG;
 	}
+	cur->loop_stack[cnt].entry_state = entry_state;
+	cur->loop_stack[cnt].max_iters = max_iters;
 	cur->loop_stack[cnt].loop_id = bpf_loop_at_index(env, env->insn_idx);
 	cur->loop_stack[cnt].terminates = terminates;
 	cur->loop_stack_cnt++;
@@ -21332,6 +21346,23 @@ static int loop_stack_pop(struct bpf_verifier_env *env)
 	return 0;
 }
 
+static int maybe_clamp_scev_regs(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct loop_stack_entry *entry;
+
+	if (cur->loop_stack_cnt == 0) {
+		verifier_bug(env, "%s: loop stack empty at %d", __FUNCTION__, env->insn_idx);
+		return -EFAULT;
+	}
+
+	entry = &cur->loop_stack[cur->loop_stack_cnt - 1];
+	if (!entry->terminates)
+		return 0;
+
+	return bpf_clamp_scev_regs(env, cur_func(env), env->insn_idx, entry->entry_state, entry->max_iters);
+}
+
 static int do_check(struct bpf_verifier_env *env)
 {
 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
@@ -21340,6 +21371,7 @@ static int do_check(struct bpf_verifier_env *env)
 	int insn_cnt = env->prog->len;
 	bool do_print_state = false;
 	int prev_insn_idx = -1;
+	u32 max_iters;
 
 	for (;;) {
 		struct bpf_insn *insn;
@@ -21368,6 +21400,12 @@ static int do_check(struct bpf_verifier_env *env)
 
 		state->last_insn_idx = env->prev_insn_idx;
 		state->insn_idx = env->insn_idx;
+
+		if (is_next_loop_iteration(env)) {
+			err = maybe_clamp_scev_regs(env);
+			if (err)
+				return err;
+		}
 
 		if (is_prune_point(env, env->insn_idx)) {
 			err = is_state_visited(env, env->insn_idx);
@@ -21411,10 +21449,10 @@ static int do_check(struct bpf_verifier_env *env)
 		if (has_entered_loop(env)) {
 			if (env->log.level & BPF_LOG_LEVEL2)
 				verbose(env, "entering loop %d\n", bpf_loop_at_index(env, env->insn_idx));
-			err = bpf_widen_scev_regs(env, cur_func(env), env->insn_idx);
+			err = bpf_widen_scev_regs(env, cur_func(env), env->insn_idx, &max_iters);
 			if (err < 0)
 				return err;
-			err = loop_stack_push(env, err > 0);
+			err = loop_stack_push(env, env->cur_state->parent, err > 0, max_iters);
 			if (err)
 				return err;
 		}
