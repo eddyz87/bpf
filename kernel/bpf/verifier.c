@@ -14811,6 +14811,13 @@ int bpf_inc_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u
 	return reg_bounds_sanity_check(env, reg, "bpf_reg_init_with_range");
 }
 
+int bpf_clamp_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 tgt_min, u64 tgt_max)
+{
+	cnum64_intersect_with_urange(&reg->r64, tgt_min, tgt_max);
+	reg_bounds_sync(reg);
+	return reg_bounds_sanity_check(env, reg, "bpf_clamp_reg_range");
+}
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
