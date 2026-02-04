@@ -473,6 +473,8 @@ struct bpf_jmp_history_entry {
 };
 
 struct loop_stack_entry {
+	struct bpf_verifier_state *entry_state;
+	u32 max_iters;
 	u32 loop_id:31;
 	u32 terminates:1;
 };
@@ -1626,6 +1628,8 @@ bool bpf_min_heap_pop(struct bpf_min_heap *heap, int *elt);
 int bpf_init_scev(struct bpf_verifier_env *env);
 void bpf_free_scev(struct bpf_verifier_env *env);
 int bpf_compute_scev(struct bpf_verifier_env *env);
-int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx);
+int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx, u32 *pmax_iters);
+int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx,
+			struct bpf_verifier_state *entry_state, u32 max_iters);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
