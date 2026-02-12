@@ -637,10 +637,12 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		return range_within(rold, rcur) &&
 		       tnum_in(rold->var_off, rcur->var_off);
 	case PTR_TO_STACK:
-		/* two stack pointers are equal only if they're pointing to
-		 * the same stack frame, since fp-8 in foo != fp-8 in bar
-		 */
-		return regs_exact(rold, rcur, idmap) && rold->frameno == rcur->frameno;
+		return memcmp(rold, rcur, offsetof(struct bpf_reg_state, var_off)) == 0 &&
+		       range_within(rold, rcur) &&
+		       tnum_in(rold->var_off, rcur->var_off) &&
+		       check_ids(rold->id, rcur->id, idmap) &&
+		       check_ids(rold->parent_id, rcur->parent_id, idmap) &&
+		       rold->frameno == rcur->frameno;
 	case PTR_TO_ARENA:
 		return true;
 	case PTR_TO_INSN:
