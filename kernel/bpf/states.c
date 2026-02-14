@@ -983,6 +983,7 @@ static bool loop_stack_safe(struct bpf_verifier_state *old, struct bpf_verifier_
 		if (old_stack[i].loop_id == cur_stack[i].loop_id &&
 		    old_stack[i].iters.max_header_count == cur_stack[i].iters.max_header_count &&
 		    old_stack[i].iters.pre_cond == cur_stack[i].iters.pre_cond &&
+		    old_stack[i].iters_left >= cur_stack[i].iters_left &&
 		    old_stack[i].terminates == cur_stack[i].terminates)
 			continue;
 		return false;
@@ -1386,15 +1387,13 @@ int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				goto skip_inf_loop_check;
 			}
 
-			// TODO: would it be safe to check this for 'cur'
-			//       and ignore 'loop_stack' in 'is_state_visited'?
 			/*
 			 * If old state belongs to a control flow loop that we know terminates,
 			 * it should be safe to prune current state.
 			 */
-			if (sl->state.loop_stack_cnt &&
-			    sl->state.loop_stack[sl->state.loop_stack_cnt - 1].terminates) {
+			if (at_terminating_loop_latch(env, &sl->state)) {
 				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+					verbose(env, "states_equal: loop converges at %d\n", insn_idx);
 					loop = true;
 					goto hit;
 				}

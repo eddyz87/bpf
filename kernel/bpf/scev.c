@@ -887,6 +887,7 @@ static void mark_latches(struct bpf_verifier_env *env)
 			if (latch >= 0) {
 				aux[latch].need_scev = true;
 				aux[latch].is_latch = true;
+				aux[latch].force_checkpoint = true;
 			}
 		}
 	}
@@ -1523,6 +1524,52 @@ int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *cur
 			bpf_log(log, " to %lld\n", umax_value);
 		}
 		mark_scev_reg_scratched(env, r);
+	}
+	return 0;
+}
+
+int bpf_finalize_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *cur_func_st,
+			   struct bpf_verifier_state *entry_state, struct bpf_loop_iters *iters)
+{
+	struct bpf_func_state *entry_st = entry_state->frame[entry_state->curframe];
+	struct bpf_verifier_log *log = &env->log;
+	struct bpf_reg_state *reg, *entry_reg;
+	struct scev *scev = env->scev;
+	struct env *header_env;
+	u32 r, base, base_reg, slope;
+	u64 umin, umax;
+	s64 slope_imm;
+	int err;
+
+	if (entry_state->curframe != cur_func_st->frameno) {
+		verifier_bug(env, "finalizing registers for a wrong frame: %d vs %d\n",
+			     entry_state->curframe, cur_func_st->frameno);
+		return -EFAULT;
+	}
+
+	header_env = scev->envs[entry_state->insn_idx];
+	for (r = 0; r < REGS_NUM; r++) {
+		if (!is_linear(scev, header_env->reg2scev[r], &base, &slope) ||
+		    !is_reg(scev, base, &base_reg) ||
+		    !is_imm(scev, slope, &slope_imm) ||
+		    slope_imm > U16_MAX)
+			continue;
+
+		entry_reg = scev_regno_to_reg(entry_st, r);
+		reg = scev_regno_to_reg(cur_func_st, r);
+		// TODO: check overflow
+		umin = reg_umin(entry_reg) + slope_imm * (iters->min_header_count - iters->pre_cond);
+		umax = reg_umax(entry_reg) + slope_imm * (iters->max_header_count - iters->pre_cond);
+		err = bpf_reg_set_range(env, reg, umin, umax);
+		if (err)
+			return err;
+		mark_scev_reg_scratched(env, r);
+		if (log->level & BPF_LOG_LEVEL2) {
+			bpf_log(log, "exiting loop %d at %d, adjusting ",
+				bpf_loop_at_index(env, entry_state->insn_idx), env->insn_idx);
+			log_reg(env, r);
+			bpf_log(log, "\n");
+		}
 	}
 	return 0;
 }
