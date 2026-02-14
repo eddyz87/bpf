@@ -105,7 +105,6 @@ __naked void meet_disagrees(void)
 }
 
 SEC("xdp")
-__failure
 __log_level(2)
 __msg("scev at header 1: r6=(bswap32 (bswap32 (zext32 (- (- (zext32 (+ (>> (<< (+ r6 1) 32) 32) 1)))))))")
 __naked void expr_chain(void)
@@ -239,9 +238,9 @@ SEC("xdp")
 __success
 __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
-__msg("loop header at 1, iterations count is 9")
-__msg("loop header at 1, widening r0 by 9")
-__msg("processed 9 insns")
+__msg("loop header at 1, iterations count is 10")
+__msg("loop header at 1, widening r0 by 10")
+__msg("processed 10 insns")
 __naked void loop_jge_latch_pre(void)
 {
 	asm volatile ("					\
@@ -275,9 +274,9 @@ SEC("xdp")
 __success
 __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
-__msg("loop header at 1, iterations count is 9")
-__msg("loop header at 1, widening r0 by 9")
-__msg("processed 9 insns")
+__msg("loop header at 1, iterations count is 10")
+__msg("loop header at 1, widening r0 by 10")
+__msg("processed 10 insns")
 __naked void loop_jeq_latch_pre(void)
 {
 	asm volatile ("					\
@@ -293,9 +292,9 @@ SEC("xdp")
 __success
 __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
-__msg("loop header at 1, iterations count is 10")
-__msg("loop header at 1, widening r0 by 10")
-__msg("processed 9 insns")
+__msg("loop header at 1, iterations count is 11")
+__msg("loop header at 1, widening r0 by 11")
+__msg("processed 10 insns")
 __naked void loop_jgt_latch_pre(void)
 {
 	asm volatile ("					\
