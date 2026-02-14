@@ -20246,6 +20246,26 @@ static void reset_idmap_scratch(struct bpf_verifier_env *env)
 	idmap->cnt = 0;
 }
 
+static bool loop_stack_safe(struct bpf_verifier_state *old, struct bpf_verifier_state *cur)
+{
+	struct loop_stack_entry *old_stack = old->loop_stack;
+	struct loop_stack_entry *cur_stack = cur->loop_stack;
+	u32 i;
+
+	if (old->loop_stack_cnt != cur->loop_stack_cnt)
+		return false;
+
+	for (i = 0; i < old->loop_stack_cnt; i++) {
+		if (old_stack[i].loop_id == cur_stack[i].loop_id &&
+		    old_stack[i].max_iters == cur_stack[i].max_iters &&
+		    old_stack[i].terminates == cur_stack[i].terminates)
+			continue;
+		return false;
+	}
+
+	return true;
+}
+
 static bool states_equal(struct bpf_verifier_env *env,
 			 struct bpf_verifier_state *old,
 			 struct bpf_verifier_state *cur,
@@ -20257,6 +20277,7 @@ static bool states_equal(struct bpf_verifier_env *env,
 	env->cache_miss_frame = -1;
 	env->cache_miss_reg = -1;
 	env->cache_miss_spi = -1;
+	env->cache_miss_loop_stack = -1;
 
 	if (old->curframe != cur->curframe)
 		return false;
@@ -20289,10 +20310,10 @@ static bool states_equal(struct bpf_verifier_env *env,
 	}
 	env->cache_miss_frame = -1;
 
-	if (old->loop_stack_cnt != cur->loop_stack_cnt ||
-	    memcmp(old->loop_stack, cur->loop_stack,
-		   old->loop_stack_cnt * sizeof(*old->loop_stack)) != 0)
+	if (!loop_stack_safe(old, cur)) {
+		env->cache_miss_loop_stack = 1;
 		return false;
+	}
 
 	return true;
 }
@@ -20818,7 +20839,7 @@ hit:
 			return 1;
 		}
 miss:
-		if ((env->log.level & BPF_LOG_LEVEL2) && same_callsites(cur, &sl->state)) {
+		if ((env->log.level & BPF_LOG_LEVEL2) && same_callsites(cur, &sl->state) && env->cache_miss_frame != -2) {
 			verbose(env, "cache miss at ");
 			log_callchain(env, cur);
 			verbose(env, ": frame=%d, reg=%d, spi=%d, loop=%d",
@@ -20830,6 +20851,8 @@ miss:
 				log_miss_reg(env, &sl->state);
 				verbose(env, ")");
 			}
+			if (env->cache_miss_loop_stack == 1)
+				verbose(env, " loop_stack differs");
 			verbose(env, "\n");
 		}
 		/* when new state is not going to be added do not increase miss count.
