@@ -1321,7 +1321,7 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 	    !eval_expr(scev, st, latch->reg_expr, &initial))
 		return false;
 
-	diff = bound - base - initial; // TODO: check overflow
+	diff = bound - initial; // TODO: check overflow
 	if (step == 0) // TODO: still can infer 0 or inf
 		return false;
 
@@ -1333,10 +1333,10 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 	}
 	switch (latch->op) {
 	case BPF_JLT:
-		*max_iters = diff <= 0 ? 0 : (diff - 1) / step;
+		*max_iters = diff <= 0 ? 0 : DIV_ROUND_UP(diff, step);
 		break;
 	case BPF_JLE:
-		*max_iters = diff <  0 ? 0 : diff / step;
+		*max_iters = diff <  0 ? 0 : diff / step + 1;
 		break;
 	case BPF_JGT:
 		*max_iters = diff >= 0 ? 0 : U64_MAX;
@@ -1345,7 +1345,7 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 		*max_iters = diff >  0 ? 0 : U64_MAX;
 		break;
 	case BPF_JNE:
-		*max_iters = diff % step ? U64_MAX : max(0, diff / step - 1);
+		*max_iters = diff % step ? U64_MAX : max(0, DIV_ROUND_UP(diff, step));
 		break;
 	default:
 		return false;
@@ -1357,7 +1357,7 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 	 *   }                            } while (i < 10);
 	 */
 	if (base != 0)
-		*max_iters += 1;
+		*max_iters -= 1;
 
 	return true;
 }
