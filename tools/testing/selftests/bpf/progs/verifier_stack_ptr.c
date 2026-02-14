@@ -533,4 +533,37 @@ __naked void stack_check_size_512_with_may_goto(void)
 }
 #endif
 
+/* Verify that old PTR_TO_STACK state is considered a super-set of
+ * new PTR_TO_STACK state when new variable range is a sub-range
+ * of the old range, e.g. old [-64, -8] vs new [-56, -8].
+ */
+SEC("socket")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+/* first pass through the loop body after SCEV widening:
+ * r7 has the full widened range [-64, -8]
+ */
+__msg("R7=fp(smin=smin32=-64,smax=smax32=-8")
+/* back-edge from insn 5 to loop header insn 3 */
+__msg("from 5 to 3:")
+/* second pass: r7 has a narrower sub-range [-56, -8] */
+__msg("R7=fp(smin=smin32=-56,smax=smax32=-8")
+/* state at insn 5 is pruned because [-56, -8] ⊂ [-64, -8] */
+__msg("5: safe")
+__msg("processed 11 insns")
+__naked void stack_ptr_subrange_in_loop(void)
+{
+	asm volatile ("					\
+	r7 = r10;					\
+	r7 += -72;					\
+	r6 = 0;						\
+	r7 += 8;					\
+	r6 += 1;					\
+	if r6 < 8 goto -3;				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
