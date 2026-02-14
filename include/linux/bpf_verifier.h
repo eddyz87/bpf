@@ -1045,9 +1045,11 @@ struct bpf_verifier_env {
 	int cache_miss_frame;
 	int cache_miss_reg;
 	int cache_miss_spi;
+
 	int cache_miss_refsafe;
 	int cache_miss_cb_depth;
 	int cache_miss_in_sleepable;
+	int cache_miss_loop_stack;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
