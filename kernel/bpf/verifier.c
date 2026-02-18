@@ -14648,11 +14648,30 @@ int bpf_inc_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u
 	return reg_bounds_sanity_check(env, reg, "bpf_reg_init_with_range");
 }
 
+int bpf_reg_set_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 umin, u64 umax)
+{
+	__mark_reg_unbounded(reg);
+	reg->var_off = tnum_unknown;
+	cnum64_intersect_with_urange(&reg->r64, umin, umax);
+	reg_bounds_sync(reg);
+	return reg_bounds_sanity_check(env, reg, "bpf_reg_set_range");
+}
+
 int bpf_clamp_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 tgt_min, u64 tgt_max)
 {
-	cnum64_intersect_with_urange(&reg->r64, tgt_min, tgt_max);
+	struct cnum64 new_range = cnum64_intersect(reg->r64,
+						   cnum64_from_urange(tgt_min, tgt_max));
+
+	__mark_reg_unbounded(reg);
+	reg->var_off = tnum_unknown;
+	reg->r64 = new_range;
 	reg_bounds_sync(reg);
-	return reg_bounds_sanity_check(env, reg, "bpf_clamp_reg_range");
+	int err = reg_bounds_sanity_check(env, reg, "bpf_clamp_reg_range");
+	if (err) {
+		verbose(env, "bpf_clamp_reg_range invariants violation tgt_min=%llu, umin=%llu, tgt_max=%llu, umax=%llu\n",
+			tgt_min, reg_umin(reg), tgt_max, reg_umax(reg));
+	}
+	return err;
 }
 
 /* check validity of 32-bit and 64-bit arithmetic operations */
@@ -15179,6 +15198,60 @@ static int is_pkt_ptr_branch_taken(struct bpf_reg_state *dst_reg,
 	return -1;
 }
 
+bool at_terminating_loop_latch(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct loop_stack_entry *cur_loop;
+
+	if (!st->loop_stack_cnt)
+		return false;
+
+	cur_loop = &st->loop_stack[st->loop_stack_cnt - 1];
+	return aux[st->insn_idx].is_latch &&
+	       cur_loop->terminates &&
+	       bpf_loop_at_index(env, st->insn_idx) == cur_loop->loop_id;
+}
+
+static struct loop_stack_entry *cur_loop_entry(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *state = env->cur_state;
+
+	if (state->loop_stack_cnt)
+		return &state->loop_stack[state->loop_stack_cnt - 1];
+
+	return NULL;
+}
+
+static int is_loop_latch_taken(struct bpf_verifier_env *env)
+{
+	struct loop_stack_entry *cur_loop = cur_loop_entry(env);
+	bool fallthrough_is_backedge;
+	u32 min_max_gap;
+
+	if (!at_terminating_loop_latch(env, env->cur_state))
+		return -1;
+
+	/*
+	 * E.g. if loop iterates from 3 to 5 times, on iteration #4
+         * it is uncertain which latch branch will be taken.
+	 */
+	min_max_gap = cur_loop->iters.max_header_count - cur_loop->iters.min_header_count;
+	if (0 < cur_loop->iters_left && cur_loop->iters_left < min_max_gap)
+		return -1;
+
+	fallthrough_is_backedge = bpf_loop_at_index(env, env->insn_idx + 1) == cur_loop->loop_id;
+	if (env->log.level & BPF_LOG_LEVEL2) {
+		verbose(env, "is_loop_latch_taken: backedge direction: %s, iters_left: %u\n",
+			     fallthrough_is_backedge ? "fallthrough" : "goto", cur_loop->iters_left);
+	}
+	if (fallthrough_is_backedge)
+		/* fallthrough branch is a backedge */
+		return cur_loop->iters_left == 0;
+	else
+		/* true branch is a backedge */
+		return cur_loop->iters_left > 0;
+}
+
 /* compute branch direction of the expression "if (<reg1> opcode <reg2>) goto target;"
  * and return:
  *  1 - branch will be taken and "goto target" will be executed
@@ -15189,6 +15262,12 @@ static int is_pkt_ptr_branch_taken(struct bpf_reg_state *dst_reg,
 static int is_branch_taken(struct bpf_verifier_env *env, struct bpf_reg_state *reg1,
 			   struct bpf_reg_state *reg2, u8 opcode, bool is_jmp32)
 {
+	int loop_taken;
+
+	loop_taken = is_loop_latch_taken(env);
+	if (loop_taken >= 0)
+		return loop_taken;
+
 	if (reg_is_pkt_pointer_any(reg1) && reg_is_pkt_pointer_any(reg2) && !is_jmp32)
 		return is_pkt_ptr_branch_taken(reg1, reg2, opcode);
 
@@ -17118,7 +17197,9 @@ static bool has_exited_loop(struct bpf_verifier_env *env)
 }
 
 static int loop_stack_push(struct bpf_verifier_env *env,
-			   struct bpf_verifier_state *entry_state, bool terminates, u32 max_iters)
+			   struct bpf_verifier_state *entry_state,
+			   bool terminates,
+			   struct bpf_loop_iters *iters)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 	u32 cnt = cur->loop_stack_cnt;
@@ -17129,7 +17210,8 @@ static int loop_stack_push(struct bpf_verifier_env *env,
 		return -E2BIG;
 	}
 	cur->loop_stack[cnt].entry_state = entry_state;
-	cur->loop_stack[cnt].max_iters = max_iters;
+	cur->loop_stack[cnt].iters = terminates ? *iters : (struct bpf_loop_iters){};
+	cur->loop_stack[cnt].iters_left = terminates ? (iters->max_header_count - 1) : 0;
 	cur->loop_stack[cnt].loop_id = bpf_loop_at_index(env, env->insn_idx);
 	cur->loop_stack[cnt].terminates = terminates;
 	cur->loop_stack_cnt++;
@@ -17162,7 +17244,25 @@ static int maybe_clamp_scev_regs(struct bpf_verifier_env *env)
 	if (!entry->terminates)
 		return 0;
 
-	return bpf_clamp_scev_regs(env, cur_func(env), env->insn_idx, entry->entry_state, entry->max_iters);
+	return bpf_clamp_scev_regs(env, cur_func(env), env->insn_idx, entry->entry_state, &entry->iters);
+}
+
+static int push_loop_exit_state(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[env->insn_idx];
+	struct loop_stack_entry *cur_loop = cur_loop_entry(env);
+	struct bpf_verifier_state *st;
+	u32 loop_exit_idx;
+
+	if (bpf_loop_at_index(env, env->insn_idx + 1) == cur_loop->loop_id)
+		loop_exit_idx = env->insn_idx + bpf_jmp_offset(insn) + 1;
+	else
+		loop_exit_idx = env->insn_idx + 1;
+	st = push_stack(env, loop_exit_idx, env->insn_idx, false);
+	if (IS_ERR(st))
+		return PTR_ERR(st);
+	verbose(env, "push_loop_exit_state at %d, exiting to %d\n", env->insn_idx, loop_exit_idx);
+	return bpf_finalize_scev_regs(env, st->frame[st->curframe], cur_loop->entry_state, &cur_loop->iters);
 }
 
 static int do_check(struct bpf_verifier_env *env)
@@ -17170,10 +17270,11 @@ static int do_check(struct bpf_verifier_env *env)
 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_insn *insns = env->prog->insnsi;
+	struct loop_stack_entry *cur_loop;
+	struct bpf_loop_iters iters;
 	int insn_cnt = env->prog->len;
 	bool do_print_state = false;
 	int prev_insn_idx = -1;
-	u32 max_iters;
 
 	for (;;) {
 		struct bpf_insn *insn;
@@ -17207,6 +17308,25 @@ static int do_check(struct bpf_verifier_env *env)
 			err = maybe_clamp_scev_regs(env);
 			if (err)
 				return err;
+			cur_loop = cur_loop_entry(env);
+			if (!cur_loop) {
+				verifier_bug(env, "at %d on the next loop iteration, but the loop stack is empty\n",
+					     env->insn_idx);
+				return -EFAULT;
+			}
+			if (cur_loop->loop_id != env->insn_idx) {
+				verifier_bug(env, "at %d on the next loop iteration, unexpected loop entry top: %d\n",
+					     env->insn_idx, cur_loop->loop_id);
+				return -EFAULT;
+			}
+			if (cur_loop->terminates) {
+				if (cur_loop->iters_left == 0) {
+					verifier_bug(env, "at %d on the next loop iteration, iters_left is 0\n",
+						     env->insn_idx);
+					return -EFAULT;
+				}
+				cur_loop->iters_left--;
+			}
 		}
 
 		if (bpf_is_prune_point(env, env->insn_idx)) {
@@ -17214,7 +17334,14 @@ static int do_check(struct bpf_verifier_env *env)
 			if (err < 0)
 				return err;
 			if (err == 1) {
+				verbose(env, "is_state_visited converges, at latch in cur? %d\n",
+					at_terminating_loop_latch(env, env->cur_state));
 				/* found equivalent state, can prune the search */
+				if (at_terminating_loop_latch(env, env->cur_state)) {
+					err = push_loop_exit_state(env);
+					if (err)
+						return err;
+				}
 				if (env->log.level & BPF_LOG_LEVEL) {
 					if (do_print_state)
 						verbose(env, "\nfrom %d to %d%s: safe\n",
@@ -17251,10 +17378,10 @@ static int do_check(struct bpf_verifier_env *env)
 		if (has_entered_loop(env)) {
 			if (env->log.level & BPF_LOG_LEVEL2)
 				verbose(env, "entering loop %d\n", bpf_loop_at_index(env, env->insn_idx));
-			err = bpf_widen_scev_regs(env, cur_func(env), env->insn_idx, &max_iters);
+			err = bpf_widen_scev_regs(env, cur_func(env), env->insn_idx, &iters);
 			if (err < 0)
 				return err;
-			err = loop_stack_push(env, env->cur_state->parent, err > 0, max_iters);
+			err = loop_stack_push(env, env->cur_state->parent, err > 0, &iters);
 			if (err)
 				return err;
 		}
