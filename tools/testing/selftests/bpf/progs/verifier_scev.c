@@ -6,7 +6,7 @@
 #include "bpf_misc.h"
 
 struct map_val {
-	char foo[48];
+	char foo[1024];
 };
 
 struct {
@@ -332,6 +332,96 @@ __naked void loop_correlated_regs(void)
 2:	exit;						\
 "	:
 	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map)
+	: __clobber_all);
+}
+
+/*
+ * k = 0
+ * for (i = 0; i < 4; i++):
+ *   for (j = 0; j < 4; j++):
+ *     k += 1
+ *     k <<= 1   // make SCEV construction not possible
+ *     k >>= 1
+ * map[k] = 1    // make k precise
+ */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void nested_loops_precise_var1(void)
+{
+	asm volatile ("					\
+	*(u64*)(r10 - 8) = 0;				\
+	r1 = %[map] ll;					\
+	r2 = r10;					\
+	r2 += -8;					\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == 0 goto 3f;				\
+	r1 = 0;						\
+	r3 = 0;						\
+	/* outer loop */				\
+1:	r2 = 0;						\
+	/* inner loop */				\
+2:	r2 += 1;					\
+	r3 += 1;					\
+	r3 <<= 1;					\
+	r3 >>= 1;					\
+	if r2 < 4 goto 2b;				\
+	r1 += 1;					\
+	if r1 < 4 goto 1b;				\
+	r4 = r0;					\
+	r4 += r3;					\
+	*(u8 *)(r4 + 0) = 1;				\
+	r0 = 0;						\
+3:	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(map)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void nested_loops_precise_var2(void)
+{
+	asm volatile ("					\
+	*(u64*)(r10 - 8) = 0;				\
+	r1 = %[map] ll;					\
+	r2 = r10;					\
+	r2 += -8;					\
+	call %[bpf_map_lookup_elem];			\
+	if r0 == 0 goto 7f;				\
+	r9 = r0;					\
+	r6 = 0;						\
+	r8 = 0;						\
+	/* outer loop */				\
+1:	r7 = 0;						\
+	/* inner loop #1 */				\
+2:	r7 += 1;					\
+	call %[bpf_get_prandom_u32];			\
+	if r0 != 42 goto +1;				\
+	r8 += 1;					\
+	if r7 < 4 goto 2b;				\
+	r7 = 0;						\
+	/* inner loop #2 */				\
+3:	r7 += 1;					\
+	call %[bpf_get_prandom_u32];			\
+	if r0 != 42 goto +1;				\
+	r8 += 1;					\
+	if r7 < 4 goto 3b;				\
+	r6 += 1;					\
+	if r6 < 4 goto 1b;				\
+	r0 = r9;					\
+	r0 += r8;					\
+	*(u8 *)(r0 + 0) = 1;				\
+	r0 = 0;						\
+7:	exit;						\
+"	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm(bpf_get_prandom_u32),
 	  __imm_addr(map)
 	: __clobber_all);
 }
