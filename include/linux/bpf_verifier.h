@@ -363,9 +363,16 @@ struct bpf_jmp_history_entry {
 	u64 linked_regs;
 };
 
+struct bpf_loop_iters {
+	u32 min_header_count;   /* min number of times header is executed */
+	u32 max_header_count;   /* max number of times header is executed */
+	bool pre_cond;
+};
+
 struct loop_stack_entry {
 	struct bpf_verifier_state *entry_state;
-	u32 max_iters;
+	struct bpf_loop_iters iters;
+	u32 iters_left;
 	u32 loop_id:31;
 	u32 terminates:1;
 };
@@ -1152,6 +1159,7 @@ bool bpf_calls_callback(struct bpf_verifier_env *env, int insn_idx);
 void bpf_verbose_insn(struct bpf_verifier_env *env, struct bpf_insn *insn);
 int bpf_inc_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 amount, u16 base, u16 step);
 int bpf_clamp_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 min, u64 max);
+int bpf_reg_set_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 umin, u64 umax);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);
@@ -1191,8 +1199,12 @@ bool bpf_min_heap_pop(struct bpf_min_heap *heap, int *elt);
 int bpf_init_scev(struct bpf_verifier_env *env);
 void bpf_free_scev(struct bpf_verifier_env *env);
 int bpf_compute_scev(struct bpf_verifier_env *env);
-int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx, u32 *pmax_iters);
+
+int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx,
+			struct bpf_loop_iters *iters);
 int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx,
-			struct bpf_verifier_state *entry_state, u32 max_iters);
+			struct bpf_verifier_state *entry_state, struct bpf_loop_iters *iters);
+int bpf_finalize_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
+			   struct bpf_verifier_state *entry_state, struct bpf_loop_iters *iters);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
