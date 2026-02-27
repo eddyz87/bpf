@@ -324,8 +324,8 @@ __msg("loop header at 1, clamping r0")
 __msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=2,{{.*}})")
 __msg("1: (07) r0 += 1")
 __msg("2: safe")
-__msg("from 2 to 3: R0=P3 R1=ctx()")
-__msg("3: R0=P3 R1=ctx()")
+__msg("from 2 to 3: R0=3 R1=ctx()")
+__msg("3: R0=3 R1=ctx()")
 __msg("3: (95) exit")
 __msg("processed 6 insns")
 __naked void post_cond_jne1(void)
@@ -374,6 +374,25 @@ __naked void pre_cond_je1(void)
 	goto 1b;					\
 2:	exit;						\
 "	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void one_backedge_two_exits(void)
+{
+	asm volatile ("					\
+	r6 = 0;						\
+1:	call %[bpf_get_prandom_u32];			\
+	if r0 == 0 goto 2f;				\
+	r6 += 1;					\
+	if r6 != 3 goto 1b;				\
+2:	r0 = r6;					\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
 }
 
 SEC("xdp")
