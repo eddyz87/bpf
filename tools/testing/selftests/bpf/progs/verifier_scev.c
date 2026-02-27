@@ -324,8 +324,8 @@ __msg("loop header at 1, clamping r0")
 __msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=2,{{.*}})")
 __msg("1: (07) r0 += 1")
 __msg("2: safe")
-__msg("from 2 to 3: R0=P3 R1=ctx()")
-__msg("3: R0=P3 R1=ctx()")
+__msg("from 2 to 3: R0=3")
+__msg("3: R0=3")
 __msg("3: (95) exit")
 __msg("processed 6 insns")
 __naked void post_cond_jne1(void)
@@ -380,6 +380,25 @@ SEC("xdp")
 __success
 __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
+__naked void one_backedge_two_exits(void)
+{
+	asm volatile ("					\
+	r6 = 0;						\
+1:	call %[bpf_get_prandom_u32];			\
+	if r0 == 0 goto 2f;				\
+	r6 += 1;					\
+	if r6 != 3 goto 1b;				\
+2:	r0 = r6;					\
+	exit;						\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
 __msg("scev at header 11: r0=(+ r0 1) / (linear r0 1) r1=(+ r1 2) / (linear r1 2) r2=(+ r6 r1) / ?")
 __msg(" scev at latch 16: r0=(+ r0 1) / (linear (+ r0 1) 1) r1=(+ r1 2) / (linear (+ r1 2) 2) r2=(+ r6 r1) / (+ r6 (linear r1 2))")
 __msg("      latch at 16: (a5) if r0 < 0x8 goto pc-6")
@@ -392,8 +411,8 @@ __msg("11: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=7,var_off
 __msg("16: safe")
 __not_msg("11:")
 /* loop exit */
-__msg("from 16 to 17: R0=8 R1=16 R2=map_value(map=map,ks=4,vs=1024,smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=14,var_off=(0x0; 0xe))")
-__msg("17: R0=8 R1=16 R2=map_value(map=map,ks=4,vs=1024,smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=14,var_off=(0x0; 0xe))")
+__msg("from 16 to 17: R0=8")
+__msg("17: R0=8")
 __msg("17: (95) exit")
 /* map lookup error path */
 __msg("from 7 to 17: R0=0")
