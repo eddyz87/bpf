@@ -3,6 +3,7 @@
  * Copyright (c) 2016 Facebook
  * Copyright (c) 2018 Covalent IO, Inc. http://covalent.io
  */
+#include "linux/cnum.h"
 #include <uapi/linux/btf.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/kernel.h>
@@ -16563,23 +16564,91 @@ static void find_good_pkt_pointers(struct bpf_verifier_state *vstate,
 	}));
 }
 
+static int cnum32_from_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg, struct cnum32 *out)
+{
+	struct cnum32 u = cnum32_from_urange(reg->u32_min_value, reg->u32_max_value);
+	struct cnum32 s = cnum32_from_srange(reg->s32_min_value, reg->s32_max_value);
+
+	if (!cnum32_intersect(u, s, out)) {
+		verifier_bug(env, "register s32 and u32 ranges do not intersect: u32=[%x, %x], s32=[%x, %x]\n",
+			     reg->u32_min_value, reg->u32_max_value, reg->s32_min_value, reg->s32_max_value);
+		return -EFAULT;
+	}
+	/*
+	 * if (env->log.level & BPF_LOG_LEVEL2) {
+	 * 	verbose(env, "cnum32_from_reg: u={%x,%x} s={%x,%x}\n",
+	 * 		u.base, u.size, s.base, s.size);
+	 * }
+	 */
+	return 0;
+}
+
+static int cnum64_from_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg, struct cnum64 *out)
+{
+	struct cnum64 u = cnum64_from_urange(reg->umin_value, reg->umax_value);
+	struct cnum64 s = cnum64_from_srange(reg->smin_value, reg->smax_value);
+
+	if (!cnum64_intersect(u, s, out)) {
+		verifier_bug(env, "register s64 and u64 ranges do not intersect: u64=[%llx, %llx], s64=[%llx, %llx]\n",
+			     reg->umin_value, reg->umax_value, reg->smin_value, reg->smax_value);
+		return -EFAULT;
+	}
+	/*
+	 * if (env->log.level & BPF_LOG_LEVEL2) {
+	 * 	verbose(env, "cnum64_from_reg: u={%llx,%llx} s={%llx,%llx}\n",
+	 * 		u.base, u.size, s.base, s.size);
+	 * }
+	 */
+	return 0;
+}
+
 /*
  * <reg1> <op> <reg2>, currently assuming reg2 is a constant
  */
-static int is_scalar_branch_taken(struct bpf_reg_state *reg1, struct bpf_reg_state *reg2,
+static int is_scalar_branch_taken(struct bpf_verifier_env *env,
+				  struct bpf_reg_state *reg1, struct bpf_reg_state *reg2,
 				  u8 opcode, bool is_jmp32)
 {
+	/*
+	 * if (env->log.level & BPF_LOG_LEVEL2) {
+	 * 	verbose(env, "reg1: u32=[%u, %u], u64=[%llu, %llu], s32=[%d, %d], s64=[%lld, %lld]\n",
+	 * 		reg1->u32_min_value, reg1->u32_max_value, reg1->umin_value, reg1->umax_value,
+	 * 		reg1->s32_min_value, reg1->s32_max_value, reg1->smin_value, reg1->smax_value);
+	 * 	verbose(env, "reg2: u32=[%u, %u], u64=[%llu, %llu], s32=[%d, %d], s64=[%lld, %lld]\n",
+	 * 		reg2->u32_min_value, reg2->u32_max_value, reg2->umin_value, reg2->umax_value,
+	 * 		reg2->s32_min_value, reg2->s32_max_value, reg2->smin_value, reg2->smax_value);
+	 * }
+	 */
 	struct tnum t1 = is_jmp32 ? tnum_subreg(reg1->var_off) : reg1->var_off;
 	struct tnum t2 = is_jmp32 ? tnum_subreg(reg2->var_off) : reg2->var_off;
-	u64 umin1 = is_jmp32 ? (u64)reg1->u32_min_value : reg1->umin_value;
-	u64 umax1 = is_jmp32 ? (u64)reg1->u32_max_value : reg1->umax_value;
-	s64 smin1 = is_jmp32 ? (s64)reg1->s32_min_value : reg1->smin_value;
-	s64 smax1 = is_jmp32 ? (s64)reg1->s32_max_value : reg1->smax_value;
-	u64 umin2 = is_jmp32 ? (u64)reg2->u32_min_value : reg2->umin_value;
-	u64 umax2 = is_jmp32 ? (u64)reg2->u32_max_value : reg2->umax_value;
-	s64 smin2 = is_jmp32 ? (s64)reg2->s32_min_value : reg2->smin_value;
-	s64 smax2 = is_jmp32 ? (s64)reg2->s32_max_value : reg2->smax_value;
+	struct cnum32 c1_32, c2_32;
+	struct cnum64 c1_64, c2_64;
+	u64 umin1, umax1, umin2, umax2;
+	s64 smin1, smax1, smin2, smax2;
+	int err;
 
+	err = cnum32_from_reg(env, reg1, &c1_32);
+	err = err ?: cnum32_from_reg(env, reg2, &c2_32);
+	err = err ?: cnum64_from_reg(env, reg1, &c1_64);
+	err = err ?: cnum64_from_reg(env, reg2, &c2_64);
+	if (err)
+		return err;
+
+	umin1 = is_jmp32 ? (u64)cnum32_umin(c1_32) : cnum64_umin(c1_64);
+	umax1 = is_jmp32 ? (u64)cnum32_umax(c1_32) : cnum64_umax(c1_64);
+	smin1 = is_jmp32 ? (s64)cnum32_smin(c1_32) : cnum64_smin(c1_64);
+	smax1 = is_jmp32 ? (s64)cnum32_smax(c1_32) : cnum64_smax(c1_64);
+	umin2 = is_jmp32 ? (u64)cnum32_umin(c2_32) : cnum64_umin(c2_64);
+	umax2 = is_jmp32 ? (u64)cnum32_umax(c2_32) : cnum64_umax(c2_64);
+	smin2 = is_jmp32 ? (s64)cnum32_smin(c2_32) : cnum64_smin(c2_64);
+	smax2 = is_jmp32 ? (s64)cnum32_smax(c2_32) : cnum64_smax(c2_64);
+
+	/*
+	 * if (env->log.level & BPF_LOG_LEVEL2) {
+	 * 	verbose(env, "umin1/umax1=[%llu, %llu], smin1/smax1=[%lld, %lld]\n", umin1, umax1, smin1, smax1);
+	 * 	verbose(env, "umin2/umax2=[%llu, %llu], smin2/smax2=[%lld, %lld]\n", umin2, umax2, smin2, smax2);
+	 * }
+	 */
 	if (reg1 == reg2) {
 		switch (opcode) {
 		case BPF_JGE:
@@ -16790,7 +16859,8 @@ static int is_pkt_ptr_branch_taken(struct bpf_reg_state *dst_reg,
  * -1 - unknown. Example: "if (reg1 < 5)" is unknown when register value
  *      range [0,10]
  */
-static int is_branch_taken(struct bpf_reg_state *reg1, struct bpf_reg_state *reg2,
+static int is_branch_taken(struct bpf_verifier_env *env,
+			   struct bpf_reg_state *reg1, struct bpf_reg_state *reg2,
 			   u8 opcode, bool is_jmp32)
 {
 	if (reg_is_pkt_pointer_any(reg1) && reg_is_pkt_pointer_any(reg2) && !is_jmp32)
@@ -16829,7 +16899,11 @@ static int is_branch_taken(struct bpf_reg_state *reg1, struct bpf_reg_state *reg
 	}
 
 	/* now deal with two scalars, but not necessarily constants */
-	return is_scalar_branch_taken(reg1, reg2, opcode, is_jmp32);
+	int err = is_scalar_branch_taken(env, reg1, reg2, opcode, is_jmp32);
+	/*
+	 * verbose(env, "is_branch_taken returns %d\n", err);
+	 */
+	return err;
 }
 
 /* Opcode that corresponds to a *false* branch condition.
@@ -17441,7 +17515,9 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	}
 
 	is_jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
-	pred = is_branch_taken(dst_reg, src_reg, opcode, is_jmp32);
+	pred = is_branch_taken(env, dst_reg, src_reg, opcode, is_jmp32);
+	if (pred < -1)
+		return pred;
 	if (pred >= 0) {
 		/* If we get here with a dst_reg pointer type it is because
 		 * above is_branch_taken() special cased the 0 comparison.
