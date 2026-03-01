@@ -1863,4 +1863,22 @@ l1_%=:	r0 = 1;				\
 	: __clobber_all);
 }
 
+SEC("socket")
+__success
+__flag(BPF_F_TEST_REG_INVARIANTS)
+__naked void signed_unsined_intersection32(void *ctx)
+{
+	asm volatile("			\
+	call %[bpf_get_prandom_u32];	\
+	w0 &= 0xffffffff;		\
+	if w0 < 0x3 goto 1f;		\
+	if w0 s> 0x1 goto 1f;		\
+	if w0 s< 0x0 goto 1f;		\
+	r10 = 0;			\
+1:	exit;				\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
