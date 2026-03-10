@@ -2746,9 +2746,9 @@ static void deduce_bounds_64_from_32(struct bpf_reg_state *reg)
 
 static void __reg_deduce_bounds(struct bpf_reg_state *reg)
 {
-	deduce_bounds_32_from_32(reg);
 	deduce_bounds_64_from_64(reg);
 	deduce_bounds_32_from_64(reg);
+	deduce_bounds_32_from_32(reg);
 	deduce_bounds_64_from_32(reg);
 }
 
