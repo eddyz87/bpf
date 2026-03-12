@@ -595,6 +595,8 @@ struct bpf_insn_aux_data {
 	u32 scc;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	u16 use_regs;         /* registers read by this instruction */
+	u16 def_regs;         /* registers written by this instruction */
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
@@ -1094,5 +1096,12 @@ int bpf_commit_stack_write_marks(struct bpf_verifier_env *env);
 int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
 bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 spi);
 void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env);
+
+void bpf_mark_precise(struct bpf_verifier_env *env, int regno);
+void bpf_mark_precise_stack(struct bpf_verifier_env *env, u32 frame, u64 stack_mask);
+void bpf_mark_linked_reg(struct bpf_verifier_env *env, u32 frame, int regno);
+void bpf_mark_linked_stack(struct bpf_verifier_env *env, u32 frame, u32 spi);
+int bpf_reset_insn_marks(struct bpf_verifier_env *env, u32 insn_idx);
+int bpf_commit_insn_marks(struct bpf_verifier_env *env);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

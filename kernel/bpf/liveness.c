@@ -95,8 +95,13 @@ struct callchain {
 struct per_frame_masks {
 	u64 may_read;		/* stack slots that may be read by this instruction */
 	u64 must_write;		/* stack slots written by this instruction */
+	u64 may_write;		/* stack slots that may be written (union) */
 	u64 must_write_acc;	/* stack slots written by this instruction and its successors */
 	u64 live_before;	/* stack slots that may be read by this insn and its successors */
+	u64 precise_before_stack; /* stack slots needing precision before this insn */
+	u16 precise_before_regs;  /* register precision before this insn */
+	u16 linked_at;            /* registers marked as linked at this insn */
+	u64 linked_at_stack;      /* stack slots marked as linked at this insn */
 };
 
 /*
@@ -133,6 +138,10 @@ struct bpf_liveness {
 	 */
 	u64 write_masks_acc[MAX_CALL_FRAMES];
 	u32 write_insn_idx;
+	/* Precision and linked register accumulators for current instruction */
+	u16 precise_at_reg_acc;
+	u16 linked_at_acc[MAX_CALL_FRAMES];
+	u64 linked_at_stack_acc[MAX_CALL_FRAMES];
 };
 
 /* Compute callchain corresponding to state @st at depth @frameno */
@@ -387,6 +396,7 @@ static int commit_stack_write_marks(struct bpf_verifier_env *env,
 		}
 		if (old_must_write & ~mask)
 			instance->must_write_dropped = true;
+		masks->may_write |= liveness->write_masks_acc[frame];
 	}
 	instance->must_write_set[idx] = true;
 	liveness->write_insn_idx = 0;
@@ -400,6 +410,118 @@ static int commit_stack_write_marks(struct bpf_verifier_env *env,
 int bpf_commit_stack_write_marks(struct bpf_verifier_env *env)
 {
 	return commit_stack_write_marks(env, env->liveness->cur_instance);
+}
+
+void bpf_mark_precise(struct bpf_verifier_env *env, int regno)
+{
+	env->liveness->precise_at_reg_acc |= BIT(regno);
+}
+
+void bpf_mark_precise_stack(struct bpf_verifier_env *env, u32 frame, u64 stack_mask)
+{
+	struct bpf_liveness *liveness = env->liveness;
+	struct func_instance *instance = liveness->cur_instance;
+	struct per_frame_masks *masks;
+
+	if (!stack_mask || !instance)
+		return;
+
+	masks = get_frame_masks(instance, frame, liveness->write_insn_idx);
+	if (masks)
+		masks->precise_before_stack |= stack_mask;
+}
+
+static int commit_precise_marks(struct bpf_verifier_env *env,
+				struct func_instance *instance)
+{
+	struct bpf_liveness *liveness = env->liveness;
+	struct per_frame_masks *masks;
+	u16 acc;
+
+	if (!instance)
+		return 0;
+
+	acc = liveness->precise_at_reg_acc;
+	if (!acc)
+		return 0;
+
+	masks = alloc_frame_masks(env, instance, instance->callchain.curframe,
+				  liveness->write_insn_idx);
+	if (IS_ERR(masks))
+		return PTR_ERR(masks);
+
+	if (acc & ~masks->precise_before_regs) {
+		masks->precise_before_regs |= acc;
+		instance->updated = true;
+	}
+	return 0;
+}
+
+void bpf_mark_linked_reg(struct bpf_verifier_env *env, u32 frame, int regno)
+{
+	env->liveness->linked_at_acc[frame] |= BIT(regno);
+}
+
+void bpf_mark_linked_stack(struct bpf_verifier_env *env, u32 frame, u32 spi)
+{
+	env->liveness->linked_at_stack_acc[frame] |= BIT_ULL(spi);
+}
+
+static int commit_linked_marks(struct bpf_verifier_env *env,
+			       struct func_instance *instance)
+{
+	struct bpf_liveness *liveness = env->liveness;
+	struct per_frame_masks *masks;
+	u16 reg_acc;
+	u64 stack_acc;
+	u32 frame;
+
+	if (!instance)
+		return 0;
+
+	for (frame = 0; frame <= instance->callchain.curframe; frame++) {
+		reg_acc = liveness->linked_at_acc[frame];
+		stack_acc = liveness->linked_at_stack_acc[frame];
+		if (!reg_acc && !stack_acc)
+			continue;
+
+		masks = alloc_frame_masks(env, instance, frame,
+					  liveness->write_insn_idx);
+		if (IS_ERR(masks))
+			return PTR_ERR(masks);
+
+		if ((reg_acc & ~masks->linked_at) || (stack_acc & ~masks->linked_at_stack)) {
+			masks->linked_at |= reg_acc;
+			masks->linked_at_stack |= stack_acc;
+			instance->updated = true;
+		}
+	}
+	return 0;
+}
+
+int bpf_reset_insn_marks(struct bpf_verifier_env *env, u32 insn_idx)
+{
+	struct bpf_liveness *liveness = env->liveness;
+	int err = bpf_reset_stack_write_marks(env, insn_idx);
+
+	if (err)
+		return err;
+	liveness->precise_at_reg_acc = 0;
+	memset(liveness->linked_at_acc, 0, sizeof(liveness->linked_at_acc));
+	memset(liveness->linked_at_stack_acc, 0, sizeof(liveness->linked_at_stack_acc));
+	return 0;
+}
+
+int bpf_commit_insn_marks(struct bpf_verifier_env *env)
+{
+	int err = bpf_commit_stack_write_marks(env);
+
+	if (err)
+		return err;
+	err = commit_precise_marks(env, env->liveness->cur_instance);
+	if (err)
+		return err;
+	return commit_linked_marks(env, env->liveness->cur_instance);
 }
 
 static char *fmt_callchain(struct bpf_verifier_env *env, struct callchain *callchain)
@@ -535,7 +657,7 @@ static int propagate_to_outer_instance(struct bpf_verifier_env *env,
 	struct callchain *callchain = &instance->callchain;
 	u32 this_subprog_start, callsite, frame;
 	struct func_instance *outer_instance;
-	struct per_frame_masks *insn;
+	struct per_frame_masks *insn, *outer_masks;
 	int err;
 
 	this_subprog_start = callchain_subprog_start(callchain);
@@ -553,6 +675,17 @@ static int propagate_to_outer_instance(struct bpf_verifier_env *env,
 		err = mark_stack_read(env, outer_instance, frame, callsite, insn->live_before);
 		if (err)
 			return err;
+
+		/* Transfer precision marks from subprogram entry to caller's call instruction */
+		if (insn->precise_before_stack) {
+			outer_masks = alloc_frame_masks(env, outer_instance, frame, callsite);
+			if (IS_ERR(outer_masks))
+				return PTR_ERR(outer_masks);
+			if (insn->precise_before_stack & ~outer_masks->precise_before_stack) {
+				outer_masks->precise_before_stack |= insn->precise_before_stack;
+				outer_instance->updated = true;
+			}
+		}
 	}
 	commit_stack_write_marks(env, outer_instance);
 	return 0;
@@ -563,7 +696,11 @@ static inline bool update_insn(struct bpf_verifier_env *env,
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	u64 new_before, new_after, must_write_acc;
+	u64 precise_after_stack, new_pbs, precise_results_stack, precise_reads_stack;
+	u16 precise_after_regs, new_pbr, precise_results_regs, precise_reads_regs;
 	struct per_frame_masks *insn, *succ_insn;
+	struct callchain *callchain = &instance->callchain;
+	bool has_precise_results;
 	struct bpf_iarray *succ;
 	u32 s;
 	bool changed;
@@ -581,10 +718,14 @@ static inline bool update_insn(struct bpf_verifier_env *env,
 	 * of successors plus all "must_write" slots of instruction itself.
 	 */
 	must_write_acc = U64_MAX;
+	precise_after_stack = 0;
+	precise_after_regs = 0;
 	for (s = 0; s < succ->cnt; ++s) {
 		succ_insn = get_frame_masks(instance, frame, succ->items[s]);
 		new_after |= succ_insn->live_before;
 		must_write_acc &= succ_insn->must_write_acc;
+		precise_after_stack |= succ_insn->precise_before_stack;
+		precise_after_regs |= succ_insn->precise_before_regs;
 	}
 	must_write_acc |= insn->must_write;
 	/*
@@ -596,15 +737,51 @@ static inline bool update_insn(struct bpf_verifier_env *env,
 	changed |= must_write_acc != insn->must_write_acc;
 	if (unlikely(env->log.level & BPF_LOG_LEVEL2) &&
 	    (insn->may_read || insn->must_write ||
-	     insn_idx == callchain_subprog_start(&instance->callchain) ||
+	     insn_idx == callchain_subprog_start(callchain) ||
 	     aux[insn_idx].prune_point)) {
-		log_mask_change(env, &instance->callchain, "live",
+		log_mask_change(env, callchain, "live",
 				frame, insn_idx, insn->live_before, new_before);
-		log_mask_change(env, &instance->callchain, "written",
+		log_mask_change(env, callchain, "written",
 				frame, insn_idx, insn->must_write_acc, must_write_acc);
 	}
 	insn->live_before = new_before;
 	insn->must_write_acc = must_write_acc;
+
+	/*
+	 * Precision propagation:
+	 * If this instruction writes to something that is precise afterward,
+	 * then its inputs must be precise too.
+	 */
+	precise_results_stack = precise_after_stack & insn->may_write;
+	precise_results_regs = precise_after_regs & aux[insn_idx].def_regs;
+
+	has_precise_results = precise_results_stack || precise_results_regs;
+
+	precise_reads_stack = has_precise_results ? insn->may_read : 0;
+	precise_reads_regs = has_precise_results ? aux[insn_idx].use_regs : 0;
+
+	new_pbs = (precise_after_stack & ~insn->must_write)
+		| insn->precise_before_stack | precise_reads_stack;
+	new_pbr = insn->precise_before_regs | precise_reads_regs
+		| (precise_after_regs & ~aux[insn_idx].def_regs);
+
+	/* Linked registers/stack extension */
+	if (insn->linked_at || insn->linked_at_stack) {
+		bool any_linked_precise;
+
+		any_linked_precise = (insn->linked_at & new_pbr) ||
+				     (insn->linked_at_stack & new_pbs);
+		if (any_linked_precise) {
+			new_pbr |= insn->linked_at;
+			new_pbs |= insn->linked_at_stack;
+		}
+	}
+
+	changed |= new_pbs != insn->precise_before_stack;
+	changed |= new_pbr != insn->precise_before_regs;
+	insn->precise_before_stack = new_pbs;
+	insn->precise_before_regs = new_pbr;
+
 	return changed;
 }
 
@@ -632,6 +809,8 @@ static int update_instance(struct bpf_verifier_env *env, struct func_instance *i
 			for (i = 0; i < instance->insn_cnt; i++) {
 				insn = get_frame_masks(instance, frame, this_subprog_start + i);
 				insn->must_write_acc = 0;
+				insn->precise_before_stack = 0;
+				insn->precise_before_regs = 0;
 			}
 		}
 	}

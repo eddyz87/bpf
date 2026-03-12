@@ -5096,6 +5096,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env,
 
 int mark_chain_precision(struct bpf_verifier_env *env, int regno)
 {
+	bpf_mark_precise(env, regno);
 	return __mark_chain_precision(env, env->cur_state, regno, NULL);
 }
 
@@ -5105,6 +5106,20 @@ int mark_chain_precision(struct bpf_verifier_env *env, int regno)
 static int mark_chain_precision_batch(struct bpf_verifier_env *env,
 				      struct bpf_verifier_state *starting_state)
 {
+	struct backtrack_state *bt = &env->bt;
+	u16 reg_mask;
+	u32 i;
+	int r;
+
+	for (i = 0; i <= bt->frame; i++) {
+		reg_mask = bt->reg_masks[i];
+		while (reg_mask) {
+			r = __ffs(reg_mask);
+			bpf_mark_precise(env, r);
+			reg_mask &= ~BIT(r);
+		}
+		bpf_mark_precise_stack(env, i, bt->stack_masks[i]);
+	}
 	return __mark_chain_precision(env, starting_state, -1, NULL);
 }
 
@@ -17598,6 +17613,14 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		err = push_jmp_history(env, this_branch, 0, linked_regs_pack(&linked_regs));
 		if (err)
 			return err;
+		for (int i = 0; i < linked_regs.cnt; i++) {
+			struct linked_reg *e = &linked_regs.entries[i];
+
+			if (e->is_reg)
+				bpf_mark_linked_reg(env, e->frameno, e->regno);
+			else
+				bpf_mark_linked_stack(env, e->frameno, e->spi);
+		}
 	}
 
 	other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx, false);
@@ -21368,12 +21391,12 @@ static int do_check(struct bpf_verifier_env *env)
 		if (state->speculative && insn_aux->nospec)
 			goto process_bpf_exit;
 
-		err = bpf_reset_stack_write_marks(env, env->insn_idx);
+		err = bpf_reset_insn_marks(env, env->insn_idx);
 		if (err)
 			return err;
 		err = do_check_insn(env, &do_print_state);
 		if (err >= 0 || error_recoverable_with_nospec(err)) {
-			marks_err = bpf_commit_stack_write_marks(env);
+			marks_err = bpf_commit_insn_marks(env);
 			if (marks_err)
 				return marks_err;
 		}
@@ -25826,8 +25849,11 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 		}
 	}
 
-	for (i = 0; i < insn_cnt; ++i)
+	for (i = 0; i < insn_cnt; ++i) {
 		insn_aux[i].live_regs_before = state[i].in;
+		insn_aux[i].use_regs = state[i].use;
+		insn_aux[i].def_regs = state[i].def;
+	}
 
 	if (env->log.level & BPF_LOG_LEVEL2) {
 		verbose(env, "Live regs before insn:\n");
