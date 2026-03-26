@@ -1760,10 +1760,8 @@ static const int caller_saved[CALLER_SAVED_REGS] = {
 static void ___mark_reg_known(struct bpf_reg_state *reg, u64 imm)
 {
 	reg->var_off = tnum_const(imm);
-	reg_set_srange64(reg, (s64)imm, (s64)imm);
-	reg_set_urange64(reg, imm, imm);
-	reg_set_srange32(reg, (s32)imm, (s32)imm);
-	reg_set_urange32(reg, (u32)imm, (u32)imm);
+	reg->r64 = cnum64_from_urange(imm, imm);
+	reg->r32 = cnum32_from_urange((u32)imm, (u32)imm);
 }
 
 /* Mark the unknown part of a register (variable offset or scalar value) as
@@ -1782,8 +1780,7 @@ static void __mark_reg_known(struct bpf_reg_state *reg, u64 imm)
 static void __mark_reg32_known(struct bpf_reg_state *reg, u64 imm)
 {
 	reg->var_off = tnum_const_subreg(reg->var_off, imm);
-	reg_set_srange32(reg, (s32)imm, (s32)imm);
-	reg_set_urange32(reg, (u32)imm, (u32)imm);
+	reg->r32 = cnum32_from_urange((u32)imm, (u32)imm);
 }
 
 /* Mark the 'variable offset' part of a register as zero.  This should be
@@ -1896,23 +1893,19 @@ static bool reg_is_init_pkt_pointer(const struct bpf_reg_state *reg,
 
 static void __mark_reg32_unbounded(struct bpf_reg_state *reg)
 {
-	reg_set_srange32(reg, S32_MIN, S32_MAX);
-	reg_set_urange32(reg, 0, U32_MAX);
+	reg->r32 = CNUM32_UNBOUNDED;
+}
+
+static void __mark_reg64_unbounded(struct bpf_reg_state *reg)
+{
+	reg->r64 = CNUM64_UNBOUNDED;
 }
 
 /* Reset the min/max bounds of a register */
 static void __mark_reg_unbounded(struct bpf_reg_state *reg)
 {
-	reg_set_srange64(reg, S64_MIN, S64_MAX);
-	reg_set_urange64(reg, 0, U64_MAX);
-
+	__mark_reg64_unbounded(reg);
 	__mark_reg32_unbounded(reg);
-}
-
-static void __mark_reg64_unbounded(struct bpf_reg_state *reg)
-{
-	reg_set_srange64(reg, S64_MIN, S64_MAX);
-	reg_set_urange64(reg, 0, U64_MAX);
 }
 
 static void reset_reg64_and_tnum(struct bpf_reg_state *reg)
@@ -1927,18 +1920,32 @@ static void reset_reg32_and_tnum(struct bpf_reg_state *reg)
 	reg->var_off = tnum_unknown;
 }
 
+static struct cnum32 cnum32_from_tnum(struct tnum tnum)
+{
+	tnum = tnum_subreg(tnum);
+	if ((tnum.mask & S32_MIN) || (tnum.value & S32_MIN))
+		/* min signed is max(sign bit) | min(other bits) */
+		/* max signed is min(sign bit) | max(other bits) */
+		return cnum32_from_srange(tnum.value | (tnum.mask & S32_MIN),
+					  tnum.value | (tnum.mask & S32_MAX));
+	else
+		return cnum32_from_urange(tnum.value, (tnum.value | tnum.mask));
+}
+
+static struct cnum64 cnum64_from_tnum(struct tnum tnum)
+{
+	if ((tnum.mask & S64_MIN) || (tnum.value & S64_MIN))
+		/* min signed is max(sign bit) | min(other bits) */
+		/* max signed is min(sign bit) | max(other bits) */
+		return cnum64_from_srange(tnum.value | (tnum.mask & S64_MIN),
+					  tnum.value | (tnum.mask & S64_MAX));
+	else
+		return cnum64_from_urange(tnum.value, (tnum.value | tnum.mask));
+}
+
 static void __update_reg32_bounds(struct bpf_reg_state *reg)
 {
-	struct tnum var32_off = tnum_subreg(reg->var_off);
-
-	reg_set_srange32(reg,
-			 /* min signed is max(sign bit) | min(other bits) */
-			 max_t(s32, reg_s32_min(reg), var32_off.value | (var32_off.mask & S32_MIN)),
-			 /* max signed is min(sign bit) | max(other bits) */
-			 min_t(s32, reg_s32_max(reg), var32_off.value | (var32_off.mask & S32_MAX)));
-	reg_set_urange32(reg,
-			 max_t(u32, reg_u32_min(reg), (u32)var32_off.value),
-			 min(reg_u32_max(reg), (u32)(var32_off.value | var32_off.mask)));
+	reg->r32 = cnum32_intersect(reg->r32, cnum32_from_tnum(reg->var_off));
 }
 
 static void __update_reg64_bounds(struct bpf_reg_state *reg)
@@ -1946,17 +1953,7 @@ static void __update_reg64_bounds(struct bpf_reg_state *reg)
 	u64 tnum_next, tmax;
 	bool umin_in_tnum;
 
-	/* min signed is max(sign bit) | min(other bits) */
-	/* max signed is min(sign bit) | max(other bits) */
-	reg_set_srange64(reg,
-			 max_t(s64, reg_smin(reg),
-			       reg->var_off.value | (reg->var_off.mask & S64_MIN)),
-			 min_t(s64, reg_smax(reg),
-			       reg->var_off.value | (reg->var_off.mask & S64_MAX)));
-	reg_set_urange64(reg,
-			 max(reg_umin(reg), reg->var_off.value),
-			 min(reg_umax(reg),
-			     reg->var_off.value | reg->var_off.mask));
+	reg->r64 = cnum64_intersect(reg->r64, cnum64_from_tnum(reg->var_off));
 
 	/* Check if u64 and tnum overlap in a single value */
 	tnum_next = tnum_step(reg->var_off, reg_umin(reg));
@@ -1992,103 +1989,20 @@ static void __update_reg_bounds(struct bpf_reg_state *reg)
 	__update_reg64_bounds(reg);
 }
 
-static struct cnum32 cnum32_from_ureg(struct bpf_reg_state *reg)
-{
-	return cnum32_from_urange(reg_u32_min(reg), reg_u32_max(reg));
-}
-
-static struct cnum32 cnum32_from_sreg(struct bpf_reg_state *reg)
-{
-	return cnum32_from_srange(reg_s32_min(reg), reg_s32_max(reg));
-}
-
-static struct cnum64 cnum64_from_ureg(struct bpf_reg_state *reg)
-{
-	return cnum64_from_urange(reg_umin(reg), reg_umax(reg));
-}
-
-static struct cnum64 cnum64_from_sreg(struct bpf_reg_state *reg)
-{
-	return cnum64_from_srange(reg_smin(reg), reg_smax(reg));
-}
-
-static bool cnum32_from_reg(struct bpf_reg_state *reg, struct cnum32 *cnum)
-{
-	return cnum32_intersect(cnum32_from_ureg(reg), cnum32_from_sreg(reg), cnum);
-}
-
-static bool cnum64_from_reg(struct bpf_reg_state *reg, struct cnum64 *cnum)
-{
-	return cnum64_intersect(cnum64_from_ureg(reg), cnum64_from_sreg(reg), cnum);
-}
-
-static void cnum_update_reg32_bounds(struct bpf_reg_state *reg, struct cnum32 cnum)
-{
-	reg_set_urange32(reg,
-			 max_t(u32, reg_u32_min(reg), cnum32_umin(cnum)),
-			 min_t(u32, reg_u32_max(reg), cnum32_umax(cnum)));
-	reg_set_srange32(reg,
-			 max_t(s32, reg_s32_min(reg), cnum32_smin(cnum)),
-			 min_t(s32, reg_s32_max(reg), cnum32_smax(cnum)));
-}
-
-static void cnum_update_reg64_bounds(struct bpf_reg_state *reg, struct cnum64 cnum)
-{
-	reg_set_urange64(reg,
-			 max_t(u64, reg_umin(reg), cnum64_umin(cnum)),
-			 min_t(u64, reg_umax(reg), cnum64_umax(cnum)));
-	reg_set_srange64(reg,
-			 max_t(s64, reg_smin(reg), cnum64_smin(cnum)),
-			 min_t(s64, reg_smax(reg), cnum64_smax(cnum)));
-}
-
 /* Uses signed min/max values to inform unsigned, and vice-versa */
 static void deduce_bounds_32_from_64(struct bpf_reg_state *reg)
 {
-	struct cnum64 cnum;
-
-	if (cnum64_from_reg(reg, &cnum))
-		cnum_update_reg32_bounds(reg, cnum32_from_cnum64(cnum));
-}
-
-static void deduce_bounds_32_from_32(struct bpf_reg_state *reg)
-{
-	struct cnum32 cnum;
-
-	if (cnum32_from_reg(reg, &cnum))
-		cnum_update_reg32_bounds(reg, cnum);
-}
-
-static void deduce_bounds_64_from_64(struct bpf_reg_state *reg)
-{
-	struct cnum64 cnum;
-
-	if (cnum64_from_reg(reg, &cnum))
-		cnum_update_reg64_bounds(reg, cnum);
+	reg->r32 = cnum32_intersect(reg->r32, cnum32_from_cnum64(reg->r64));
 }
 
 static void deduce_bounds_64_from_32(struct bpf_reg_state *reg)
 {
-	struct cnum32 s = cnum32_from_sreg(reg);
-	struct cnum32 u = cnum32_from_ureg(reg);
-	struct cnum64 t;
-
-	t = cnum64_from_ureg(reg);
-	if (cnum64_cnum32_intersect(t, s, &t) &&
-	    cnum64_cnum32_intersect(t, u, &t))
-		cnum_update_reg64_bounds(reg, t);
-
-	t = cnum64_from_sreg(reg);
-	if (cnum64_cnum32_intersect(t, s, &t) &&
-	    cnum64_cnum32_intersect(t, u, &t))
-		cnum_update_reg64_bounds(reg, t);
+	reg->r64 = cnum64_cnum32_intersect(reg->r64, reg->r32);
 }
 
 static void __reg_deduce_bounds(struct bpf_reg_state *reg)
 {
-	deduce_bounds_64_from_64(reg);
 	deduce_bounds_32_from_64(reg);
-	deduce_bounds_32_from_32(reg);
 	deduce_bounds_64_from_32(reg);
 }
 
@@ -2126,35 +2040,25 @@ static void reg_bounds_sync(struct bpf_reg_state *reg)
 	__update_reg_bounds(reg);
 }
 
-static bool range_bounds_violation(struct bpf_reg_state *reg)
-{
-	return (reg->umin_value > reg->umax_value || reg->smin_value > reg->smax_value ||
-		reg->u32_min_value > reg->u32_max_value ||
-		reg->s32_min_value > reg->s32_max_value);
-}
-
 static bool const_tnum_range_mismatch(struct bpf_reg_state *reg)
 {
-	u64 uval = reg->var_off.value;
-	s64 sval = (s64)uval;
-
 	if (!tnum_is_const(reg->var_off))
 		return false;
 
-	return reg_umin(reg) != uval || reg_umax(reg) != uval ||
-	       reg_smin(reg) != sval || reg_smax(reg) != sval;
+	return !cnum64_is_const(reg->r64) || reg->r64.base != reg->var_off.value;
 }
 
 static bool const_tnum_range_mismatch_32(struct bpf_reg_state *reg)
 {
-	u32 uval32 = tnum_subreg(reg->var_off).value;
-	s32 sval32 = (s32)uval32;
-
 	if (!tnum_subreg_is_const(reg->var_off))
 		return false;
 
-	return reg_u32_min(reg) != uval32 || reg_u32_max(reg) != uval32 ||
-	       reg_s32_min(reg) != sval32 || reg_s32_max(reg) != sval32;
+	return !cnum32_is_const(reg->r32) || reg->r32.base != tnum_subreg(reg->var_off).value;
+}
+
+static bool range_bounds_violation(struct bpf_reg_state *reg)
+{
+	return cnum32_is_empty(reg->r32) || cnum64_is_empty(reg->r64);
 }
 
 static int reg_bounds_sanity_check(struct bpf_verifier_env *env,
@@ -2179,37 +2083,16 @@ static int reg_bounds_sanity_check(struct bpf_verifier_env *env,
 
 	return 0;
 out:
-	verifier_bug(env, "REG INVARIANTS VIOLATION (%s): %s u64=[%#llx, %#llx] "
-		     "s64=[%#llx, %#llx] u32=[%#x, %#x] s32=[%#x, %#x] var_off=(%#llx, %#llx)",
-		     ctx, msg, reg_umin(reg), reg_umax(reg),
-		     reg_smin(reg), reg_smax(reg),
-		     reg_u32_min(reg), reg_u32_max(reg),
-		     reg_s32_min(reg), reg_s32_max(reg),
+	verifier_bug(env, "REG INVARIANTS VIOLATION (%s): %s r64={.base=%#llx, .size=%#llx} "
+		     "r32={.base=%#x, .size=%#x} var_off=(%#llx, %#llx)",
+		     ctx, msg,
+		     reg->r64.base, reg->r64.size,
+		     reg->r32.base, reg->r32.size,
 		     reg->var_off.value, reg->var_off.mask);
 	if (env->test_reg_invariants)
 		return -EFAULT;
 	__mark_reg_unbounded(reg);
 	return 0;
-}
-
-static bool __reg32_bound_s64(s32 a)
-{
-	return a >= 0 && a <= S32_MAX;
-}
-
-static void __reg_assign_32_into_64(struct bpf_reg_state *reg)
-{
-	reg_set_urange64(reg, reg_u32_min(reg), reg_u32_max(reg));
-
-	/* Attempt to pull 32-bit signed bounds into 64-bit bounds but must
-	 * be positive otherwise set to worse case bounds and refine later
-	 * from tnum.
-	 */
-	if (__reg32_bound_s64(reg_s32_min(reg)) &&
-	    __reg32_bound_s64(reg_s32_max(reg)))
-		reg_set_srange64(reg, reg_s32_min(reg), reg_s32_max(reg));
-	else
-		reg_set_srange64(reg, 0, U32_MAX);
 }
 
 /* Mark a register as having a completely unknown (scalar) value. */
@@ -4739,7 +4622,7 @@ static int check_ctx_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		err = __check_ptr_off_reg(env, reg, regno, fixed_off_ok);
 	if (err)
 		return err;
-	off += reg->umax_value;
+	off += reg_umax(reg);
 
 	err = __check_ctx_access(env, insn_idx, off, access_size, t, info);
 	if (err)
@@ -5367,7 +5250,7 @@ static int check_buffer_access(struct bpf_verifier_env *env,
 static void zext_32_to_64(struct bpf_reg_state *reg)
 {
 	reg->var_off = tnum_subreg(reg->var_off);
-	__reg_assign_32_into_64(reg);
+	reg_set_urange64(reg, reg_u32_min(reg), reg_u32_max(reg));
 }
 
 /* truncate register to smaller size (in bytes)
@@ -5382,12 +5265,10 @@ static void coerce_reg_to_size(struct bpf_reg_state *reg, int size)
 
 	/* fix arithmetic bounds */
 	mask = ((u64)1 << (size * 8)) - 1;
-	if ((reg_umin(reg) & ~mask) == (reg_umax(reg) & ~mask)) {
+	if ((reg_umin(reg) & ~mask) == (reg_umax(reg) & ~mask))
 		reg_set_urange64(reg, reg_umin(reg) & mask, reg_umax(reg) & mask);
-	} else {
+	else
 		reg_set_urange64(reg, 0, mask);
-	}
-	reg_set_srange64(reg, reg_umin(reg), reg_umax(reg));
 
 	/* If size is smaller than 32bit register the 32bit register
 	 * values are also truncated so we push 64-bit bounds into
@@ -5412,8 +5293,6 @@ static void set_sext64_default_val(struct bpf_reg_state *reg, int size)
 		reg_set_srange64(reg, S32_MIN, S32_MAX);
 		reg_set_srange32(reg, S32_MIN, S32_MAX);
 	}
-	reg_set_urange64(reg, 0, U64_MAX);
-	reg_set_urange32(reg, 0, U32_MAX);
 	reg->var_off = tnum_unknown;
 }
 
@@ -5434,10 +5313,8 @@ static void coerce_reg_to_size_sx(struct bpf_reg_state *reg, int size)
 			reg->var_off = tnum_const((s32)u64_cval);
 
 		u64_cval = reg->var_off.value;
-		reg_set_srange64(reg, u64_cval, u64_cval);
-		reg_set_urange64(reg, u64_cval, u64_cval);
-		reg_set_srange32(reg, u64_cval, u64_cval);
-		reg_set_urange32(reg, u64_cval, u64_cval);
+		reg->r64 = cnum64_from_urange(u64_cval, u64_cval);
+		reg->r32 = cnum32_from_urange((u32)u64_cval, (u32)u64_cval);
 		return;
 	}
 
@@ -5465,9 +5342,7 @@ static void coerce_reg_to_size_sx(struct bpf_reg_state *reg, int size)
 	/* both of s64_max/s64_min positive or negative */
 	if ((s64_max >= 0) == (s64_min >= 0)) {
 		reg_set_srange64(reg, s64_min, s64_max);
-		reg_set_urange64(reg, s64_min, s64_max);
 		reg_set_srange32(reg, s64_min, s64_max);
-		reg_set_urange32(reg, s64_min, s64_max);
 		reg->var_off = tnum_range(s64_min, s64_max);
 		return;
 	}
@@ -5483,7 +5358,6 @@ static void set_sext32_default_val(struct bpf_reg_state *reg, int size)
 	else
 		/* size == 2 */
 		reg_set_srange32(reg, S16_MIN, S16_MAX);
-	reg_set_urange32(reg, 0, U32_MAX);
 	reg->var_off = tnum_subreg(tnum_unknown);
 }
 
@@ -5502,7 +5376,6 @@ static void coerce_subreg_to_size_sx(struct bpf_reg_state *reg, int size)
 
 		u32_val = reg->var_off.value;
 		reg_set_srange32(reg, u32_val, u32_val);
-		reg_set_urange32(reg, u32_val, u32_val);
 		return;
 	}
 
@@ -5526,7 +5399,6 @@ static void coerce_subreg_to_size_sx(struct bpf_reg_state *reg, int size)
 
 	if ((s32_min >= 0) == (s32_max >= 0)) {
 		reg_set_srange32(reg, s32_min, s32_max);
-		reg_set_urange32(reg, (u32)s32_min, (u32)s32_max);
 		reg->var_off = tnum_subreg(tnum_range(s32_min, s32_max));
 		return;
 	}
@@ -6766,8 +6638,8 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
 							  zero_size_allowed);
 			if (err)
 				return err;
-			if (env->prog->aux->max_ctx_offset < reg->umax_value + access_size)
-				env->prog->aux->max_ctx_offset = reg->umax_value + access_size;
+			if (env->prog->aux->max_ctx_offset < reg_umax(reg) + access_size)
+				env->prog->aux->max_ctx_offset = reg_umax(reg) + access_size;
 			return 0;
 		}
 		fallthrough;
@@ -9696,8 +9568,6 @@ static int do_refine_retval_range(struct bpf_verifier_env *env,
 	case BPF_FUNC_get_smp_processor_id:
 		reg_set_urange64(ret_reg, 0, nr_cpu_ids - 1);
 		reg_set_urange32(ret_reg, 0, nr_cpu_ids - 1);
-		reg_set_srange64(ret_reg, 0, nr_cpu_ids - 1);
-		reg_set_srange32(ret_reg, 0, nr_cpu_ids - 1);
 		reg_bounds_sync(ret_reg);
 		break;
 	}
@@ -13468,10 +13338,8 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
 	struct bpf_reg_state *regs = state->regs, *dst_reg;
 	bool known = tnum_is_const(off_reg->var_off);
-	s64 smin_val = reg_smin(off_reg), smax_val = reg_smax(off_reg),
-	    smin_ptr = reg_smin(ptr_reg), smax_ptr = reg_smax(ptr_reg);
-	u64 umin_val = reg_umin(off_reg), umax_val = reg_umax(off_reg),
-	    umin_ptr = reg_umin(ptr_reg), umax_ptr = reg_umax(ptr_reg);
+	s64 smin_val = reg_smin(off_reg), smax_val = reg_smax(off_reg);
+	u64 umin_val = reg_umin(off_reg), umax_val = reg_umax(off_reg);
 	struct bpf_sanitize_info info = {};
 	u8 opcode = BPF_OP(insn->code);
 	u32 dst = insn->dst_reg;
@@ -13573,23 +13441,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 		 * added into the variable offset, and we copy the fixed offset
 		 * from ptr_reg.
 		 */
-		{
-		s64 smin_res, smax_res;
-		u64 umin_res, umax_res;
-
-		if (check_add_overflow(smin_ptr, smin_val, &smin_res) ||
-		    check_add_overflow(smax_ptr, smax_val, &smax_res)) {
-			reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
-		} else {
-			reg_set_srange64(dst_reg, smin_res, smax_res);
-		}
-		if (check_add_overflow(umin_ptr, umin_val, &umin_res) ||
-		    check_add_overflow(umax_ptr, umax_val, &umax_res)) {
-			reg_set_urange64(dst_reg, 0, U64_MAX);
-		} else {
-			reg_set_urange64(dst_reg, umin_res, umax_res);
-		}
-		}
+		dst_reg->r64 = cnum64_add(ptr_reg->r64, off_reg->r64);
 		dst_reg->var_off = tnum_add(ptr_reg->var_off, off_reg->var_off);
 		dst_reg->raw = ptr_reg->raw;
 		if (reg_is_pkt_pointer(ptr_reg)) {
@@ -13621,27 +13473,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 				dst);
 			return -EACCES;
 		}
-		/* A new variable offset is created.  If the subtrahend is known
-		 * nonnegative, then any reg->range we had before is still good.
-		 */
-		{
-		s64 smin_res, smax_res;
-
-		if (check_sub_overflow(smin_ptr, smax_val, &smin_res) ||
-		    check_sub_overflow(smax_ptr, smin_val, &smax_res)) {
-			/* Overflow possible, we know nothing */
-			reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
-		} else {
-			reg_set_srange64(dst_reg, smin_res, smax_res);
-		}
-		}
-		if (umin_ptr < umax_val) {
-			/* Overflow possible, we know nothing */
-			reg_set_urange64(dst_reg, 0, U64_MAX);
-		} else {
-			/* Cannot overflow (as long as bounds are consistent) */
-			reg_set_urange64(dst_reg, umin_ptr - umax_val, umax_ptr - umin_val);
-		}
+		dst_reg->r64 = cnum64_add(ptr_reg->r64, cnum64_negate(off_reg->r64));
 		dst_reg->var_off = tnum_sub(ptr_reg->var_off, off_reg->var_off);
 		dst_reg->raw = ptr_reg->raw;
 		if (reg_is_pkt_pointer(ptr_reg)) {
@@ -13698,201 +13530,37 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 static void scalar32_min_max_add(struct bpf_reg_state *dst_reg,
 				 struct bpf_reg_state *src_reg)
 {
-	s32 smin = reg_s32_min(dst_reg);
-	s32 smax = reg_s32_max(dst_reg);
-	u32 umin = reg_u32_min(dst_reg);
-	u32 umax = reg_u32_max(dst_reg);
-	u32 umin_val = reg_u32_min(src_reg);
-	u32 umax_val = reg_u32_max(src_reg);
-	bool min_overflow, max_overflow;
-
-	if (check_add_overflow(smin, reg_s32_min(src_reg), &smin) ||
-	    check_add_overflow(smax, reg_s32_max(src_reg), &smax)) {
-		smin = S32_MIN;
-		smax = S32_MAX;
-	}
-
-	/* If either all additions overflow or no additions overflow, then
-	 * it is okay to set: dst_umin = dst_umin + src_umin, dst_umax =
-	 * dst_umax + src_umax. Otherwise (some additions overflow), set
-	 * the output bounds to unbounded.
-	 */
-	min_overflow = check_add_overflow(umin, umin_val, &umin);
-	max_overflow = check_add_overflow(umax, umax_val, &umax);
-
-	if (!min_overflow && max_overflow) {
-		umin = 0;
-		umax = U32_MAX;
-	}
-
-	reg_set_srange32(dst_reg, smin, smax);
-	reg_set_urange32(dst_reg, umin, umax);
+	dst_reg->r32 = cnum32_add(dst_reg->r32, src_reg->r32);
 }
 
 static void scalar_min_max_add(struct bpf_reg_state *dst_reg,
 			       struct bpf_reg_state *src_reg)
 {
-	s64 smin = reg_smin(dst_reg);
-	s64 smax = reg_smax(dst_reg);
-	u64 umin = reg_umin(dst_reg);
-	u64 umax = reg_umax(dst_reg);
-	u64 umin_val = reg_umin(src_reg);
-	u64 umax_val = reg_umax(src_reg);
-	bool min_overflow, max_overflow;
-
-	if (check_add_overflow(smin, reg_smin(src_reg), &smin) ||
-	    check_add_overflow(smax, reg_smax(src_reg), &smax)) {
-		smin = S64_MIN;
-		smax = S64_MAX;
-	}
-
-	/* If either all additions overflow or no additions overflow, then
-	 * it is okay to set: dst_umin = dst_umin + src_umin, dst_umax =
-	 * dst_umax + src_umax. Otherwise (some additions overflow), set
-	 * the output bounds to unbounded.
-	 */
-	min_overflow = check_add_overflow(umin, umin_val, &umin);
-	max_overflow = check_add_overflow(umax, umax_val, &umax);
-
-	if (!min_overflow && max_overflow) {
-		umin = 0;
-		umax = U64_MAX;
-	}
-
-	reg_set_srange64(dst_reg, smin, smax);
-	reg_set_urange64(dst_reg, umin, umax);
+	dst_reg->r64 = cnum64_add(dst_reg->r64, src_reg->r64);
 }
 
 static void scalar32_min_max_sub(struct bpf_reg_state *dst_reg,
 				 struct bpf_reg_state *src_reg)
 {
-	s32 smin = reg_s32_min(dst_reg);
-	s32 smax = reg_s32_max(dst_reg);
-	u32 umin = reg_u32_min(dst_reg);
-	u32 umax = reg_u32_max(dst_reg);
-	u32 umin_val = reg_u32_min(src_reg);
-	u32 umax_val = reg_u32_max(src_reg);
-	bool min_underflow, max_underflow;
-
-	if (check_sub_overflow(smin, reg_s32_max(src_reg), &smin) ||
-	    check_sub_overflow(smax, reg_s32_min(src_reg), &smax)) {
-		/* Overflow possible, we know nothing */
-		smin = S32_MIN;
-		smax = S32_MAX;
-	}
-
-	/* If either all subtractions underflow or no subtractions
-	 * underflow, it is okay to set: dst_umin = dst_umin - src_umax,
-	 * dst_umax = dst_umax - src_umin. Otherwise (some subtractions
-	 * underflow), set the output bounds to unbounded.
-	 */
-	min_underflow = check_sub_overflow(umin, umax_val, &umin);
-	max_underflow = check_sub_overflow(umax, umin_val, &umax);
-
-	if (min_underflow && !max_underflow) {
-		umin = 0;
-		umax = U32_MAX;
-	}
-
-	reg_set_srange32(dst_reg, smin, smax);
-	reg_set_urange32(dst_reg, umin, umax);
+	dst_reg->r32 = cnum32_add(dst_reg->r32, cnum32_negate(src_reg->r32));
 }
 
 static void scalar_min_max_sub(struct bpf_reg_state *dst_reg,
 			       struct bpf_reg_state *src_reg)
 {
-	s64 smin = reg_smin(dst_reg);
-	s64 smax = reg_smax(dst_reg);
-	u64 umin = reg_umin(dst_reg);
-	u64 umax = reg_umax(dst_reg);
-	u64 umin_val = reg_umin(src_reg);
-	u64 umax_val = reg_umax(src_reg);
-	bool min_underflow, max_underflow;
-
-	if (check_sub_overflow(smin, reg_smax(src_reg), &smin) ||
-	    check_sub_overflow(smax, reg_smin(src_reg), &smax)) {
-		/* Overflow possible, we know nothing */
-		smin = S64_MIN;
-		smax = S64_MAX;
-	}
-
-	/* If either all subtractions underflow or no subtractions
-	 * underflow, it is okay to set: dst_umin = dst_umin - src_umax,
-	 * dst_umax = dst_umax - src_umin. Otherwise (some subtractions
-	 * underflow), set the output bounds to unbounded.
-	 */
-	min_underflow = check_sub_overflow(umin, umax_val, &umin);
-	max_underflow = check_sub_overflow(umax, umin_val, &umax);
-
-	if (min_underflow && !max_underflow) {
-		umin = 0;
-		umax = U64_MAX;
-	}
-
-	reg_set_srange64(dst_reg, smin, smax);
-	reg_set_urange64(dst_reg, umin, umax);
+	dst_reg->r64 = cnum64_add(dst_reg->r64, cnum64_negate(src_reg->r64));
 }
 
 static void scalar32_min_max_mul(struct bpf_reg_state *dst_reg,
 				 struct bpf_reg_state *src_reg)
 {
-	s32 smin = reg_s32_min(dst_reg);
-	s32 smax = reg_s32_max(dst_reg);
-	u32 umin = reg_u32_min(dst_reg);
-	u32 umax = reg_u32_max(dst_reg);
-	s32 tmp_prod[4];
-
-	if (check_mul_overflow(umax, reg_u32_max(src_reg), &umax) ||
-	    check_mul_overflow(umin, reg_u32_min(src_reg), &umin)) {
-		/* Overflow possible, we know nothing */
-		umin = 0;
-		umax = U32_MAX;
-	}
-	if (check_mul_overflow(smin, reg_s32_min(src_reg), &tmp_prod[0]) ||
-	    check_mul_overflow(smin, reg_s32_max(src_reg), &tmp_prod[1]) ||
-	    check_mul_overflow(smax, reg_s32_min(src_reg), &tmp_prod[2]) ||
-	    check_mul_overflow(smax, reg_s32_max(src_reg), &tmp_prod[3])) {
-		/* Overflow possible, we know nothing */
-		smin = S32_MIN;
-		smax = S32_MAX;
-	} else {
-		smin = min_array(tmp_prod, 4);
-		smax = max_array(tmp_prod, 4);
-	}
-
-	reg_set_srange32(dst_reg, smin, smax);
-	reg_set_urange32(dst_reg, umin, umax);
+	dst_reg->r32 = cnum32_mul(dst_reg->r32, src_reg->r32);
 }
 
 static void scalar_min_max_mul(struct bpf_reg_state *dst_reg,
 			       struct bpf_reg_state *src_reg)
 {
-	s64 smin = reg_smin(dst_reg);
-	s64 smax = reg_smax(dst_reg);
-	u64 umin = reg_umin(dst_reg);
-	u64 umax = reg_umax(dst_reg);
-	s64 tmp_prod[4];
-
-	if (check_mul_overflow(umax, reg_umax(src_reg), &umax) ||
-	    check_mul_overflow(umin, reg_umin(src_reg), &umin)) {
-		/* Overflow possible, we know nothing */
-		umin = 0;
-		umax = U64_MAX;
-	}
-	if (check_mul_overflow(smin, reg_smin(src_reg), &tmp_prod[0]) ||
-	    check_mul_overflow(smin, reg_smax(src_reg), &tmp_prod[1]) ||
-	    check_mul_overflow(smax, reg_smin(src_reg), &tmp_prod[2]) ||
-	    check_mul_overflow(smax, reg_smax(src_reg), &tmp_prod[3])) {
-		/* Overflow possible, we know nothing */
-		smin = S64_MIN;
-		smax = S64_MAX;
-	} else {
-		smin = min_array(tmp_prod, 4);
-		smax = max_array(tmp_prod, 4);
-	}
-
-	reg_set_srange64(dst_reg, smin, smax);
-	reg_set_urange64(dst_reg, umin, umax);
+	dst_reg->r64 = cnum64_mul(dst_reg->r64, src_reg->r64);
 }
 
 static void scalar32_min_max_udiv(struct bpf_reg_state *dst_reg,
@@ -13904,7 +13572,6 @@ static void scalar32_min_max_udiv(struct bpf_reg_state *dst_reg,
 			 reg_u32_max(dst_reg) / src_val);
 
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_srange32(dst_reg, S32_MIN, S32_MAX);
 	reset_reg64_and_tnum(dst_reg);
 }
 
@@ -13917,7 +13584,6 @@ static void scalar_min_max_udiv(struct bpf_reg_state *dst_reg,
 			 div64_u64(reg_umax(dst_reg), src_val));
 
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
 	reset_reg32_and_tnum(dst_reg);
 }
 
@@ -13954,7 +13620,6 @@ static void scalar32_min_max_sdiv(struct bpf_reg_state *dst_reg,
 reset:
 	reg_set_srange32(dst_reg, smin, smax);
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_urange32(dst_reg, 0, U32_MAX);
 	reset_reg64_and_tnum(dst_reg);
 }
 
@@ -13991,7 +13656,6 @@ static void scalar_min_max_sdiv(struct bpf_reg_state *dst_reg,
 reset:
 	reg_set_srange64(dst_reg, smin, smax);
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_urange64(dst_reg, 0, U64_MAX);
 	reset_reg32_and_tnum(dst_reg);
 }
 
@@ -14011,7 +13675,6 @@ static void scalar32_min_max_umod(struct bpf_reg_state *dst_reg,
 	reg_set_urange32(dst_reg, 0, min(reg_u32_max(dst_reg), res_max));
 
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_srange32(dst_reg, S32_MIN, S32_MAX);
 	reset_reg64_and_tnum(dst_reg);
 }
 
@@ -14031,7 +13694,6 @@ static void scalar_min_max_umod(struct bpf_reg_state *dst_reg,
 	reg_set_urange64(dst_reg, 0, min(reg_umax(dst_reg), res_max));
 
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
 	reset_reg32_and_tnum(dst_reg);
 }
 
@@ -14071,7 +13733,6 @@ static void scalar32_min_max_smod(struct bpf_reg_state *dst_reg,
 	}
 
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_urange32(dst_reg, 0, U32_MAX);
 	reset_reg64_and_tnum(dst_reg);
 }
 
@@ -14111,7 +13772,6 @@ static void scalar_min_max_smod(struct bpf_reg_state *dst_reg,
 	}
 
 	/* Reset other ranges/tnum to unbounded/unknown. */
-	reg_set_urange64(dst_reg, 0, U64_MAX);
 	reset_reg32_and_tnum(dst_reg);
 }
 
@@ -14131,15 +13791,9 @@ static void scalar32_min_max_and(struct bpf_reg_state *dst_reg,
 	/* We get our minimum from the var_off, since that's inherently
 	 * bitwise.  Our maximum is the minimum of the operands' maxima.
 	 */
-	reg_set_urange32(dst_reg, var32_off.value, min(reg_u32_max(dst_reg), umax_val));
-
-	/* Safe to set s32 bounds by casting u32 result into s32 when u32
-	 * doesn't cross sign boundary. Otherwise set s32 bounds to unbounded.
-	 */
-	if ((s32)reg_u32_min(dst_reg) <= (s32)reg_u32_max(dst_reg))
-		reg_set_srange32(dst_reg, reg_u32_min(dst_reg), reg_u32_max(dst_reg));
-	else
-		reg_set_srange32(dst_reg, S32_MIN, S32_MAX);
+	reg_set_urange32(dst_reg,
+			 var32_off.value,
+			 min(reg_u32_max(dst_reg), umax_val));
 }
 
 static void scalar_min_max_and(struct bpf_reg_state *dst_reg,
@@ -14157,15 +13811,10 @@ static void scalar_min_max_and(struct bpf_reg_state *dst_reg,
 	/* We get our minimum from the var_off, since that's inherently
 	 * bitwise.  Our maximum is the minimum of the operands' maxima.
 	 */
-	reg_set_urange64(dst_reg, dst_reg->var_off.value, min(reg_umax(dst_reg), umax_val));
+	reg_set_urange64(dst_reg,
+			 dst_reg->var_off.value,
+			 min(reg_umax(dst_reg), umax_val));
 
-	/* Safe to set s64 bounds by casting u64 result into s64 when u64
-	 * doesn't cross sign boundary. Otherwise set s64 bounds to unbounded.
-	 */
-	if ((s64)reg_umin(dst_reg) <= (s64)reg_umax(dst_reg))
-		reg_set_srange64(dst_reg, reg_umin(dst_reg), reg_umax(dst_reg));
-	else
-		reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
 	/* We may learn something more from the var_off */
 	__update_reg_bounds(dst_reg);
 }
@@ -14186,16 +13835,9 @@ static void scalar32_min_max_or(struct bpf_reg_state *dst_reg,
 	/* We get our maximum from the var_off, and our minimum is the
 	 * maximum of the operands' minima
 	 */
-	reg_set_urange32(dst_reg, max(reg_u32_min(dst_reg), umin_val),
+	reg_set_urange32(dst_reg,
+			 max(reg_u32_min(dst_reg), umin_val),
 			 var32_off.value | var32_off.mask);
-
-	/* Safe to set s32 bounds by casting u32 result into s32 when u32
-	 * doesn't cross sign boundary. Otherwise set s32 bounds to unbounded.
-	 */
-	if ((s32)reg_u32_min(dst_reg) <= (s32)reg_u32_max(dst_reg))
-		reg_set_srange32(dst_reg, reg_u32_min(dst_reg), reg_u32_max(dst_reg));
-	else
-		reg_set_srange32(dst_reg, S32_MIN, S32_MAX);
 }
 
 static void scalar_min_max_or(struct bpf_reg_state *dst_reg,
@@ -14213,16 +13855,10 @@ static void scalar_min_max_or(struct bpf_reg_state *dst_reg,
 	/* We get our maximum from the var_off, and our minimum is the
 	 * maximum of the operands' minima
 	 */
-	reg_set_urange64(dst_reg, max(reg_umin(dst_reg), umin_val),
+	reg_set_urange64(dst_reg,
+			 max(reg_umin(dst_reg), umin_val),
 			 dst_reg->var_off.value | dst_reg->var_off.mask);
 
-	/* Safe to set s64 bounds by casting u64 result into s64 when u64
-	 * doesn't cross sign boundary. Otherwise set s64 bounds to unbounded.
-	 */
-	if ((s64)reg_umin(dst_reg) <= (s64)reg_umax(dst_reg))
-		reg_set_srange64(dst_reg, reg_umin(dst_reg), reg_umax(dst_reg));
-	else
-		reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
 	/* We may learn something more from the var_off */
 	__update_reg_bounds(dst_reg);
 }
@@ -14241,14 +13877,6 @@ static void scalar32_min_max_xor(struct bpf_reg_state *dst_reg,
 
 	/* We get both minimum and maximum from the var32_off. */
 	reg_set_urange32(dst_reg, var32_off.value, var32_off.value | var32_off.mask);
-
-	/* Safe to set s32 bounds by casting u32 result into s32 when u32
-	 * doesn't cross sign boundary. Otherwise set s32 bounds to unbounded.
-	 */
-	if ((s32)reg_u32_min(dst_reg) <= (s32)reg_u32_max(dst_reg))
-		reg_set_srange32(dst_reg, reg_u32_min(dst_reg), reg_u32_max(dst_reg));
-	else
-		reg_set_srange32(dst_reg, S32_MIN, S32_MAX);
 }
 
 static void scalar_min_max_xor(struct bpf_reg_state *dst_reg,
@@ -14264,31 +13892,21 @@ static void scalar_min_max_xor(struct bpf_reg_state *dst_reg,
 	}
 
 	/* We get both minimum and maximum from the var_off. */
-	reg_set_urange64(dst_reg, dst_reg->var_off.value,
+	reg_set_urange64(dst_reg,
+			 dst_reg->var_off.value,
 			 dst_reg->var_off.value | dst_reg->var_off.mask);
-
-	/* Safe to set s64 bounds by casting u64 result into s64 when u64
-	 * doesn't cross sign boundary. Otherwise set s64 bounds to unbounded.
-	 */
-	if ((s64)reg_umin(dst_reg) <= (s64)reg_umax(dst_reg))
-		reg_set_srange64(dst_reg, reg_umin(dst_reg), reg_umax(dst_reg));
-	else
-		reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
-
-	__update_reg_bounds(dst_reg);
 }
 
 static void __scalar32_min_max_lsh(struct bpf_reg_state *dst_reg,
 				   u64 umin_val, u64 umax_val)
 {
-	/* We lose all sign bit information (except what we can pick
-	 * up from var_off)
-	 */
-	reg_set_srange32(dst_reg, S32_MIN, S32_MAX);
 	/* If we might shift our top bit out, then we know nothing */
 	if (umax_val > 31 || reg_u32_max(dst_reg) > 1ULL << (31 - umax_val))
 		reg_set_urange32(dst_reg, 0, U32_MAX);
 	else
+		/* We lose all sign bit information (except what we can pick
+		 * up from var_off)
+		 */
 		reg_set_urange32(dst_reg, reg_u32_min(dst_reg) << umin_val,
 				 reg_u32_max(dst_reg) << umax_val);
 }
@@ -14314,23 +13932,27 @@ static void scalar32_min_max_lsh(struct bpf_reg_state *dst_reg,
 static void __scalar64_min_max_lsh(struct bpf_reg_state *dst_reg,
 				   u64 umin_val, u64 umax_val)
 {
+	struct cnum64 u, s;
+
 	/* Special case <<32 because it is a common compiler pattern to sign
 	 * extend subreg by doing <<32 s>>32. smin/smax assignments are correct
 	 * because s32 bounds don't flip sign when shifting to the left by
 	 * 32bits.
 	 */
 	if (umin_val == 32 && umax_val == 32)
-		reg_set_srange64(dst_reg, (s64)reg_s32_min(dst_reg) << 32,
-				 (s64)reg_s32_max(dst_reg) << 32);
+		s = cnum64_from_srange((s64)reg_s32_min(dst_reg) << 32,
+				       (s64)reg_s32_max(dst_reg) << 32);
 	else
-		reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
+		s = CNUM64_UNBOUNDED;
 
 	/* If we might shift our top bit out, then we know nothing */
 	if (reg_umax(dst_reg) > 1ULL << (63 - umax_val))
-		reg_set_urange64(dst_reg, 0, U64_MAX);
+		u = CNUM64_UNBOUNDED;
 	else
-		reg_set_urange64(dst_reg, reg_umin(dst_reg) << umin_val,
-				 reg_umax(dst_reg) << umax_val);
+		u = cnum64_from_urange(reg_umin(dst_reg) << umin_val,
+				       reg_umax(dst_reg) << umax_val);
+
+	dst_reg->r64 = cnum64_intersect(u, s);
 }
 
 static void scalar_min_max_lsh(struct bpf_reg_state *dst_reg,
@@ -14369,7 +13991,6 @@ static void scalar32_min_max_rsh(struct bpf_reg_state *dst_reg,
 	 * and rely on inferring new ones from the unsigned bounds and
 	 * var_off of the result.
 	 */
-	reg_set_srange32(dst_reg, S32_MIN, S32_MAX);
 
 	dst_reg->var_off = tnum_rshift(subreg, umin_val);
 	reg_set_urange32(dst_reg, reg_u32_min(dst_reg) >> umax_val,
@@ -14399,7 +14020,6 @@ static void scalar_min_max_rsh(struct bpf_reg_state *dst_reg,
 	 * and rely on inferring new ones from the unsigned bounds and
 	 * var_off of the result.
 	 */
-	reg_set_srange64(dst_reg, S64_MIN, S64_MAX);
 	dst_reg->var_off = tnum_rshift(dst_reg->var_off, umin_val);
 	reg_set_urange64(dst_reg, reg_umin(dst_reg) >> umax_val,
 			 reg_umax(dst_reg) >> umin_val);
@@ -14419,17 +14039,14 @@ static void scalar32_min_max_arsh(struct bpf_reg_state *dst_reg,
 
 	/* Upon reaching here, src_known is true and
 	 * umax_val is equal to umin_val.
+	 * Blow away the dst_reg umin_value/umax_value and rely on
+	 * dst_reg var_off to refine the result.
 	 */
 	reg_set_srange32(dst_reg,
 			 (u32)(((s32)reg_s32_min(dst_reg)) >> umin_val),
 			 (u32)(((s32)reg_s32_max(dst_reg)) >> umin_val));
 
 	dst_reg->var_off = tnum_arshift(tnum_subreg(dst_reg->var_off), umin_val, 32);
-
-	/* blow away the dst_reg umin_value/umax_value and rely on
-	 * dst_reg var_off to refine the result.
-	 */
-	reg_set_urange32(dst_reg, 0, U32_MAX);
 
 	__mark_reg64_unbounded(dst_reg);
 	__update_reg32_bounds(dst_reg);
@@ -14447,11 +14064,6 @@ static void scalar_min_max_arsh(struct bpf_reg_state *dst_reg,
 			 reg_smax(dst_reg) >> umin_val);
 
 	dst_reg->var_off = tnum_arshift(dst_reg->var_off, umin_val, 64);
-
-	/* blow away the dst_reg umin_value/umax_value and rely on
-	 * dst_reg var_off to refine the result.
-	 */
-	reg_set_urange64(dst_reg, 0, U64_MAX);
 
 	/* Its not easy to operate on alu32 bounds here because it depends
 	 * on bits being shifted in from upper 32-bits. Take easy way out
@@ -15522,6 +15134,8 @@ static u8 rev_opcode(u8 opcode)
 static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state *reg2,
 				u8 opcode, bool is_jmp32)
 {
+	struct cnum32 lo32, hi32;
+	struct cnum64 lo, hi;
 	struct tnum t;
 	u64 val;
 
@@ -15541,23 +15155,15 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 	switch (opcode) {
 	case BPF_JEQ:
 		if (is_jmp32) {
-			reg_set_urange32(reg1, max(reg_u32_min(reg1), reg_u32_min(reg2)),
-					 min(reg_u32_max(reg1), reg_u32_max(reg2)));
-			reg_set_srange32(reg1, max(reg_s32_min(reg1), reg_s32_min(reg2)),
-					 min(reg_s32_max(reg1), reg_s32_max(reg2)));
-			reg_set_urange32(reg2, reg_u32_min(reg1), reg_u32_max(reg1));
-			reg_set_srange32(reg2, reg_s32_min(reg1), reg_s32_max(reg1));
+			reg1->r32 = cnum32_intersect(reg1->r32, reg2->r32);
+			reg2->r32 = reg1->r32;
 
 			t = tnum_intersect(tnum_subreg(reg1->var_off), tnum_subreg(reg2->var_off));
 			reg1->var_off = tnum_with_subreg(reg1->var_off, t);
 			reg2->var_off = tnum_with_subreg(reg2->var_off, t);
 		} else {
-			reg_set_urange64(reg1, max(reg_umin(reg1), reg_umin(reg2)),
-					 min(reg_umax(reg1), reg_umax(reg2)));
-			reg_set_srange64(reg1, max(reg_smin(reg1), reg_smin(reg2)),
-					 min(reg_smax(reg1), reg_smax(reg2)));
-			reg_set_urange64(reg2, reg_umin(reg1), reg_umax(reg1));
-			reg_set_srange64(reg2, reg_smin(reg1), reg_smax(reg1));
+			reg1->r64 = cnum64_intersect(reg1->r64, reg2->r64);
+			reg2->r64 = reg1->r64;
 
 			reg1->var_off = tnum_intersect(reg1->var_off, reg2->var_off);
 			reg2->var_off = reg1->var_off;
@@ -15574,32 +15180,13 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 		 */
 		val = reg_const_value(reg2, is_jmp32);
 		if (is_jmp32) {
-			/* u32_min is not equal to 0xffffffff at this point,
-			 * because otherwise u32_max is 0xffffffff as well,
-			 * in such a case both reg1 and reg2 would be constants,
-			 * jump would be predicted and regs_refine_cond_op()
-			 * wouldn't be called.
-			 *
-			 * Same reasoning works for all {u,s}{min,max}{32,64} cases
-			 * below.
-			 */
-			if (reg_u32_min(reg1) == (u32)val)
-				reg_set_urange32(reg1, reg_u32_min(reg1) + 1, reg_u32_max(reg1));
-			if (reg_u32_max(reg1) == (u32)val)
-				reg_set_urange32(reg1, reg_u32_min(reg1), reg_u32_max(reg1) - 1);
-			if (reg_s32_min(reg1) == (s32)val)
-				reg_set_srange32(reg1, reg_s32_min(reg1) + 1, reg_s32_max(reg1));
-			if (reg_s32_max(reg1) == (s32)val)
-				reg_set_srange32(reg1, reg_s32_min(reg1), reg_s32_max(reg1) - 1);
+			/* Complement of the range [val, val] as cnum32. */
+			lo32 = (struct cnum32){ val + 1, U32_MAX - 1 };
+			reg1->r32 = cnum32_intersect(reg1->r32, lo32);
 		} else {
-			if (reg_umin(reg1) == (u64)val)
-				reg_set_urange64(reg1, reg_umin(reg1) + 1, reg_umax(reg1));
-			if (reg_umax(reg1) == (u64)val)
-				reg_set_urange64(reg1, reg_umin(reg1), reg_umax(reg1) - 1);
-			if (reg_smin(reg1) == (s64)val)
-				reg_set_srange64(reg1, reg_smin(reg1) + 1, reg_smax(reg1));
-			if (reg_smax(reg1) == (s64)val)
-				reg_set_srange64(reg1, reg_smin(reg1), reg_smax(reg1) - 1);
+			/* Complement of the range [val, val] as cnum64. */
+			lo = (struct cnum64){ val + 1, U64_MAX - 1 };
+			reg1->r64 = cnum64_intersect(reg1->r64, lo);
 		}
 		break;
 	case BPF_JSET:
@@ -15646,38 +15233,54 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 		break;
 	case BPF_JLE:
 		if (is_jmp32) {
-			reg_set_urange32(reg1, reg_u32_min(reg1), min(reg_u32_max(reg1), reg_u32_max(reg2)));
-			reg_set_urange32(reg2, max(reg_u32_min(reg1), reg_u32_min(reg2)), reg_u32_max(reg2));
+			lo32 = cnum32_from_urange(0, reg_u32_max(reg2));
+			hi32 = cnum32_from_urange(reg_u32_min(reg1), U32_MAX);
+			reg1->r32 = cnum32_intersect(reg1->r32, lo32);
+			reg2->r32 = cnum32_intersect(reg2->r32, hi32);
 		} else {
-			reg_set_urange64(reg1, reg_umin(reg1), min(reg_umax(reg1), reg_umax(reg2)));
-			reg_set_urange64(reg2, max(reg_umin(reg1), reg_umin(reg2)), reg_umax(reg2));
+			lo = cnum64_from_urange(0, reg_umax(reg2));
+			hi = cnum64_from_urange(reg_umin(reg1), U64_MAX);
+			reg1->r64 = cnum64_intersect(reg1->r64, lo);
+			reg2->r64 = cnum64_intersect(reg2->r64, hi);
 		}
 		break;
 	case BPF_JLT:
 		if (is_jmp32) {
-			reg_set_urange32(reg1, reg_u32_min(reg1), min(reg_u32_max(reg1), reg_u32_max(reg2) - 1));
-			reg_set_urange32(reg2, max(reg_u32_min(reg1) + 1, reg_u32_min(reg2)), reg_u32_max(reg2));
+			lo32 = cnum32_from_urange(0, reg_u32_max(reg2) - 1);
+			hi32 = cnum32_from_urange(reg_u32_min(reg1) + 1, U32_MAX);
+			reg1->r32 = cnum32_intersect(reg1->r32, lo32);
+			reg2->r32 = cnum32_intersect(reg2->r32, hi32);
 		} else {
-			reg_set_urange64(reg1, reg_umin(reg1), min(reg_umax(reg1), reg_umax(reg2) - 1));
-			reg_set_urange64(reg2, max(reg_umin(reg1) + 1, reg_umin(reg2)), reg_umax(reg2));
+			lo = cnum64_from_urange(0, reg_umax(reg2) - 1);
+			hi = cnum64_from_urange(reg_umin(reg1) + 1, U64_MAX);
+			reg1->r64 = cnum64_intersect(reg1->r64, lo);
+			reg2->r64 = cnum64_intersect(reg2->r64, hi);
 		}
 		break;
 	case BPF_JSLE:
 		if (is_jmp32) {
-			reg_set_srange32(reg1, reg_s32_min(reg1), min(reg_s32_max(reg1), reg_s32_max(reg2)));
-			reg_set_srange32(reg2, max(reg_s32_min(reg1), reg_s32_min(reg2)), reg_s32_max(reg2));
+			lo32 = cnum32_from_srange(S32_MIN, reg_s32_max(reg2));
+			hi32 = cnum32_from_srange(reg_s32_min(reg1), S32_MAX);
+			reg1->r32 = cnum32_intersect(reg1->r32, lo32);
+			reg2->r32 = cnum32_intersect(reg2->r32, hi32);
 		} else {
-			reg_set_srange64(reg1, reg_smin(reg1), min(reg_smax(reg1), reg_smax(reg2)));
-			reg_set_srange64(reg2, max(reg_smin(reg1), reg_smin(reg2)), reg_smax(reg2));
+			lo = cnum64_from_srange(S64_MIN, reg_smax(reg2));
+			hi = cnum64_from_srange(reg_smin(reg1), S64_MAX);
+			reg1->r64 = cnum64_intersect(reg1->r64, lo);
+			reg2->r64 = cnum64_intersect(reg2->r64, hi);
 		}
 		break;
 	case BPF_JSLT:
 		if (is_jmp32) {
-			reg_set_srange32(reg1, reg_s32_min(reg1), min(reg_s32_max(reg1), reg_s32_max(reg2) - 1));
-			reg_set_srange32(reg2, max(reg_s32_min(reg1) + 1, reg_s32_min(reg2)), reg_s32_max(reg2));
+			lo32 = cnum32_from_urange(S32_MIN, reg_s32_max(reg2) - 1);
+			hi32 = cnum32_from_urange(reg_s32_min(reg1) + 1, S32_MAX);
+			reg1->r32 = cnum32_intersect(reg1->r32, lo32);
+			reg2->r32 = cnum32_intersect(reg2->r32, hi32);
 		} else {
-			reg_set_srange64(reg1, reg_smin(reg1), min(reg_smax(reg1), reg_smax(reg2) - 1));
-			reg_set_srange64(reg2, max(reg_smin(reg1) + 1, reg_smin(reg2)), reg_smax(reg2));
+			lo = cnum64_from_urange(S64_MIN, reg_smax(reg2) - 1);
+			hi = cnum64_from_urange(reg_smin(reg1) + 1, S64_MAX);
+			reg1->r64 = cnum64_intersect(reg1->r64, lo);
+			reg2->r64 = cnum64_intersect(reg2->r64, hi);
 		}
 		break;
 	default:
