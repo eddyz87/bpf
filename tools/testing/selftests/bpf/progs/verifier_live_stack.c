@@ -2516,3 +2516,168 @@ static __used __naked void imprecise_fill_cross_frame(void)
 	:: __imm(bpf_get_prandom_u32)
 	: __clobber_all);
 }
+
+/* Test that a write through an offset-imprecise pointer does not
+ * destroy at_stack tracking for subsequent reads. Use "r2 = -8;
+ * r1 += r2" to make arg tracking lose offset precision while the
+ * main verifier keeps r1 as PTR_TO_STACK with fixed offset.
+ *
+ * After the imprecise write, read back fp-16 and deref.
+ * The deref should produce a use for fp-32 (where the spilled
+ * pointer points), but currently the imprecise write clears
+ * at_stack to none, so the read fills ARG_NONE and the deref
+ * produces no use.
+ */
+SEC("socket")
+__log_level(2)
+__success
+/* the deref at insn 15 should produce a use */
+__msg("15: (79) r0 = *(u64 *)(r0 +0)         ; use:")
+__naked void spill_join_with_imprecise_off(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 24) = 0;"
+	"*(u64 *)(r10 - 32) = 0;"
+	"r1 = r10;"
+	"r1 += -24;"
+	"*(u64 *)(r10 - 8) = r1;"
+	"r1 = r10;"
+	"r1 += -32;"
+	"*(u64 *)(r10 - 16) = r1;"
+	/* r1 = fp-8 but arg tracking sees off_cnt == 0 */
+	"r1 = r10;"
+	"r2 = -8;"
+	"r1 += r2;"
+	/* write through imprecise r1 */
+	"r3 = r10;"
+	"r3 += -24;"
+	"*(u64 *)(r1 + 0) = r3;"
+	/* read back fp-16: at_stack should still track &fp-32 */
+	"r0 = *(u64 *)(r10 - 16);"
+	/* deref: should produce use for fp-32 */
+	"r0 = *(u64 *)(r0 + 0);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test that spill_to_stack with multi-offset dst (sz=8) joins instead
+ * of overwriting. r1 has offsets [-8, -16]. Both slots hold FP-derived
+ * pointers. Writing through r1 should join *val with existing values,
+ * not destroy them.
+ *
+ *   fp-8  = &fp-24
+ *   fp-16 = &fp-32
+ *   r1 = fp-8 or fp-16 (two offsets from branch)
+ *   *(u64 *)(r1 + 0) = &fp-24   -- writes to one slot, other untouched
+ *   r0 = *(u64 *)(r10 - 16)     -- fill from fp-16
+ *   r0 = *(u64 *)(r0 + 0)       -- deref: should produce use
+ *
+ * Bug: both slots overwritten with &fp-24, old fp-16 tracking lost,
+ * deref produces no use for fp-32.
+ */
+SEC("socket")
+__log_level(2)
+__success
+/* deref after fp-16 fill should produce a use for fp-32 */
+__msg("r0 = *(u64 *)(r10 -16)")
+__msg("r0 = *(u64 *)(r0 +0)         ; use:"
+__naked void spill_join_with_multi_off(void)
+{
+	asm volatile (
+	/* fp-8 = &fp-24, fp-16 = &fp-32 (different pointers) */
+	"*(u64 *)(r10 - 24) = 0;"
+	"*(u64 *)(r10 - 32) = 0;"
+	"r1 = r10;"
+	"r1 += -24;"
+	"*(u64 *)(r10 - 8) = r1;"
+	"r1 = r10;"
+	"r1 += -32;"
+	"*(u64 *)(r10 - 16) = r1;"
+	/* create r1 with two candidate offsets: fp-8 or fp-16 */
+	"call %[bpf_get_prandom_u32];"
+	"if r0 == 0 goto 1f;"
+	"r1 = r10;"
+	"r1 += -8;"
+	"goto 2f;"
+"1:"
+	"r1 = r10;"
+	"r1 += -16;"
+"2:"
+	/* write &fp-24 through multi-offset r1: hits one slot, other untouched */
+	"r2 = r10;"
+	"r2 += -24;"
+	"*(u64 *)(r1 + 0) = r2;"
+	/* read back *fp-8 and *fp-16 */
+	"r0 = *(u64 *)(r10 - 8);"
+	"r0 = *(u64 *)(r0 + 0);"
+	"r0 = *(u64 *)(r10 - 16);"
+	"r0 = *(u64 *)(r0 + 0);"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* Test that spill_to_stack with imprecise dst (sz=8) collects the
+ * union of all slot values plus *val. r1 = fp + variable offset,
+ * so clear_overlapping_stack_slots is called with OFF_IMPRECISE.
+ * Currently it writes none to all slots, destroying tracking.
+ *
+ *   fp-8  = &fp-24
+ *   fp-16 = &fp-32
+ *   r1 = fp + imprecise offset
+ *   *(u64 *)(r1 + 0) = &fp-32
+ *   r0 = *(u64 *)(r10 - 16)
+ *   r0 = *(u64 *)(r0 + 0)       -- should work
+ *
+ * Bug: all slots get none, fp-16 tracking lost -> poisoned -> rejected.
+ */
+
+/* Test that spill_to_stack with multi-offset dst (sz=4) joins with
+ * none instead of overwriting. A 4-byte write destroys the spill it
+ * hits, but the slot it doesn't hit should keep its value.
+ *
+ *   fp-8  = &fp-24
+ *   fp-16 = &fp-32
+ *   r1 = fp-8 or fp-16 (two offsets from branch)
+ *   *(u32 *)(r1 + 0) = 0        -- 4-byte partial write
+ *   r0 = *(u64 *)(r10 - 16)     -- fill from fp-16
+ *   r0 = *(u64 *)(r0 + 0)       -- deref: should produce use
+ *
+ * Bug: both slots get none, deref produces no use.
+ */
+SEC("socket")
+__log_level(2)
+__success
+__msg("17: (79) r0 = *(u64 *)(r0 +0)         ; use:")
+__naked void spill_join_with_none(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 24) = 0;"
+	"*(u64 *)(r10 - 32) = 0;"
+	"r1 = r10;"
+	"r1 += -24;"
+	"*(u64 *)(r10 - 8) = r1;"
+	"r1 = r10;"
+	"r1 += -32;"
+	"*(u64 *)(r10 - 16) = r1;"
+	/* create r1 with two candidate offsets */
+	"call %[bpf_get_prandom_u32];"
+	"if r0 == 0 goto 1f;"
+	"r1 = r10;"
+	"r1 += -8;"
+	"goto 2f;"
+"1:"
+	"r1 = r10;"
+	"r1 += -16;"
+"2:"
+	/* 4-byte write through multi-offset r1 */
+	"*(u32 *)(r1 + 0) = 0;"
+	/* read back fp-16 and deref */
+	"r0 = *(u64 *)(r10 - 16);"
+	"r0 = *(u64 *)(r0 + 0);"
+	"r0 = 0;"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
