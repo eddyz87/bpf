@@ -2453,3 +2453,66 @@ __naked void load_acquire_dont_clear_dst(void)
 }
 
 #endif /* CAN_USE_LOAD_ACQ_STORE_REL */
+
+// sashiko:
+//
+// > +static struct arg_track fill_from_stack(struct bpf_insn *insn,
+// > +					struct arg_track *at_out, int reg,
+// > +					struct arg_track *at_stack_out,
+// > +					int depth)
+// > +{
+// > +	int frame = at_out[reg].frame;
+// > +	struct arg_track imp = {
+// > +		.mask = frame >= 0 ? BIT(frame) : (1u << (depth + 1)) - 1,
+// > +		.frame = ARG_IMPRECISE
+// > +	};
+// [ ... ]
+// > +	cnt = at_out[reg].off_cnt;
+// > +	if (cnt == 0)
+// > +		return imp;
+// When returning imp for an offset-imprecise pointer (cnt == 0),
+// does this incorrectly assume the loaded pointer points to frame?
+// If a pointer to a different frame was previously spilled, it seems the
+// analysis drops its identity entirely, which could lead to missing liveness
+// marks later.
+//
+// My interpretation:
+// - fill_from_stack() handles situation like r1 = *r2
+// - ideally it assigns to r1 at_stack_out[slot] where slot corresponds to at_out[reg]
+// - meaning that r1 points to frames at which *r2 points
+// - but `imp` is constructed such that it takes frames from r2, not from *r2
+SEC("socket")
+__success
+__naked void imprecise_fill_loses_cross_frame(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 8) = 0;"
+	"r1 = r10;"
+	"r1 += -8;"
+	"call imprecise_fill_cross_frame;"
+	"exit;"
+	::: __clobber_all);
+}
+
+static __used __naked void imprecise_fill_cross_frame(void)
+{
+	asm volatile (
+	/* spill &caller_fp-8 to callee's fp-8 */
+	"*(u64 *)(r10 - 8) = r1;"
+	/* imprecise FP pointer in r1 */
+	"r1 = r10;"
+	"r2 = -8;"
+	"r1 += r2;"
+	/* load from imprecise offset. fill_from_stack returns
+	 * ARG_IMPRECISE{mask=BIT(1)}, losing frame 0.
+	 */
+	"r1 = *(u64 *)(r1 + 0);"
+	/* read caller's fp-8 through loaded pointer.
+	 * liveness should mark fp0-8 live but doesn't due to mask=BIT(1).
+	 */
+	"r0 = *(u64 *)(r1 + 0);"
+	"r0 = 0;"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
