@@ -2,6 +2,67 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/bits.h>
+#include <linux/math64.h>
+
+/* *result = c*d - a*b, if fits in u32; all operands unsigned */
+static bool check_mul_u32_u32_sub(u32 a, u32 b, u32 c, u32 d, u32 *result)
+{
+	u64 size = (u64)c * d - (u64)a * b;
+
+	if (size > U32_MAX)
+		return false;
+	*result = size;
+	return true;
+}
+
+/* *result = c*d - a*b, if fits in u32; all operands signed */
+static bool check_mul_s32_s32_sub(s32 a, s32 b, s32 c, s32 d, u32 *result)
+{
+	s64 size = (s64)c * d - (s64)a * b;
+
+	if (size > U32_MAX)
+		return false;
+	*result = size;
+	return true;
+}
+
+/* Return (s128)a * b >> shift */
+static s64 mul_s64_s64_shr(s64 a, s64 b, unsigned int shift)
+{
+	return mul_s64_u64_shr(a, abs(b), shift) * (b < 0 ? -1 : 1);
+}
+
+/* *result = c*d - a*b, if fits in u64; all operands unsigned */
+static bool check_mul_u64_u64_sub(u64 a, u64 b, u64 c, u64 d, u64 *result)
+{
+	u64 cd_hi = mul_u64_u64_shr(c, d, 64);
+	u64 cd_lo = c * d;
+	u64 ab_hi = mul_u64_u64_shr(a, b, 64);
+	u64 ab_lo = a * b;
+	u64 borrow = cd_lo < ab_lo;
+	u64 hi = cd_hi - ab_hi - borrow;
+
+	if (hi != 0)
+		return false;
+	*result = cd_lo - ab_lo;
+	return true;
+}
+
+/* *result = c*d - a*b, if fits in u64; all operands signed */
+static bool check_mul_s64_s64_sub(s64 a, s64 b, s64 c, s64 d, u64 *result)
+{
+	s64 cd_hi = mul_s64_s64_shr(c, d, 64);
+	u64 cd_lo = (u64)c * (u64)d;
+	s64 ab_hi = mul_s64_s64_shr(a, b, 64);
+	u64 ab_lo = (u64)a * (u64)b;
+	u64 borrow = cd_lo < ab_lo;
+	s64 hi = cd_hi - ab_hi - borrow;
+
+	if (hi != 0)
+		return false;
+	*result = cd_lo - ab_lo;
+	return true;
+}
 
 #define T 32
 #include "cnum_defs.h"

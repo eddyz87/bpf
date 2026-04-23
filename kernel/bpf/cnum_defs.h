@@ -11,19 +11,19 @@
 #include <linux/compiler_types.h>
 
 #if T == 32
-#define ut2 u64
-#define st2 s64
 #define utt u32
 #define stt s32
 #define EMPTY CNUM32_EMPTY
+#define check_mul_sub check_mul_u32_u32_sub
+#define check_mul_sub_s check_mul_s32_s32_sub
 #elif T == 64
-#define ut2 unsigned __int128
-#define st2 signed __int128
 #define utt u64
 #define stt s64
 #define EMPTY CNUM64_EMPTY
+#define check_mul_sub check_mul_u64_u64_sub
+#define check_mul_sub_s check_mul_s64_s64_sub
 #else
-#error "Unsupported T value, cannot define ut2/st2"
+#error "Unsupported T value"
 #endif
 
 #define cnum_t  __PASTE(cnum, T)
@@ -365,20 +365,20 @@ static int FN(cut)(struct cnum_t a, struct cnum_t chunks[3])
 
 static struct cnum_t FN(mk_mul_u)(utt a, utt b, utt c, utt d)
 {
-	ut2 size = (ut2)c * d - (ut2)a * b;
+	utt size;
 
-	if (size > UT_MAX)
+	if (!check_mul_sub(a, b, c, d, &size))
 		return (struct cnum_t){ 0, UT_MAX };
-	return (struct cnum_t){ a * b, size };
+	return (struct cnum_t){ (ut)(a * b), size };
 }
 
 static struct cnum_t FN(mk_mul_s)(stt a, stt b, stt c, stt d)
 {
-	st2 size = (st2)c * d - (st2)a * b;
+	utt size;
 
-	if (size > UT_MAX)
+	if (!check_mul_sub_s(a, b, c, d, &size))
 		return (struct cnum_t){ 0, UT_MAX };
-	return (struct cnum_t){ a * b, size };
+	return (struct cnum_t){ (ut)(a * b), size };
 }
 
 static struct cnum_t FN(mul_chunk)(struct cnum_t a, struct cnum_t b)
@@ -433,11 +433,11 @@ struct cnum_t FN(mul)(struct cnum_t a, struct cnum_t b)
 #undef cnum_t
 #undef ut
 #undef st
-#undef ut2
-#undef st2
 #undef utt
 #undef stt
 #undef UT_MAX
 #undef ST_MAX
 #undef ST_MIN
 #undef FN
+#undef check_mul_sub
+#undef check_mul_sub_s
