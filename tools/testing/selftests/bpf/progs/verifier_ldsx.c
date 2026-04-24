@@ -286,7 +286,7 @@ __jited("add	x11, x0, x28")
 __jited("ldrsh	x22, [x11, #0x18]")
 __jited("add	x11, x0, x28")
 __jited("ldrsb	x22, [x11, #0x20]")
-__naked void arena_ldsx_disasm(void *ctx)
+__naked void arena_ldsx_disasm(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"
@@ -317,7 +317,7 @@ __description("Arena LDSX Exception")
 __success __retval(0)
 __arch_x86_64
 __arch_arm64
-__naked void arena_ldsx_exception(void *ctx)
+__naked void arena_ldsx_exception(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"
@@ -338,7 +338,7 @@ __description("Arena LDSX, S8")
 __success __retval(-1)
 __arch_x86_64
 __arch_arm64
-__naked void arena_ldsx_s8(void *ctx)
+__naked void arena_ldsx_s8(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"
@@ -369,7 +369,7 @@ __description("Arena LDSX, S16")
 __success __retval(-1)
 __arch_x86_64
 __arch_arm64
-__naked void arena_ldsx_s16(void *ctx)
+__naked void arena_ldsx_s16(void)
 {
 	asm volatile (
 	"r1 = %[arena] ll;"

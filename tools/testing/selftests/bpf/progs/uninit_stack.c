@@ -33,7 +33,7 @@ __naked int read_uninit_stack_fixed_off(void *ctx)
 
 /* Read an uninitialized value from stack at a variable offset */
 SEC("socket")
-__naked int read_uninit_stack_var_off(void *ctx)
+__naked int read_uninit_stack_var_off(void)
 {
 	asm volatile ("					\
 		call %[bpf_get_prandom_u32];		\

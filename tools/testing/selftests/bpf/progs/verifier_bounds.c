@@ -1669,7 +1669,7 @@ l0_%=:	r0 = 0;				\
 SEC("socket")
 __description("dead jne branch due to disagreeing tnums")
 __success __log_level(2)
-__naked void jne_disagreeing_tnums(void *ctx)
+__naked void jne_disagreeing_tnums(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1689,7 +1689,7 @@ __naked void jne_disagreeing_tnums(void *ctx)
 SEC("socket")
 __description("dead jeq branch due to disagreeing tnums")
 __success __log_level(2)
-__naked void jeq_disagreeing_tnums(void *ctx)
+__naked void jeq_disagreeing_tnums(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1712,7 +1712,7 @@ __description("conditional jump on same register, branch taken")
 __not_msg("20: (b7) r0 = 1 {{.*}} R0=1")
 __success __log_level(2)
 __retval(0)
-__naked void condition_jump_on_same_register(void *ctx)
+__naked void condition_jump_on_same_register(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1747,7 +1747,7 @@ __description("jset on same register, constant value branch taken")
 __not_msg("7: (b7) r0 = 1 {{.*}} R0=1")
 __success __log_level(2)
 __retval(0)
-__naked void jset_on_same_register_1(void *ctx)
+__naked void jset_on_same_register_1(void)
 {
 	asm volatile("			\
 	r0 = 0;				\
@@ -1769,7 +1769,7 @@ __description("jset on same register, scalar value branch taken")
 __not_msg("12: (b7) r0 = 1 {{.*}} R0=1")
 __success __log_level(2)
 __retval(0)
-__naked void jset_on_same_register_2(void *ctx)
+__naked void jset_on_same_register_2(void)
 {
 	asm volatile("			\
 	/* range [1;2] */		\
@@ -1798,7 +1798,7 @@ __description("jset on same register, scalar value unknown branch 1")
 __msg("3: (b7) r0 = 0 {{.*}} R0=0")
 __msg("5: (b7) r0 = 1 {{.*}} R0=1")
 __success __log_level(2)
-__naked void jset_on_same_register_3(void *ctx)
+__naked void jset_on_same_register_3(void)
 {
 	asm volatile("			\
 	/* range [0;1] */		\
@@ -1819,7 +1819,7 @@ __description("jset on same register, scalar value unknown branch 2")
 __msg("4: (b7) r0 = 0 {{.*}} R0=0")
 __msg("6: (b7) r0 = 1 {{.*}} R0=1")
 __success __log_level(2)
-__naked void jset_on_same_register_4(void *ctx)
+__naked void jset_on_same_register_4(void)
 {
 	asm volatile("			\
 	/* range [-1;0] */		\
@@ -1841,7 +1841,7 @@ __description("jset on same register, scalar value unknown branch 3")
 __msg("4: (b7) r0 = 0 {{.*}} R0=0")
 __msg("6: (b7) r0 = 1 {{.*}} R0=1")
 __success __log_level(2)
-__naked void jset_on_same_register_5(void *ctx)
+__naked void jset_on_same_register_5(void)
 {
 	asm volatile("			\
 	/* range [-1;1] */		\
@@ -1872,7 +1872,7 @@ SEC("socket")
 __description("bounds refinement with single-value tnum on umax")
 __msg("3: (15) if r0 == 0xe0 {{.*}} R0=240")
 __success __log_level(2)
-__naked void bounds_refinement_tnum_umax(void *ctx)
+__naked void bounds_refinement_tnum_umax(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1901,7 +1901,7 @@ SEC("socket")
 __description("bounds refinement with single-value tnum on umin")
 __msg("3: (15) if r0 == 0xf0 {{.*}} R0=224")
 __success __log_level(2)
-__naked void bounds_refinement_tnum_umin(void *ctx)
+__naked void bounds_refinement_tnum_umin(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1934,7 +1934,7 @@ SEC("socket")
 __description("bounds refinement with single-value tnum in middle of range")
 __msg("3: (a5) if r0 < 0x7cf {{.*}} R0=2000")
 __success __log_level(2)
-__naked void bounds_refinement_tnum_middle(void *ctx)
+__naked void bounds_refinement_tnum_middle(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1957,7 +1957,7 @@ SEC("socket")
 __description("bounds refinement: several overlaps between tnum and u64")
 __msg("2: (25) if r0 > 0x1 {{.*}} R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=1,var_off=(0x0; 0x1))")
 __failure __log_level(2)
-__naked void bounds_refinement_several_overlaps(void *ctx)
+__naked void bounds_refinement_several_overlaps(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1979,7 +1979,7 @@ SEC("socket")
 __description("bounds refinement: multiple overlaps between tnum and u64")
 __msg("2: (25) if r0 > 0x10 {{.*}} R0=scalar(smin=umin=smin32=umin32=15,smax=umax=smax32=umax32=16,var_off=(0x0; 0x1f))")
 __failure __log_level(2)
-__naked void bounds_refinement_multiple_overlaps(void *ctx)
+__naked void bounds_refinement_multiple_overlaps(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -1995,7 +1995,7 @@ __naked void bounds_refinement_multiple_overlaps(void *ctx)
 
 SEC("socket")
 __success
-__naked void signed_unsigned_intersection32_case1(void *ctx)
+__naked void signed_unsigned_intersection32_case1(void)
 {
 	asm volatile("									\
 	call %[bpf_get_prandom_u32];							\
@@ -2012,7 +2012,7 @@ __naked void signed_unsigned_intersection32_case1(void *ctx)
 
 SEC("socket")
 __success
-__naked void signed_unsigned_intersection32_case2(void *ctx)
+__naked void signed_unsigned_intersection32_case2(void)
 {
 	asm volatile("									\
 	call %[bpf_get_prandom_u32];							\
@@ -2046,7 +2046,7 @@ __description("bounds refinement: 64bits ranges not overwritten by 32bits ranges
 __msg("3: (65) if r0 s> 0x2 {{.*}} R0=scalar(smin=0x8000000000000002,smax=2,umin=smin32=umin32=2,umax=0xffffffff00000003,smax32=umax32=3")
 __msg("4: (25) if r0 > 0x13 {{.*}} R0=2")
 __success __log_level(2)
-__naked void refinement_32bounds_not_overwriting_64bounds(void *ctx)
+__naked void refinement_32bounds_not_overwriting_64bounds(void)
 {
 	asm volatile("			\
 	call %[bpf_get_prandom_u32];	\
@@ -2163,7 +2163,7 @@ l0_%=:	r0 = 0;						\
 SEC("socket")
 __description("dead branch: tnums give impossible constant if equal")
 __success
-__naked void tnums_equal_impossible_constant(void *ctx)
+__naked void tnums_equal_impossible_constant(void)
 {
 	asm volatile("						\
 	call %[bpf_get_prandom_u32];				\
