@@ -368,6 +368,21 @@ struct bpf_retval_range {
 	bool return_32bit;
 };
 
+struct bpf_loop_iters {
+	u32 min_header_count;   /* min number of times header is executed */
+	u32 max_header_count;   /* max number of times header is executed */
+	bool pre_cond;
+};
+
+struct loop_stack_entry {
+	struct bpf_verifier_state *entry_state;
+	struct bpf_loop_iters iters;
+	u32 loop_id:31;
+	u32 terminates:1;
+};
+
+#define LOOP_STACK_SIZE 16
+
 /* state of the program:
  * type of all registers and stack info
  */
@@ -406,6 +421,12 @@ struct bpf_func_state {
 	 *                           | number of simulations is tracked in frame N
 	 */
 	u32 callback_depth;
+	/*
+	 * Control-flow loop nesting at the current insn within this frame's
+	 * subprogram (loops never cross subprogram boundaries).
+	 */
+	u32 loop_stack_cnt;
+	struct loop_stack_entry loop_stack[LOOP_STACK_SIZE];
 
 	/* The following fields should be last. See copy_func_state() */
 	/* The state of the stack. Each element of the array describes BPF_REG_SIZE
@@ -463,6 +484,7 @@ static_assert(MAX_BPF_STACK / 8 <= (1 << 6));
 #define MAX_STACK_ARG_SLOTS (MAX_BPF_FUNC_ARGS - MAX_BPF_FUNC_REG_ARGS)
 #define BPF_ID_MAP_SIZE ((MAX_BPF_REG + MAX_BPF_STACK / BPF_REG_SIZE + \
 			  MAX_STACK_ARG_SLOTS) * MAX_CALL_FRAMES)
+
 struct bpf_verifier_state {
 	/* call stack tracking */
 	struct bpf_func_state *frame[MAX_CALL_FRAMES];
@@ -1231,7 +1253,7 @@ void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab);
 
 int mark_chain_precision(struct bpf_verifier_env *env, int regno);
 
-int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx);
+int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx, bool entering_loop);
 int bpf_update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
 
 void bpf_clear_jmp_history(struct bpf_verifier_state *state);
@@ -1585,7 +1607,7 @@ s64 bpf_kfunc_stack_access_bytes(struct bpf_verifier_env *env,
 				 int insn_idx);
 int bpf_compute_subprog_arg_access(struct bpf_verifier_env *env);
 int bpf_set_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
-		      struct cnum64 range, u32 alignment);
+		      struct cnum64 range, u16 step);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);
@@ -1704,5 +1726,10 @@ bool bpf_min_heap_pop(struct bpf_min_heap *heap, int *elt);
 int bpf_init_scev(struct bpf_verifier_env *env);
 void bpf_free_scev(struct bpf_verifier_env *env);
 int bpf_compute_scev(struct bpf_verifier_env *env);
+
+int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			struct bpf_loop_iters *iters);
+int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx,
+			struct bpf_verifier_state *entry_state, struct bpf_loop_iters *iters);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
