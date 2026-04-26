@@ -465,8 +465,14 @@ struct bpf_jmp_history_entry {
 	u64 linked_regs;
 };
 
+struct loop_stack_entry {
+	u32 loop_id:31;
+	u32 terminates:1;
+};
+
 /* Maximum number of register states that can exist at once */
 #define BPF_ID_MAP_SIZE ((MAX_BPF_REG + MAX_BPF_STACK / BPF_REG_SIZE) * MAX_CALL_FRAMES)
+#define LOOP_STACK_SIZE 32
 struct bpf_verifier_state {
 	/* call stack tracking */
 	struct bpf_func_state *frame[MAX_CALL_FRAMES];
@@ -550,6 +556,9 @@ struct bpf_verifier_state {
 	u32 dfs_depth;
 	u32 callback_unroll_depth;
 	u32 may_goto_depth;
+	// TODO: think a bit more if I need this per func_state
+	struct loop_stack_entry loop_stack[LOOP_STACK_SIZE];
+	u32 loop_stack_cnt;
 };
 
 #define bpf_get_spilled_reg(slot, frame, mask)				\
@@ -1625,5 +1634,6 @@ bool bpf_min_heap_pop(struct bpf_min_heap *heap, int *elt);
 int bpf_init_scev(struct bpf_verifier_env *env);
 void bpf_free_scev(struct bpf_verifier_env *env);
 int bpf_compute_scev(struct bpf_verifier_env *env);
+int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 insn_idx);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
