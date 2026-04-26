@@ -916,6 +916,31 @@ static bool refsafe(struct bpf_verifier_state *old, struct bpf_verifier_state *c
 	return true;
 }
 
+static bool loop_stack_safe(struct bpf_verifier_env *env, struct bpf_func_state *old,
+			    struct bpf_func_state *cur)
+{
+	struct loop_stack_entry *old_stack = old->loop_stack;
+	struct loop_stack_entry *cur_stack = cur->loop_stack;
+	u32 i;
+
+	if (old->loop_stack_cnt != cur->loop_stack_cnt) {
+		env->cache_miss_loop_stack = 1;
+		return false;
+	}
+
+	for (i = 0; i < old->loop_stack_cnt; i++) {
+		if (old_stack[i].loop_id == cur_stack[i].loop_id &&
+		    old_stack[i].iters.max_header_count == cur_stack[i].iters.max_header_count &&
+		    old_stack[i].iters.pre_cond == cur_stack[i].iters.pre_cond &&
+		    old_stack[i].terminates == cur_stack[i].terminates)
+			continue;
+		env->cache_miss_loop_stack = 1;
+		return false;
+	}
+
+	return true;
+}
+
 /* compare two verifier states
  *
  * all states stored in state_list are known to be valid, since
@@ -966,6 +991,9 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 	if (!stack_arg_safe(env, old, cur, &env->idmap_scratch, exact))
 		return false;
 
+	if (!loop_stack_safe(env, old, cur))
+		return false;
+
 	return true;
 }
 
@@ -1012,6 +1040,7 @@ static bool states_equal(struct bpf_verifier_env *env,
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
+
 	return true;
 }
 
@@ -1236,16 +1265,40 @@ static void mark_all_scalars_imprecise(struct bpf_verifier_env *env, struct bpf_
 	}
 }
 
-int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+/*
+ * Force a checkpoint:
+ * - on the loop entry edge, so that bpf_widen_scev_regs() finds
+ *   a freshly spawned header state to use as the widening entry_state;
+ *   TODO: remove this condition by adding a utility function to split
+ *         a new state and use it in bpf_widen_scev_regs().
+ * - on subsequent iterations of a loop that SCEV proved terminating.
+ */
+static bool need_loop_checkpoint(struct bpf_verifier_env *env, int insn_idx, bool entering_loop)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct bpf_func_state *frame = cur->frame[cur->curframe];
+	struct loop_stack_entry *top;
+
+	if (entering_loop)
+		return true;
+	if (bpf_loop_at_index(env, insn_idx) != insn_idx || !frame->loop_stack_cnt)
+		return false;
+	top = &frame->loop_stack[frame->loop_stack_cnt - 1];
+	return top->loop_id == insn_idx && top->terminates;
+}
+
+int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx, bool entering_loop)
 {
 	struct bpf_verifier_state_list *new_sl;
 	struct bpf_verifier_state_list *sl;
 	struct bpf_verifier_state *cur = env->cur_state, *new;
-	bool force_new_state, add_new_state, loop;
+	bool force_new_state, add_new_state, loop, loop_checkpoint;
 	int n, err, states_cnt = 0;
 	struct list_head *pos, *tmp, *head;
 
+	loop_checkpoint = need_loop_checkpoint(env, insn_idx, entering_loop);
 	force_new_state = env->test_state_freq || bpf_is_force_checkpoint(env, insn_idx) ||
+			  loop_checkpoint ||
 			  /* Avoid accumulating infinitely long jmp history */
 			  cur->jmp_history_cnt > 40;
 
@@ -1367,6 +1420,22 @@ int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				}
 				goto skip_inf_loop_check;
 			}
+
+			// TODO: would it be safe to check this for 'cur'
+			//       and ignore 'loop_stack' in 'is_state_visited'?
+			/*
+			 * If old state belongs to a control flow loop that we know terminates,
+			 * it should be safe to prune current state.
+			 */
+			if (frame->loop_stack_cnt &&
+			    frame->loop_stack[frame->loop_stack_cnt - 1].terminates) {
+				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+					loop = true;
+					goto hit;
+				}
+				goto skip_inf_loop_check;
+			}
+
 			/* attempt to detect infinite loop to avoid unnecessary doomed work */
 			if (states_maybe_looping(&sl->state, cur) &&
 			    states_equal(env, &sl->state, cur, EXACT) &&
@@ -1525,7 +1594,8 @@ miss:
 		 * Use bigger 'n' for checkpoints because evicting checkpoint states
 		 * too early would hinder iterator convergence.
 		 */
-		n = bpf_is_force_checkpoint(env, insn_idx) && sl->state.branches > 0 ? 64 : 3;
+		n = (bpf_is_force_checkpoint(env, insn_idx) || loop_checkpoint) &&
+		    sl->state.branches > 0 ? 64 : 3;
 		if (sl->miss_cnt > sl->hit_cnt * n + n) {
 			/* the state is unlikely to be useful. Remove it to
 			 * speed up verification
