@@ -972,6 +972,12 @@ static bool states_equal(struct bpf_verifier_env *env,
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
+
+	if (old->loop_stack_cnt != cur->loop_stack_cnt ||
+	    memcmp(old->loop_stack, cur->loop_stack,
+		   old->loop_stack_cnt * sizeof(*old->loop_stack)) != 0)
+		return false;
+
 	return true;
 }
 
@@ -1327,6 +1333,22 @@ int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				}
 				goto skip_inf_loop_check;
 			}
+
+			// TODO: would it be safe to check this for 'cur'
+			//       and ignore 'loop_stack' in 'is_state_visited'?
+			/*
+			 * If old state belongs to a control flow loop that we know terminates,
+			 * it should be safe to prune current state.
+			 */
+			if (sl->state.loop_stack_cnt &&
+			    sl->state.loop_stack[sl->state.loop_stack_cnt - 1].terminates) {
+				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+					loop = true;
+					goto hit;
+				}
+				goto skip_inf_loop_check;
+			}
+
 			/* attempt to detect infinite loop to avoid unnecessary doomed work */
 			if (states_maybe_looping(&sl->state, cur) &&
 			    states_equal(env, &sl->state, cur, EXACT) &&
