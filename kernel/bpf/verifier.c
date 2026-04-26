@@ -1658,6 +1658,9 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 		if (err)
 			return err;
 	}
+	dst_state->loop_stack_cnt = src->loop_stack_cnt;
+	memcpy(dst_state->loop_stack, src->loop_stack,
+	       dst_state->loop_stack_cnt * sizeof(*src->loop_stack));
 	return 0;
 }
 
@@ -14813,9 +14816,19 @@ int bpf_inc_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u
 
 int bpf_clamp_reg_range(struct bpf_verifier_env *env, struct bpf_reg_state *reg, u64 tgt_min, u64 tgt_max)
 {
-	cnum64_intersect_with_urange(&reg->r64, tgt_min, tgt_max);
+	struct cnum64 new_range = cnum64_intersect(reg->r64,
+						   cnum64_from_urange(tgt_min, tgt_max));
+
+	__mark_reg_unbounded(reg);
+	reg->var_off = tnum_unknown;
+	reg->r64 = new_range;
 	reg_bounds_sync(reg);
-	return reg_bounds_sanity_check(env, reg, "bpf_clamp_reg_range");
+	int err = reg_bounds_sanity_check(env, reg, "bpf_clamp_reg_range");
+	if (err) {
+		verbose(env, "bpf_clamp_reg_range invariants violation tgt_min=%llu, umin=%llu, tgt_max=%llu, umax=%llu\n",
+			tgt_min, reg_umin(reg), tgt_max, reg_umax(reg));
+	}
+	return err;
 }
 
 /* check validity of 32-bit and 64-bit arithmetic operations */
@@ -17237,11 +17250,113 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 	return -EFAULT;
 }
 
+static bool has_entered_loop(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int prev_insn_idx = env->prev_insn_idx;
+	int insn_idx = env->insn_idx;
+
+	return aux[insn_idx].loop &&
+	       (prev_insn_idx == -1 ||
+		bpf_loop_at_index(env, prev_insn_idx) != bpf_loop_at_index(env, insn_idx));
+}
+
+static bool is_next_loop_iteration(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int prev_insn_idx = env->prev_insn_idx;
+	int insn_idx = env->insn_idx;
+
+	return aux[insn_idx].loop &&
+	       (prev_insn_idx != -1 &&
+		bpf_loop_at_index(env, prev_insn_idx) == bpf_loop_at_index(env, insn_idx));
+}
+
+static bool has_exited_loop(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int prev_insn_idx = env->prev_insn_idx;
+	int insn_idx = env->insn_idx;
+	struct bpf_loop_exit *exit;
+	struct bpf_loop *loop;
+	int prev_loop_idx;
+	u32 i;
+
+	if (prev_insn_idx == -1)
+		return false;
+
+	prev_loop_idx = bpf_loop_at_index(env, prev_insn_idx);
+	if (prev_loop_idx < 0)
+		return false;
+
+	if (prev_loop_idx == bpf_loop_at_index(env, insn_idx))
+		return false;
+
+	loop = aux[prev_loop_idx].loop;
+	for (i = 0; i < loop->exits_cnt; i++) {
+		exit = &loop->exits[i];
+		if (exit->from == prev_insn_idx && exit->to == insn_idx)
+			return true;
+	}
+	return false;
+}
+
+static int loop_stack_push(struct bpf_verifier_env *env,
+			   struct bpf_verifier_state *entry_state,
+			   bool terminates,
+			   struct bpf_loop_iters *iters)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	u32 cnt = cur->loop_stack_cnt;
+
+	if (cnt == LOOP_STACK_SIZE) {
+		// TODO: dynamically allocate and remove this restriction
+		verbose(env, "Too many nested loops (%d) at %d", cnt, env->insn_idx);
+		return -E2BIG;
+	}
+	cur->loop_stack[cnt].entry_state = entry_state;
+	cur->loop_stack[cnt].iters = terminates ? *iters : (struct bpf_loop_iters){};
+	cur->loop_stack[cnt].loop_id = bpf_loop_at_index(env, env->insn_idx);
+	cur->loop_stack[cnt].terminates = terminates;
+	cur->loop_stack_cnt++;
+	return 0;
+}
+
+static int loop_stack_pop(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+
+	if (cur->loop_stack_cnt == 0) {
+		verifier_bug(env, "Loop stack underflow at %d", env->insn_idx);
+		return -EFAULT;
+	}
+	cur->loop_stack_cnt--;
+	return 0;
+}
+
+static int maybe_clamp_scev_regs(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct loop_stack_entry *entry;
+
+	if (cur->loop_stack_cnt == 0) {
+		verifier_bug(env, "%s: loop stack empty at %d", __FUNCTION__, env->insn_idx);
+		return -EFAULT;
+	}
+
+	entry = &cur->loop_stack[cur->loop_stack_cnt - 1];
+	if (!entry->terminates)
+		return 0;
+
+	return bpf_clamp_scev_regs(env, cur_func(env), env->insn_idx, entry->entry_state, &entry->iters);
+}
+
 static int do_check(struct bpf_verifier_env *env)
 {
 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_insn *insns = env->prog->insnsi;
+	struct bpf_loop_iters iters;
 	int insn_cnt = env->prog->len;
 	bool do_print_state = false;
 	int prev_insn_idx = -1;
@@ -17274,6 +17389,12 @@ static int do_check(struct bpf_verifier_env *env)
 		state->last_insn_idx = env->prev_insn_idx;
 		state->insn_idx = env->insn_idx;
 
+		if (is_next_loop_iteration(env)) {
+			err = maybe_clamp_scev_regs(env);
+			if (err)
+				return err;
+		}
+
 		if (bpf_is_prune_point(env, env->insn_idx)) {
 			err = bpf_is_state_visited(env, env->insn_idx);
 			if (err < 0)
@@ -17304,6 +17425,25 @@ static int do_check(struct bpf_verifier_env *env)
 
 		if (need_resched())
 			cond_resched();
+
+		if (has_exited_loop(env)) {
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "exiting loop %d\n", bpf_loop_at_index(env, env->prev_insn_idx));
+			err = loop_stack_pop(env);
+			if (err)
+				return err;
+		}
+
+		if (has_entered_loop(env)) {
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "entering loop %d\n", bpf_loop_at_index(env, env->insn_idx));
+			err = bpf_widen_scev_regs(env, cur_func(env), env->insn_idx, &iters);
+			if (err < 0)
+				return err;
+			err = loop_stack_push(env, env->cur_state->parent, err > 0, &iters);
+			if (err)
+				return err;
+		}
 
 		if (env->log.level & BPF_LOG_LEVEL2 && do_print_state) {
 			verbose(env, "\nfrom %d to %d%s:",

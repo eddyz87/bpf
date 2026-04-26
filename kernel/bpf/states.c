@@ -970,6 +970,27 @@ static void reset_idmap_scratch(struct bpf_verifier_env *env)
 	idmap->cnt = 0;
 }
 
+static bool loop_stack_safe(struct bpf_verifier_state *old, struct bpf_verifier_state *cur)
+{
+	struct loop_stack_entry *old_stack = old->loop_stack;
+	struct loop_stack_entry *cur_stack = cur->loop_stack;
+	u32 i;
+
+	if (old->loop_stack_cnt != cur->loop_stack_cnt)
+		return false;
+
+	for (i = 0; i < old->loop_stack_cnt; i++) {
+		if (old_stack[i].loop_id == cur_stack[i].loop_id &&
+		    old_stack[i].iters.max_header_count == cur_stack[i].iters.max_header_count &&
+		    old_stack[i].iters.pre_cond == cur_stack[i].iters.pre_cond &&
+		    old_stack[i].terminates == cur_stack[i].terminates)
+			continue;
+		return false;
+	}
+
+	return true;
+}
+
 static bool states_equal(struct bpf_verifier_env *env,
 			 struct bpf_verifier_state *old,
 			 struct bpf_verifier_state *cur,
@@ -1005,6 +1026,10 @@ static bool states_equal(struct bpf_verifier_env *env,
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
 			return false;
 	}
+
+	if (!loop_stack_safe(old, cur))
+		return false;
+
 	return true;
 }
 
@@ -1360,6 +1385,22 @@ int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				}
 				goto skip_inf_loop_check;
 			}
+
+			// TODO: would it be safe to check this for 'cur'
+			//       and ignore 'loop_stack' in 'is_state_visited'?
+			/*
+			 * If old state belongs to a control flow loop that we know terminates,
+			 * it should be safe to prune current state.
+			 */
+			if (sl->state.loop_stack_cnt &&
+			    sl->state.loop_stack[sl->state.loop_stack_cnt - 1].terminates) {
+				if (states_equal(env, &sl->state, cur, RANGE_WITHIN)) {
+					loop = true;
+					goto hit;
+				}
+				goto skip_inf_loop_check;
+			}
+
 			/* attempt to detect infinite loop to avoid unnecessary doomed work */
 			if (states_maybe_looping(&sl->state, cur) &&
 			    states_equal(env, &sl->state, cur, EXACT) &&
