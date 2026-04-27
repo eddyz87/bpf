@@ -268,15 +268,17 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 
 	if (insn->code == 0)
 		return 0;
-	if (env->log.level & BPF_LOG_LEVEL2) {
-		fmt_reg_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_reg_mask(bt));
-		verbose(env, "mark_precise: frame%d: regs=%s ",
-			bt->frame, env->tmp_str_buf);
-		bpf_fmt_stack_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_stack_mask(bt));
-		verbose(env, "stack=%s before ", env->tmp_str_buf);
-		verbose(env, "%d: ", idx);
-		bpf_verbose_insn(env, insn);
-	}
+	/*
+	 * if (env->log.level & BPF_LOG_LEVEL2) {
+	 * 	fmt_reg_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_reg_mask(bt));
+	 * 	verbose(env, "mark_precise: frame%d: regs=%s ",
+	 * 		bt->frame, env->tmp_str_buf);
+	 * 	bpf_fmt_stack_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_stack_mask(bt));
+	 * 	verbose(env, "stack=%s before ", env->tmp_str_buf);
+	 * 	verbose(env, "%d: ", idx);
+	 * 	bpf_verbose_insn(env, insn);
+	 * }
+	 */
 
 	/* If there is a history record that some registers gained range at this insn,
 	 * propagate precision marks to those registers, so that bt_is_reg_set()
