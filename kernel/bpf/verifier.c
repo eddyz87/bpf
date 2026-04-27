@@ -1657,7 +1657,7 @@ struct list_head *bpf_explored_state(struct bpf_verifier_env *env, int idx)
 	return &env->explored_states[(idx ^ state->callsite) % state_htab_size(env)];
 }
 
-static bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_state *b)
+bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_state *b)
 {
 	int fr;
 

@@ -2273,6 +2273,7 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 	if (env->log.level & BPF_LOG_LEVEL2) {
 		verbose(env, "Live regs before insn:\n");
 		for (i = 0; i < insn_cnt; ++i) {
+			verbose_linfo(env, i, "    ; ");
 			if (env->insn_aux_data[i].scc)
 				verbose(env, "%3d ", env->insn_aux_data[i].scc);
 			else

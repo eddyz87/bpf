@@ -1108,6 +1108,13 @@ struct bpf_verifier_env {
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
 	int *idoms;
+	int cache_miss_frame;
+	int cache_miss_reg;
+	int cache_miss_spi;
+	int cache_miss_refsafe;
+	int cache_miss_cb_depth;
+	int cache_miss_in_sleepable;
+	int cache_miss_loop_stack;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1731,5 +1738,16 @@ int bpf_compute_idoms(struct bpf_verifier_env *env);
 int bpf_compute_loops(struct bpf_verifier_env *env);
 int bpf_loop_at_index(struct bpf_verifier_env *env, u32 idx);
 bool bpf_is_nested_loop(struct bpf_verifier_env *env, int inner_header, int outer_header);
+
+void bpf_print_reg_state(struct bpf_verifier_env *env,
+			 const struct bpf_func_state *state,
+			 const struct bpf_reg_state *reg);
+
+void bpf_print_stack_state(struct bpf_verifier_env *env,
+			   const struct bpf_func_state *fstate,
+			   struct bpf_stack_state *stack,
+			   int i, bool print_all);
+
+bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_state *b);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
