@@ -1069,6 +1069,15 @@ struct bpf_verifier_env {
 	struct bpf_iarray *gotox_tmp_buf;
 	int *idoms;
 	struct scev *scev;
+
+	int cache_miss_frame;
+	int cache_miss_reg;
+	int cache_miss_spi;
+
+	int cache_miss_refsafe;
+	int cache_miss_cb_depth;
+	int cache_miss_in_sleepable;
+	int cache_miss_loop_stack;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1695,5 +1704,16 @@ int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
 			struct bpf_verifier_state *entry_state, struct bpf_loop_iters *iters);
 int bpf_finalize_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
 			   struct bpf_verifier_state *entry_state, struct bpf_loop_iters *iters);
+
+void bpf_print_reg_state(struct bpf_verifier_env *env,
+			 const struct bpf_func_state *state,
+			 const struct bpf_reg_state *reg);
+
+void bpf_print_stack_state(struct bpf_verifier_env *env,
+			   const struct bpf_func_state *fstate,
+			   struct bpf_stack_state *stack,
+			   int i, bool print_all);
+
+bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_state *b);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
