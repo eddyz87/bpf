@@ -1676,7 +1676,7 @@ struct list_head *bpf_explored_state(struct bpf_verifier_env *env, int idx)
 	return &env->explored_states[(idx ^ state->callsite) % state_htab_size(env)];
 }
 
-static bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_state *b)
+bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_state *b)
 {
 	int fr;
 
@@ -20061,7 +20061,6 @@ static void log_program(struct bpf_verifier_env *env)
 			verbose(env, "%3d ", env->insn_aux_data[i].scc);
 		else
 			verbose(env, "    ");
-		verbose(env, "%3d ", env->idoms[i]);
 		if (env->insn_aux_data[i].loop_header >= 0)
 			verbose(env, "%3d ", env->insn_aux_data[i].loop_header);
 		else
