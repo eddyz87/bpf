@@ -1237,6 +1237,10 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 		op = bpf_rev_opcode(op);
 	// TODO: signed variants
 	switch (op) {
+	case BPF_JSLT:
+	case BPF_JSLE:
+	case BPF_JSGT:
+	case BPF_JSGE:
 	case BPF_JLT:
 	case BPF_JLE:
 	case BPF_JGT:
@@ -1288,7 +1292,7 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 	return true;
 }
 
-static bool eval_expr(struct scev *scev, struct bpf_func_state *st, u32 id, s64 *result)
+static bool eval_expr(struct scev *scev, struct bpf_func_state *st, u32 id, u64 *result)
 {
 	struct bpf_reg_state *reg;
 	u32 regno;
@@ -1338,7 +1342,7 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 			      struct linear_latch *latch,
 			      struct bpf_loop_iters *iters)
 {
-	s64 base, step, diff, bound, initial, max_iters;
+	u64 base, step, diff, bound, initial, max_iters;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_loop *loop = aux[bpf_loop_at_index(env, latch->insn_idx)].loop;
 	struct scev *scev = env->scev;
@@ -1352,38 +1356,47 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 	    !eval_expr(scev, st, latch->reg_expr, &initial))
 		return false;
 
-	diff = bound - initial; // TODO: check overflow
+	bpf_log(&env->log, "compute_max_iters: bound=%lld initial=%lld step=%lld op=%x\n",
+		bound, initial, step, op);
 	if (step == 0) // TODO: still can infer 0 or inf
 		return false;
 
-	if (step < 0) {
+	if ((s64)step < 0) {
 		/* Multiply both sides of the equation by -1, e.g. -2*i > -3 becomes 2*i < 3 */
 		op = bpf_flip_opcode(op);
 		step = -step; // TODO: check overflow
-		diff = -diff; // TODO: check overflow
+		swap(bound, initial);
 	}
-	switch (latch->op) {
+	diff = bound - initial;
+	switch (op) {
 	case BPF_JLT:
-		max_iters = diff <= 0 ? 0 : DIV_ROUND_UP(diff, step);
+		max_iters = (u64)initial >= (u64)bound ? 0 : DIV_ROUND_UP(diff, step);
 		break;
 	case BPF_JLE:
-		max_iters = diff <  0 ? 0 : diff / step + 1;
+		max_iters = (u64)initial >  (u64)bound ? 0 : diff / step + 1;
 		break;
-	case BPF_JGT:
-		max_iters = diff >= 0 ? 0 : U32_MAX;
+	case BPF_JSLT:
+		max_iters = (s64)initial >= (s64)bound ? 0 : DIV_ROUND_UP((s64)diff, (s64)step);
 		break;
-	case BPF_JGE:
-		max_iters = diff >  0 ? 0 : U32_MAX;
+	case BPF_JSLE:
+		max_iters = (s64)initial >  (s64)bound ? 0 : (s64)diff / step + 1;
 		break;
+	/*
+	 * case BPF_JGT:
+	 * 	max_iters = diff >= 0 ? 0 : U32_MAX;
+	 * 	break;
+	 * case BPF_JGE:
+	 * 	max_iters = diff >  0 ? 0 : U32_MAX;
+	 * 	break;
+	 */
 	case BPF_JNE:
 		max_iters = diff % step ? U32_MAX : max(0, DIV_ROUND_UP(diff, step));
 		break;
 	default:
 		return false;
 	}
-
-	if (max_iters <= 0) // TODO: can this happen at all?
-		return false;
+	bpf_log(&env->log, "compute_max_iters: diff=%lld bound=%lld initial=%lld step=%lld max_iters=%lld, op=%x\n",
+		diff, bound, initial, step, max_iters, op);
 
 	if (max_iters > U32_MAX)
 		return false;
@@ -1449,6 +1462,12 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *st,
 	if (!compute_max_iters(env, st, &latch, iters)) {
 		if (log->level & BPF_LOG_LEVEL2)
 			bpf_log(log, "loop header at %d, can't compute iterations count\n", insn_idx);
+		return 0;
+	}
+
+	if (iters->max_header_count == 0) {
+		if (log->level & BPF_LOG_LEVEL2)
+			bpf_log(log, "loop header at %d, 0 iterations count\n", insn_idx);
 		return 0;
 	}
 
