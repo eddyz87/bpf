@@ -12,7 +12,7 @@ extern buddy_t buddy;
 
 #ifdef BPF_ARENA_ASAN
 
-#include "st_asan_common.h"
+#include "test_asan_common.h"
 
 static __always_inline int asan_test_buddy_oob_single(size_t alloc_size)
 {
