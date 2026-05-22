@@ -12235,7 +12235,7 @@ static int check_kfunc_args(struct bpf_verifier_env *env, struct bpf_kfunc_call_
 			break;
 		case KF_ARG_PTR_TO_LIST_NODE:
 			if (is_kfunc_arg_nonown_allowed(btf, &args[i]) &&
-			    type_is_non_owning_ref(reg->type) && !reg->ref_obj_id) {
+			    type_is_non_owning_ref(reg->type) && !reg_is_referenced(env, reg)) {
 				/* Allow bpf_list_front/back return value for
 				 * __nonown_allowed list-node arguments.
 				 */
