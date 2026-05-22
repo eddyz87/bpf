@@ -1519,9 +1519,12 @@ static struct bpf_reference_state *find_reference_state(struct bpf_verifier_stat
 {
 	int i;
 
-	for (i = 0; i < state->acquired_refs; i++)
+	for (i = 0; i < state->acquired_refs; i++) {
+		if (state->refs[i].type != REF_TYPE_PTR)
+			continue;
 		if (state->refs[i].id == ptr_id)
 			return &state->refs[i];
+	}
 
 	return NULL;
 }
