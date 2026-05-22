@@ -200,11 +200,10 @@ struct bpf_verifier_stack_elem {
 
 #define BPF_PRIV_STACK_MIN_SIZE		64
 
-static int acquire_reference(struct bpf_verifier_env *env, int insn_idx);
-static int acquire_virtual_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id);
+static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id);
 static struct bpf_reference_state *find_reference_state(struct bpf_verifier_state *state, int ptr_id);
 static int release_reference_nomark(struct bpf_verifier_state *state, int id);
-static int release_reference(struct bpf_verifier_env *env, struct bpf_reg_state *reg, bool release_v_parent);
+static int release_reference(struct bpf_verifier_env *env, int id);
 static int validate_ref_obj(struct bpf_verifier_env *env, struct ref_obj_desc *ref_obj);
 static void invalidate_non_owning_refs(struct bpf_verifier_env *env);
 static bool in_rbtree_lock_required_cb(struct bpf_verifier_env *env);
@@ -726,7 +725,7 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 			 * referenced dynptr. Freeing a referenced dynptr through helpers/kfuncs
 			 * will invalidate all clones.
 			 */
-			v_parent_id = acquire_virtual_reference(env, insn_idx, ref_obj->id);
+			v_parent_id = acquire_reference(env, insn_idx, ref_obj->id);
 			if (v_parent_id < 0)
 				return v_parent_id;
 
@@ -767,12 +766,14 @@ static int unmark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_re
 		return spi;
 
 	/*
-	 * For referenced dynptr, release the virtual ref (parent_id) which
-	 * cascades to all clones and derived slices. For non-referenced dynptr,
-	 * only the dynptr and slices derived from it will be invalidated.
+	 * For referenced dynptr, release the parent ref which cascades to
+	 * all clones and derived slices. For non-referenced dynptr, only
+	 * the dynptr and slices derived from it will be invalidated.
 	 */
 	reg = &state->stack[spi].spilled_ptr;
-	return release_reference(env, reg, true);
+	return release_reference(env, dynptr_type_referenced(reg->dynptr.type)
+				      ? reg->parent_id
+				      : reg->id);
 }
 
 static void __mark_reg_unknown(const struct bpf_verifier_env *env,
@@ -834,7 +835,7 @@ static int destroy_if_dynptr_stack_slot(struct bpf_verifier_env *env,
 	}
 
 	/* Invalidate the dynptr and any derived slices */
-	err = release_reference(env, &state->stack[spi].spilled_ptr, false);
+	err = release_reference(env, state->stack[spi].spilled_ptr.id);
 	if (!err) {
 		mark_stack_slot_scratched(env, spi);
 		mark_stack_slot_scratched(env, spi - 1);
@@ -940,7 +941,7 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 	if (spi < 0)
 		return spi;
 
-	id = acquire_reference(env, insn_idx);
+	id = acquire_reference(env, insn_idx, 0);
 	if (id < 0)
 		return id;
 
@@ -986,7 +987,7 @@ static int unmark_stack_slots_iter(struct bpf_verifier_env *env,
 		struct bpf_reg_state *st = &slot->spilled_ptr;
 
 		if (i == 0)
-			WARN_ON_ONCE(release_reference(env, st, true));
+			WARN_ON_ONCE(release_reference(env, st->id));
 
 		bpf_mark_reg_not_init(env, st);
 
@@ -1423,32 +1424,7 @@ static struct bpf_reference_state *acquire_reference_state(struct bpf_verifier_e
 	return &state->refs[new_ofs];
 }
 
-static int acquire_reference(struct bpf_verifier_env *env, int insn_idx)
-{
-	struct bpf_reference_state *s;
-
-	s = acquire_reference_state(env, insn_idx);
-	if (!s)
-		return -ENOMEM;
-	s->type = REF_TYPE_PTR;
-	s->id = ++env->id_gen;
-	return s->id;
-}
-
-/*
- * A virtual reference has no backing register or stack slot — it exists only as an entry in
- * env->cur_state->refs. It serves as a lifetime anchor for objects that share the same
- * lifetime but need distinct identities (e.g., pointer casting results, referenced dynptr
- * clones).
- *
- * A register derived from a virtual reference has its parent_id points to the virtual
- * reference. The register in this case is also considered referenced, just like one whose
- * id is directly in the reference table. Use reg_is_referenced() to check for both cases.
- *
- * Releasing such a register releases the virtual reference, which in turn invalidates all
- * objects derived from that virtual reference and their children.
- */
-static int acquire_virtual_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id)
+static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id)
 {
 	struct bpf_reference_state *s;
 
@@ -1458,7 +1434,6 @@ static int acquire_virtual_reference(struct bpf_verifier_env *env, int insn_idx,
 	s->type = REF_TYPE_PTR;
 	s->id = ++env->id_gen;
 	s->parent_id = parent_id;
-	s->is_virtual = true;
 	return s->id;
 }
 
@@ -1532,18 +1507,7 @@ static struct bpf_reference_state *find_reference_state(struct bpf_verifier_stat
 static bool reg_is_referenced(struct bpf_verifier_env *env,
 			      const struct bpf_reg_state *reg)
 {
-	struct bpf_reference_state *s;
-
-	s = find_reference_state(env->cur_state, reg->id);
-	if (s)
-		return true;
-
-	if (reg->parent_id) {
-		s = find_reference_state(env->cur_state, reg->parent_id);
-		if (s && s->is_virtual)
-			return true;
-	}
-	return false;
+	return find_reference_state(env->cur_state, reg->id) != NULL;
 }
 
 static int release_lock_state(struct bpf_verifier_state *state, int type, int id, void *ptr)
@@ -8941,24 +8905,15 @@ static int idstack_pop(struct bpf_idmap *idmap)
 }
 
 /* Release id and objects derived from it iteratively in a DFS manner */
-static int release_reference(struct bpf_verifier_env *env, struct bpf_reg_state *reg, bool release_v_parent)
+static int release_reference(struct bpf_verifier_env *env, int id)
 {
 	u32 mask = (1 << STACK_SPILL) | (1 << STACK_DYNPTR);
 	struct bpf_verifier_state *vstate = env->cur_state;
 	struct bpf_idmap *idstack = &env->idmap_scratch;
-	struct bpf_reference_state *ref;
 	struct bpf_stack_state *stack;
 	struct bpf_func_state *state;
-	int i, id, root_id, err;
-
-	/* Free the parent virtual reference if the reg is derived from it */
-	id = reg->id;
-	if (reg->parent_id && release_v_parent) {
-		ref = find_reference_state(env->cur_state, reg->parent_id);
-		if (ref && ref->is_virtual)
-			id = reg->parent_id;
-	}
-	root_id = id;
+	struct bpf_reg_state *reg;
+	int i, err;
 
 	idstack->cnt = 0;
 	idstack_push(idstack, id);
@@ -8971,16 +8926,6 @@ static int release_reference(struct bpf_verifier_env *env, struct bpf_reg_state 
 			if (reg->id != id && reg->parent_id != id)
 				continue;
 
-			if (find_reference_state(env->cur_state, reg->id) && reg->id != root_id) {
-				struct bpf_reference_state *ref_state;
-
-				ref_state = find_reference_state(env->cur_state, reg->id);
-				verbose(env, "Leaking reference id=%d alloc_insn=%d. Release it first.\n",
-					ref_state->id, ref_state->insn_idx);
-				return -EINVAL;
-			}
-
-			/* Free objects derived from the current object */
 			if (reg->id != id) {
 				err = idstack_push(idstack, reg->id);
 				if (err)
@@ -8993,11 +8938,12 @@ static int release_reference(struct bpf_verifier_env *env, struct bpf_reg_state 
 				invalidate_dynptr(env, stack);
 		}));
 
-		/* Check for virtual refs whose parent is being released */
+		/*
+		 * Child references are inaccessible after parent is released,
+		 * any child references that exist at this point are a leak.
+		 */
 		for (i = 0; i < vstate->acquired_refs; i++) {
 			if (vstate->refs[i].type != REF_TYPE_PTR)
-				continue;
-			if (!vstate->refs[i].is_virtual)
 				continue;
 			if (vstate->refs[i].parent_id != id)
 				continue;
@@ -10125,7 +10071,7 @@ static int release_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 	} else if (convert_rcu) {
 		err = ref_convert_alloc_rcu_protected(env, reg->id);
 	} else if (reg_is_referenced(env, reg)) {
-		err = release_reference(env, reg, true);
+		err = release_reference(env, reg->id);
 	} else if (bpf_register_is_null(reg)) {
 		err = 0;
 	}
@@ -10516,7 +10462,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 		regs[BPF_REG_0].type &= ~PTR_MAYBE_NULL;
 		regs[BPF_REG_0].id = meta.ref_obj.id;
 	} else if (is_acquire_function(func_id, meta.map.ptr)) {
-		int id = acquire_reference(env, insn_idx);
+		int id = acquire_reference(env, insn_idx, 0);
 
 		if (id < 0)
 			return id;
@@ -13138,7 +13084,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 		mark_btf_func_reg_size(env, BPF_REG_0, sizeof(void *));
 		if (is_kfunc_acquire(&meta)) {
-			id = acquire_reference(env, insn_idx);
+			id = acquire_reference(env, insn_idx, 0);
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
@@ -18386,7 +18332,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 	if (!subprog && env->prog->type == BPF_PROG_TYPE_STRUCT_OPS) {
 		for (i = 0; i < aux->ctx_arg_info_size; i++)
 			aux->ctx_arg_info[i].ref_id = aux->ctx_arg_info[i].refcounted ?
-						      acquire_reference(env, 0) : 0;
+						      acquire_reference(env, 0, 0) : 0;
 	}
 
 	ret = do_check(env);

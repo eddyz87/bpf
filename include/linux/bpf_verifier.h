@@ -332,10 +332,7 @@ struct bpf_reference_state {
 	int insn_idx;
 	union {
 		/* For REF_TYPE_PTR */
-		struct {
-			int parent_id;
-			bool is_virtual;
-		};
+		int parent_id;
 		/* Use to keep track of the source object of a lock, to ensure
 		 * it matches on unlock.
 		 */
