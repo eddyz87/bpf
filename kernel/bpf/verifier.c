@@ -10133,50 +10133,6 @@ static int release_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 	return err;
 }
 
-/*
- * Pointer casting helpers (bpf_sk_fullsock, bpf_tcp_sock, etc.) return a different view
- * of the same kernel object. All casted pointers share the same lifetime as the original.
- *
- * Use a virtual reference as a lifetime anchor: the original pointer and all cast results
- * get parent_id = V (the virtual reference). Each gets a unique non-referenced id for
- * independent null-checking. Releasing any of them releases V, which in turn invalidates
- * all siblings.
- */
-static int cast_from_ref_obj(struct bpf_verifier_env *env, struct ref_obj_desc *ref_obj)
-{
-	struct bpf_reference_state *ref;
-	struct bpf_func_state *state;
-	struct bpf_reg_state *reg;
-	int err, v_parent_id = 0;
-
-	err = validate_ref_obj(env, ref_obj);
-	if (err)
-		return err;
-
-	ref = find_reference_state(env->cur_state, ref_obj->id);
-	if (ref) {
-		/*
-		 * First cast from a referenced ptr: Create a virtual reference, grafted the
-		 * referenced objects to it and convert to non-referenced
-		 */
-		v_parent_id = acquire_virtual_reference(env, ref->insn_idx, 0);
-		if (v_parent_id < 0)
-			return v_parent_id;
-
-		release_reference_nomark(env->cur_state, ref_obj->id);
-
-		bpf_for_each_reg_in_vstate(env->cur_state, state, reg, ({
-			if (reg->id == ref_obj->id)
-				reg->parent_id = v_parent_id;
-		}));
-	} else {
-		/* Subsequent casts: return the already created virtual reference */
-		v_parent_id = ref_obj->parent_id;
-	}
-
-	return v_parent_id;
-}
-
 static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			     int *insn_idx_p)
 {
@@ -10536,13 +10492,29 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	if (type_may_be_null(regs[BPF_REG_0].type))
 		regs[BPF_REG_0].id = ++env->id_gen;
 
-	if (is_ptr_cast_function(func_id)) {
-		int parent_id = cast_from_ref_obj(env, &meta.ref_obj);
+	if (is_ptr_cast_function(func_id) &&
+	    find_reference_state(env->cur_state, meta.ref_obj.id)) {
+		struct bpf_verifier_state *branch;
+		struct bpf_reg_state *r0;
 
-		if (parent_id < 0)
-			return parent_id;
+		/*
+		 * In order for a release of any of the original or cast pointers
+		 * to invalidate all other pointers, reuse the same reference id for
+		 * the cast result.
+		 * This reference id can't be used for nullness propagation,
+		 * as cast might return NULL for a non-NULL input.
+		 * Hence, explore the NULL case as a separate branch.
+		 */
+		branch = push_stack(env, env->insn_idx + 1, env->insn_idx, false);
+		if (IS_ERR(branch))
+			return PTR_ERR(branch);
 
-		regs[BPF_REG_0].parent_id = parent_id;
+		r0 = &branch->frame[branch->curframe]->regs[BPF_REG_0];
+		__mark_reg_known_zero(r0);
+		r0->type = SCALAR_VALUE;
+
+		regs[BPF_REG_0].type &= ~PTR_MAYBE_NULL;
+		regs[BPF_REG_0].id = meta.ref_obj.id;
 	} else if (is_acquire_function(func_id, meta.map.ptr)) {
 		int id = acquire_reference(env, insn_idx);
 
