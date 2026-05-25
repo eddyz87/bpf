@@ -25,13 +25,13 @@ extern volatile bool asan_report_once;
 
 #ifdef BPF_ARENA_ASAN
 
-typedef s8 __arena s8a;
+typedef s8 __arena *s8a;
 
 static inline
-s8a *mem_to_shadow(void __arena __arg_arena *addr)
+s8a mem_to_shadow(void __arena *addr)
 {
-	return (s8a *)(((u32)(u64)addr >> ASAN_SHADOW_SHIFT) +
-			__asan_shadow_memory_dynamic_address);
+	return (s8a)(((u32)(u64)addr >> ASAN_SHADOW_SHIFT) +
+		     __asan_shadow_memory_dynamic_address);
 }
 
 __weak __noasan

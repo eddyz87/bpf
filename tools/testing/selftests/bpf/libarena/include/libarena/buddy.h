@@ -3,10 +3,10 @@
 #pragma once
 
 struct buddy_chunk;
-typedef struct buddy_chunk __arena buddy_chunk_t;
+typedef struct buddy_chunk __arena *buddy_chunk_t;
 
 struct buddy_header;
-typedef struct buddy_header __arena buddy_header_t;
+typedef struct buddy_header __arena *buddy_header_t;
 
 enum buddy_consts {
 	/*
@@ -68,24 +68,24 @@ struct buddy_chunk {
 	u8		allocated[BUDDY_CHUNK_ITEMS / 8];
 	/* Freelists for O(1) allocation. */
 	u64		freelists[BUDDY_CHUNK_NUM_ORDERS];
-	buddy_chunk_t	*next;
+	buddy_chunk_t	next;
 };
 
 struct buddy {
-	buddy_chunk_t *first_chunk;		/* Pointer to the chunk linked list. */
+	buddy_chunk_t first_chunk;		/* Pointer to the chunk linked list. */
 	arena_spinlock_t lock;			/* Allocator lock */
 	u64 vaddr;				/* Allocation into reserved vaddr */
 };
 
-typedef struct buddy __arena buddy_t;
+typedef struct buddy __arena *buddy_t;
 
 #ifdef __BPF__
 
-int buddy_init(buddy_t *buddy);
-int buddy_destroy(buddy_t *buddy);
-int buddy_free_internal(buddy_t *buddy, u64 free);
+int buddy_init(buddy_t buddy);
+int buddy_destroy(buddy_t buddy);
+int buddy_free_internal(buddy_t buddy, u64 free);
 #define buddy_free(buddy, ptr) buddy_free_internal((buddy), (u64)(ptr))
-u64 buddy_alloc_internal(buddy_t *buddy, size_t size);
+u64 buddy_alloc_internal(buddy_t buddy, size_t size);
 #define buddy_alloc(alloc, size) ((void __arena *)buddy_alloc_internal((alloc), (size)))
 
 

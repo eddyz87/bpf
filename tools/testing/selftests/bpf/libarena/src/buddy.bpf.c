@@ -45,12 +45,12 @@ enum {
 	BUDDY_CHUNK_PAGES	= BUDDY_CHUNK_BYTES / __PAGE_SIZE
 };
 
-static inline int buddy_lock(buddy_t *buddy)
+static inline int buddy_lock(buddy_t buddy)
 {
 	return arena_spin_lock(&buddy->lock);
 }
 
-static inline void buddy_unlock(buddy_t *buddy)
+static inline void buddy_unlock(buddy_t buddy)
 {
 	arena_spin_unlock(&buddy->lock);
 }
@@ -61,7 +61,7 @@ static inline void buddy_unlock(buddy_t *buddy)
  * page alloc kfuncs do not support aligning to a boundary (in this
  * case 1 MiB, see buddy.h on how this is derived).
  */
-static int buddy_reserve_arena_vaddr(buddy_t *buddy)
+static int buddy_reserve_arena_vaddr(buddy_t buddy)
 {
 	buddy->vaddr = 0;
 
@@ -73,7 +73,7 @@ static int buddy_reserve_arena_vaddr(buddy_t *buddy)
 /*
  * Free up any unused address space. Used only during teardown.
  */
-static void buddy_unreserve_arena_vaddr(buddy_t *buddy)
+static void buddy_unreserve_arena_vaddr(buddy_t buddy)
 {
 	bpf_arena_free_pages(
 		&arena, (void __arena *)(BUDDY_VADDR_OFFSET + buddy->vaddr),
@@ -94,7 +94,7 @@ static void buddy_unreserve_arena_vaddr(buddy_t *buddy)
  * However, bump allocation must still be atomic because this function
  * is called without the buddy lock from multiple threads concurrently.
  */
-__weak int buddy_alloc_arena_vaddr(buddy_t __arg_arena *buddy, u64 *vaddrp)
+__weak int buddy_alloc_arena_vaddr(buddy_t buddy, u64 *vaddrp)
 {
 	u64 vaddr, old, new;
 
@@ -134,7 +134,7 @@ static u64 arena_next_pow2(__u64 n)
 }
 
 __weak
-int idx_set_allocated(buddy_chunk_t __arg_arena *chunk, u64 idx, bool allocated)
+int idx_set_allocated(buddy_chunk_t chunk, u64 idx, bool allocated)
 {
 	bool already_allocated;
 
@@ -160,7 +160,7 @@ int idx_set_allocated(buddy_chunk_t __arg_arena *chunk, u64 idx, bool allocated)
 	return 0;
 }
 
-static int idx_is_allocated(buddy_chunk_t *chunk, u64 idx, bool *allocated)
+static int idx_is_allocated(buddy_chunk_t chunk, u64 idx, bool *allocated)
 {
 	if (unlikely(idx >= BUDDY_CHUNK_ITEMS)) {
 		arena_stderr("getting state of invalid idx (%llu, max %d)\n", idx,
@@ -173,7 +173,7 @@ static int idx_is_allocated(buddy_chunk_t *chunk, u64 idx, bool *allocated)
 }
 
 __weak
-int idx_set_order(buddy_chunk_t __arg_arena *chunk, u64 idx, u8 order)
+int idx_set_order(buddy_chunk_t chunk, u64 idx, u8 order)
 {
 	u8 prev_order;
 
@@ -206,7 +206,7 @@ int idx_set_order(buddy_chunk_t __arg_arena *chunk, u64 idx, u8 order)
 	return 0;
 }
 
-static u8 idx_get_order(buddy_chunk_t *chunk, u64 idx)
+static u8 idx_get_order(buddy_chunk_t chunk, u64 idx)
 {
 	u8 result;
 
@@ -223,7 +223,7 @@ static u8 idx_get_order(buddy_chunk_t *chunk, u64 idx)
 	return (idx & 0x1) ? (result & 0xf) : (result >> 4);
 }
 
-static void __arena *idx_to_addr(buddy_chunk_t *chunk, size_t idx)
+static void __arena *idx_to_addr(buddy_chunk_t chunk, size_t idx)
 {
 	u64 address;
 
@@ -246,7 +246,7 @@ static void __arena *idx_to_addr(buddy_chunk_t *chunk, size_t idx)
 	return (void __arena *)address;
 }
 
-static buddy_header_t *idx_to_header(buddy_chunk_t *chunk, size_t idx)
+static buddy_header_t idx_to_header(buddy_chunk_t chunk, size_t idx)
 {
 	bool allocated;
 	u64 address;
@@ -283,13 +283,13 @@ static buddy_header_t *idx_to_header(buddy_chunk_t *chunk, size_t idx)
 	 * less probable.
 	 */
 
-	return (buddy_header_t *)(address + BUDDY_HEADER_OFF);
+	return (buddy_header_t)(address + BUDDY_HEADER_OFF);
 }
 
-static void header_add_freelist(buddy_chunk_t *chunk, buddy_header_t *header,
+static void header_add_freelist(buddy_chunk_t chunk, buddy_header_t header,
 		u64 idx, u8 order)
 {
-	buddy_header_t *tmp_header;
+	buddy_header_t tmp_header;
 
 	idx_set_order(chunk, idx, order);
 
@@ -304,10 +304,10 @@ static void header_add_freelist(buddy_chunk_t *chunk, buddy_header_t *header,
 	chunk->freelists[order] = idx;
 }
 
-static void header_remove_freelist(buddy_chunk_t  *chunk,
-				   buddy_header_t *header, u8 order)
+static void header_remove_freelist(buddy_chunk_t chunk,
+				   buddy_header_t header, u8 order)
 {
-	buddy_header_t *tmp_header;
+	buddy_header_t tmp_header;
 
 	if (header->prev_index != BUDDY_CHUNK_ITEMS) {
 		tmp_header = idx_to_header(chunk, header->prev_index);
@@ -356,10 +356,10 @@ static u64 size_to_order(size_t size)
 }
 
 __weak
-int add_leftovers_to_freelist(buddy_chunk_t __arg_arena *chunk, u32 cur_idx,
+int add_leftovers_to_freelist(buddy_chunk_t chunk, u32 cur_idx,
 		u64 min_order, u64 max_order)
 {
-	buddy_header_t *header;
+	buddy_header_t header;
 	u64 ord;
 	u32 idx;
 
@@ -381,10 +381,10 @@ int add_leftovers_to_freelist(buddy_chunk_t __arg_arena *chunk, u32 cur_idx,
 	return 0;
 }
 
-static buddy_chunk_t *buddy_chunk_get(buddy_t *buddy)
+static buddy_chunk_t buddy_chunk_get(buddy_t buddy)
 {
 	u64 order, ord, min_order, max_order;
-	buddy_chunk_t  *chunk;
+	buddy_chunk_t chunk;
 	size_t left;
 	int power2;
 	u64 vaddr;
@@ -561,9 +561,9 @@ static buddy_chunk_t *buddy_chunk_get(buddy_t *buddy)
 	return chunk;
 }
 
-__weak int buddy_init(buddy_t __arg_arena *buddy)
+__weak int buddy_init(buddy_t buddy)
 {
-	buddy_chunk_t *chunk;
+	buddy_chunk_t chunk;
 	int ret;
 
 	if (!asan_ready())
@@ -602,9 +602,9 @@ __weak int buddy_init(buddy_t __arg_arena *buddy)
  * We do not take a lock because we are freeing arena pages, and nobody should
  * be using the allocator at that point in the execution.
  */
-__weak int buddy_destroy(buddy_t __arg_arena *buddy)
+__weak int buddy_destroy(buddy_t buddy)
 {
-	buddy_chunk_t *chunk, *next;
+	buddy_chunk_t chunk, next;
 
 	if (!buddy)
 		return -EINVAL;
@@ -631,9 +631,9 @@ __weak int buddy_destroy(buddy_t __arg_arena *buddy)
 	return 0;
 }
 
-__weak u64 buddy_chunk_alloc(buddy_chunk_t __arg_arena *chunk, int order_req)
+__weak u64 buddy_chunk_alloc(buddy_chunk_t chunk, int order_req)
 {
-	buddy_header_t *header, *tmp_header, *next_header;
+	buddy_header_t header, tmp_header, next_header;
 	u32 idx, tmpidx, retidx;
 	u64 address;
 	u64 order = 0;
@@ -709,9 +709,9 @@ __weak u64 buddy_chunk_alloc(buddy_chunk_t __arg_arena *chunk, int order_req)
 }
 
 /* Scan the existing chunks for available memory. */
-static u64 buddy_alloc_from_existing_chunks(buddy_t *buddy, int order)
+static u64 buddy_alloc_from_existing_chunks(buddy_t buddy, int order)
 {
-	buddy_chunk_t *chunk;
+	buddy_chunk_t chunk;
 	u64 address;
 
 	for (chunk = buddy->first_chunk; chunk != NULL && can_loop;
@@ -728,7 +728,7 @@ static u64 buddy_alloc_from_existing_chunks(buddy_t *buddy, int order)
  * Try an allocation from a newly allocated chunk. Also
  * incorporate the chunk into the linked list.
  */
-static u64 buddy_alloc_from_new_chunk(buddy_t *buddy, buddy_chunk_t *chunk, int order)
+static u64 buddy_alloc_from_new_chunk(buddy_t buddy, buddy_chunk_t chunk, int order)
 {
 	u64 address;
 
@@ -750,9 +750,9 @@ static u64 buddy_alloc_from_new_chunk(buddy_t *buddy, buddy_chunk_t *chunk, int 
 	return (u64)address;
 }
 __weak
-u64 buddy_alloc_internal(buddy_t __arg_arena *buddy, size_t size)
+u64 buddy_alloc_internal(buddy_t buddy, size_t size)
 {
-	buddy_chunk_t *chunk;
+	buddy_chunk_t chunk;
 	u64 address = (u64)NULL;
 	int order;
 
@@ -788,20 +788,20 @@ done:
 	 * data is smaller than the header, we must poison any
 	 * unused bytes that were part of the header.
 	 */
-	if (size < BUDDY_HEADER_OFF + sizeof(buddy_header_t))
+	if (size < BUDDY_HEADER_OFF + sizeof(struct buddy_header))
 		asan_poison((u8 __arena *)address + BUDDY_HEADER_OFF,
-			    BUDDY_POISONED, sizeof(buddy_header_t));
+			    BUDDY_POISONED, sizeof(struct buddy_header));
 
 	asan_unpoison((u8 __arena *)address, size);
 
 	return address;
 }
 
-static __always_inline int buddy_free_unlocked(buddy_t *buddy, u64 addr)
+static __always_inline int buddy_free_unlocked(buddy_t buddy, u64 addr)
 {
-	buddy_header_t *header, *buddy_header;
+	buddy_header_t header, buddy_header;
 	u64 idx, buddy_idx, tmp_idx;
-	buddy_chunk_t *chunk;
+	buddy_chunk_t chunk;
 	bool allocated;
 	u8 order;
 	int ret;
@@ -815,7 +815,7 @@ static __always_inline int buddy_free_unlocked(buddy_t *buddy, u64 addr)
 	}
 
 	/* Get (chunk, idx) out of the address. */
-	chunk = (void __arena *)(addr & ~BUDDY_CHUNK_OFFSET_MASK);
+	chunk = (buddy_chunk_t)(addr & ~BUDDY_CHUNK_OFFSET_MASK);
 	idx = (addr & BUDDY_CHUNK_OFFSET_MASK) / BUDDY_MIN_ALLOC_BYTES;
 
 	/* Mark the block as unallocated so we can access the header. */
@@ -878,7 +878,7 @@ static __always_inline int buddy_free_unlocked(buddy_t *buddy, u64 addr)
 	return 0;
 }
 
-__weak int buddy_free_internal(buddy_t __arg_arena *buddy, u64 addr)
+__weak int buddy_free_internal(buddy_t buddy, u64 addr)
 {
 	int ret;
 
