@@ -15209,9 +15209,15 @@ static u8 rev_opcode(u8 opcode);
 static int simulate_both_branches_taken(struct bpf_verifier_env *env, u8 opcode, bool is_jmp32)
 {
 	/* Fallthrough (FALSE) branch */
+	// TODO: adjust to know how many registers returned and do reg_bounds_sync() for all returned regs
 	regs_refine_cond_op(&env->false_reg1, &env->false_reg2, rev_opcode(opcode), is_jmp32);
 	reg_bounds_sync(&env->false_reg1);
 	reg_bounds_sync(&env->false_reg2);
+	// TODO: this condition has to be moved to caller: check_cond_jmp_op()
+	//       just return -1 after two
+	//         regs_refine_cond_op(false_reg...);
+	//         regs_refine_cond_op(true_reg...);
+	//       calls
 	/*
 	 * If there is a range bounds violation in *any* of the abstract values in either
 	 * reg_states in the FALSE branch (i.e. reg1, reg2), the FALSE branch must be dead. Only
@@ -15221,6 +15227,7 @@ static int simulate_both_branches_taken(struct bpf_verifier_env *env, u8 opcode,
 		return 1;
 
 	/* Jump (TRUE) branch */
+	// TODO: adjust to know how many registers returned and do reg_bounds_sync() for all returned regs
 	regs_refine_cond_op(&env->true_reg1, &env->true_reg2, opcode, is_jmp32);
 	reg_bounds_sync(&env->true_reg1);
 	reg_bounds_sync(&env->true_reg2);
@@ -15392,6 +15399,7 @@ static int is_scalar_branch_taken(struct bpf_verifier_env *env, struct bpf_reg_s
 		break;
 	}
 
+	// TODO: just return -1
 	return simulate_both_branches_taken(env, opcode, is_jmp32);
 }
 
@@ -15531,6 +15539,11 @@ static u8 rev_opcode(u8 opcode)
 }
 
 /* Refine range knowledge for <reg1> <op> <reg>2 conditional operation. */
+// TODO: extend this to be:
+//       void regs_refine_cond_op(struct bpf_reg_state reg1[2], struct bpf_reg_state reg2[2],
+//				  u32 *reg1_cnt, u32 *reg2_cnt, u8 opcode, bool is_jmp32)
+//       as it can produce up to two variants for reg1 and reg2, reg{1,2}_cnt should track
+//       the actual number of registers produced
 static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state *reg2,
 				u8 opcode, bool is_jmp32)
 {
@@ -15550,9 +15563,20 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 		break;
 	}
 
+	// TODO: for each branch below (except BPF_JSET) use the cnum{32,64}_intersect2
 	switch (opcode) {
 	case BPF_JEQ:
 		if (is_jmp32) {
+			// TODO: a, b = intersect2(...)
+			//       t = ... as before ...
+			//       reg1[0]->r32 = a;
+			//       reg2[0]->r32 = a;
+			//       reg1[1]->r32 = b;
+			//       reg2[1]->r32 = b;
+			//       reg1[0]->var_off = t
+			//       reg2[0]->var_off = t
+			//       reg1[1]->var_off = t
+			//       reg2[1]->var_off = t
 			reg1->r32 = cnum32_intersect(reg1->r32, reg2->r32);
 			reg2->r32 = reg1->r32;
 
@@ -15560,6 +15584,7 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 			reg1->var_off = tnum_with_subreg(reg1->var_off, t);
 			reg2->var_off = tnum_with_subreg(reg2->var_off, t);
 		} else {
+			// TODO: same as jmp32 but for r64
 			reg1->r64 = cnum64_intersect(reg1->r64, reg2->r64);
 			reg2->r64 = reg1->r64;
 
@@ -15578,9 +15603,13 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 		 */
 		val = reg_const_value(reg2, is_jmp32);
 		if (is_jmp32) {
+			// TODO: a, b = intersect2(...)
+			//       reg1[0]->r32 = a;
+			//       reg1[1]->r32 = b;
 			/* Complement of the range [val, val] as cnum32. */
 			cnum32_intersect_with(&reg1->r32, (struct cnum32){ val + 1, U32_MAX - 1 });
 		} else {
+			// TODO: same as jmp32 but for r64
 			/* Complement of the range [val, val] as cnum64. */
 			cnum64_intersect_with(&reg1->r64, (struct cnum64){ val + 1, U64_MAX - 1 });
 		}
@@ -15629,36 +15658,49 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 		break;
 	case BPF_JLE:
 		if (is_jmp32) {
+			// TODO: a, b = intersect2(reg1->r32, from_urange(0, reg_u32_max(reg2)))
+			//       c, d = intersect2(reg2->r32, from_urange(reg_u32_min(reg1), U32_MAX))
+			//       reg1[0]->r32 = a;
+			//       reg1[1]->r32 = b;
+			//       reg2[0]->r32 = c;
+			//       reg2[1]->r32 = d;
 			cnum32_intersect_with_urange(&reg1->r32, 0, reg_u32_max(reg2));
 			cnum32_intersect_with_urange(&reg2->r32, reg_u32_min(reg1), U32_MAX);
 		} else {
+			// TODO: similar
 			cnum64_intersect_with_urange(&reg1->r64, 0, reg_umax(reg2));
 			cnum64_intersect_with_urange(&reg2->r64, reg_umin(reg1), U64_MAX);
 		}
 		break;
 	case BPF_JLT:
 		if (is_jmp32) {
+			// TODO: similar
 			cnum32_intersect_with_urange(&reg1->r32, 0, reg_u32_max(reg2) - 1);
 			cnum32_intersect_with_urange(&reg2->r32, reg_u32_min(reg1) + 1, U32_MAX);
 		} else {
+			// TODO: similar
 			cnum64_intersect_with_urange(&reg1->r64, 0, reg_umax(reg2) - 1);
 			cnum64_intersect_with_urange(&reg2->r64, reg_umin(reg1) + 1, U64_MAX);
 		}
 		break;
 	case BPF_JSLE:
 		if (is_jmp32) {
+			// TODO: similar
 			cnum32_intersect_with_srange(&reg1->r32, S32_MIN, reg_s32_max(reg2));
 			cnum32_intersect_with_srange(&reg2->r32, reg_s32_min(reg1), S32_MAX);
 		} else {
+			// TODO: similar
 			cnum64_intersect_with_srange(&reg1->r64, S64_MIN, reg_smax(reg2));
 			cnum64_intersect_with_srange(&reg2->r64, reg_smin(reg1), S64_MAX);
 		}
 		break;
 	case BPF_JSLT:
 		if (is_jmp32) {
+			// TODO: similar
 			cnum32_intersect_with_srange(&reg1->r32, S32_MIN, reg_s32_max(reg2) - 1);
 			cnum32_intersect_with_srange(&reg2->r32, reg_s32_min(reg1) + 1, S32_MAX);
 		} else {
+			// TODO: similar
 			cnum64_intersect_with_srange(&reg1->r64, S64_MIN, reg_smax(reg2) - 1);
 			cnum64_intersect_with_srange(&reg2->r64, reg_smin(reg1) + 1, S64_MAX);
 		}
@@ -16107,6 +16149,29 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		if (err)
 			return err;
 	}
+
+	// TODO: call simulate_both_branches_taken(env, opcode, is_jmp32);
+	// TODO: this point becomes a Cartesian product of states:
+	//       - env->false_reg{1,2}[*]:
+	//         any false_reg1 can be paired with any false_reg2
+	//       - env->true_reg{1,2}[*]
+	//         any true_reg1 can be paired with any true_reg2
+	//       (the better names would be {true,false}_{src,dst}[] but we'll deal with this later)
+	//       For each pair:
+	//       - do the (range_bounds_violation(src) || range_bounds_violation(dst))
+	//         check to infer if pair is viable (as it was done in simulate_both_branches_taken())
+	//         if any pair becomes non-viable (has violations) do mark_chain_precision as if
+	//         prediction had been made (don't deal with sanitize_speculative_path for now)
+	//       - if the pair is w/o violations:
+	//         - do push_stack to visit it later (with insn_idx depending on a pair
+	//           coming from true_ or false_ array)
+	//         - do sync_linked_regs() within the pair
+	//         - the mark_ptr_not_null_reg() steps done by this function also have to be
+	//         - done for each pair
+	//         - this effectively rewrites the tail of this function by applying it to each pair.
+	//       Make it so that the current state continues as a first viable pair from false_ array,
+	//       if such a pair does not exist, then it should be a first viable pair from true_ array,
+	//       one of those should always exist.
 
 	other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx, false);
 	if (IS_ERR(other_branch))
