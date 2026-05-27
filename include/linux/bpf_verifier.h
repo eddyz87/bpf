@@ -1052,13 +1052,8 @@ struct bpf_verifier_env {
 	/* buffer used to temporary hold constants as scalar registers */
 	struct bpf_reg_state fake_reg[1];
 	/* buffers used to save updated reg states while simulating branches */
-	// TODO:
-	// extend these to be arrays two elements each:
-	// true_reg1[2], true_reg2[2], false_reg1[2], false_reg2[2]
-	// extend the structure with fields
-	//   u32 true_reg1_cnt, ...;
-	// maintaining the actual sizes of the arrays
-	struct bpf_reg_state true_reg1, true_reg2, false_reg1, false_reg2;
+	struct bpf_reg_state true_reg1[2], true_reg2[2], false_reg1[2], false_reg2[2];
+	u32 true_reg1_cnt, true_reg2_cnt, false_reg1_cnt, false_reg2_cnt;
 	/* buffer used to generate temporary string representations,
 	 * e.g., in reg_type_str() to generate reg_type string
 	 */

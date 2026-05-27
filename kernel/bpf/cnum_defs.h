@@ -82,28 +82,17 @@ st FN(smax)(struct cnum_t cnum)
 	       : max((st)cnum.base, (st)(cnum.base + cnum.size));
 }
 
-// TODO: define a function
-//       struct cnum_t[2] FN(intersect2)(struct cnum_t a, struct cnum_t b)
-//       that performs the intersection and returns two arcs:
-//       - an arc and an empty arc if cnums intersect in one arc
-//       - to legit arcs if cnums intersect in two arcs
-//       - reuse FN(intersect) body for this
-
 /*
- * Returns a possibly empty intersection of cnums 'a' and 'b'.
- * If 'a' and 'b' intersect in two sub-arcs, the function over-approximates
- * and returns either 'a' or 'b', whichever is smaller.
+ * Compute intersection of cnums 'a' and 'b', returning up to two arcs
+ * in 'out'. Returns the number of non-empty arcs (0, 1, or 2).
  */
-struct cnum_t FN(intersect)(struct cnum_t a, struct cnum_t b)
+u32 FN(intersect2)(struct cnum_t a, struct cnum_t b, struct cnum_t out[2])
 {
-	// TODO: implement this function in terms of intersect2:
-	//       - return a bigger arcs if two non-empty arcs are returned
-	//       - otherwise return a non-empty arc (or empty if both are empty)
 	struct cnum_t b1;
 	ut dbase;
 
 	if (FN(is_empty)(a) || FN(is_empty)(b))
-		return EMPTY;
+		return 0;
 
 	if (a.base > b.base)
 		swap(a, b);
@@ -125,16 +114,17 @@ struct cnum_t FN(intersect)(struct cnum_t a, struct cnum_t b)
 			 * [= b1 tail =]  [========= b1 main ==========>]
 			 *                 ^-- b1.base <= a.size
 			 *
-			 * 'a' and 'b' intersect in two disjoint arcs,
-			 * can't represent as single cnum, over-approximate
-			 * the result.
+			 * 'a' and 'b' intersect in two sub-arcs.
+			 * If b1 tail extends past a, the intersection is
+			 * just a (single arc).
 			 */
-			// TODO:
-			// When moving this to intersect2, this branch produces two arcs:
-			// - {a.base, (ut)(b1.base + b1.size)}
-			// - {b.base, a.size - b1.base}
-			// (double check me)
-			return a.size <= b.size ? a : b;
+			if ((ut)(b1.base + b1.size) >= a.size) {
+				out[0] = a;
+				return 1;
+			}
+			out[0] = (struct cnum_t){ a.base, (ut)(b1.base + b1.size) };
+			out[1] = (struct cnum_t){ b.base, a.size - b1.base };
+			return 2;
 		} else {
 			/*
 			 * Rotated frame (a.base at origin):
@@ -147,10 +137,11 @@ struct cnum_t FN(intersect)(struct cnum_t a, struct cnum_t b)
 			 *
 			 * Only 'b' tail intersects 'a'.
 			 */
-			return (struct cnum_t) {
+			out[0] = (struct cnum_t) {
 				.base = a.base,
 				.size = min(a.size, (ut)(b1.base + b1.size)),
 			};
+			return 1;
 		}
 	} else if (a.size >= b1.base) {
 		/*
@@ -170,13 +161,31 @@ struct cnum_t FN(intersect)(struct cnum_t a, struct cnum_t b)
 		 *
 		 * 'a' and 'b' intersect as one cnum.
 		 */
-		return (struct cnum_t) {
+		out[0] = (struct cnum_t) {
 			.base = b.base,
 			.size = min((ut)(a.size - dbase), b.size),
 		};
+		return 1;
 	} else {
-		return EMPTY;
+		return 0;
 	}
+}
+
+/*
+ * Returns a possibly empty intersection of cnums 'a' and 'b'.
+ * If 'a' and 'b' intersect in two sub-arcs, the function over-approximates
+ * and returns either 'a' or 'b', whichever is smaller.
+ */
+struct cnum_t FN(intersect)(struct cnum_t a, struct cnum_t b)
+{
+	struct cnum_t out[2];
+	u32 cnt = FN(intersect2)(a, b, out);
+
+	if (cnt == 2)
+		return a.size <= b.size ? a : b;
+	if (cnt == 1)
+		return out[0];
+	return EMPTY;
 }
 
 void FN(intersect_with)(struct cnum_t *dst, struct cnum_t src)
