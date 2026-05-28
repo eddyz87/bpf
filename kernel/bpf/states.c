@@ -1266,6 +1266,47 @@ static void mark_all_scalars_imprecise(struct bpf_verifier_env *env, struct bpf_
 	}
 }
 
+u32 state_htab_size(struct bpf_verifier_env *env)
+{
+	return env->prog->len;
+}
+
+struct list_head *bpf_explored_state(struct bpf_verifier_env *env, int idx)
+{
+	struct bpf_verifier_state *cur = env->cur_state;
+	struct bpf_func_state *state = cur->frame[cur->curframe];
+
+	return &env->explored_states[(idx ^ state->callsite) % state_htab_size(env)];
+}
+
+struct cache_iter {
+	struct list_head *head;
+	struct list_head *pos;
+};
+
+static struct cache_iter make_cache_iter(struct bpf_verifier_env *env, u32 callsite, u32 insn_idx)
+{
+	struct list_head *head = &env->explored_states[(insn_idx ^ callsite) % state_htab_size(env)];
+
+	return (struct cache_iter) {
+		.head = head,
+		.pos = head->next,
+	};
+}
+
+static struct bpf_verifier_state_list *cache_iter_next(struct cache_iter *it)
+{
+	struct list_head *cur;
+
+	if (list_is_head(it->pos, it->head))
+		return NULL;
+
+	cur = it->pos;
+	it->pos = cur->next;
+	return container_of(cur, struct bpf_verifier_state_list, node);
+}
+
+
 int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
@@ -1630,6 +1671,11 @@ miss:
 	return 0;
 }
 
+static u32 cc_callsite(struct bpf_callchain *cc)
+{
+	return cc->curframe > 0 ? cc->insn_idx[cc->curframe - 1] : BPF_MAIN_FUNC;
+}
+
 static bool callchain_matches_state(struct bpf_callchain *cc,
 				    struct bpf_verifier_state *st)
 {
@@ -1665,28 +1711,26 @@ int bpf_sample_state_diffs(struct bpf_verifier_env *env,
 {
 	struct bpf_verifier_state_list *sl_i, *sl_j;
 	struct state_diff_cnt *diff_cnts = NULL;
-	struct list_head *pos_i, *pos_j, *head;
-	u32 leaf_insn, callsite, hash_idx;
+	struct cache_iter iter_i, iter_j;
+	u32 leaf_insn, callsite;
 	int i, cap = 0, nr_locs = 0;
 
 	leaf_insn = cc->insn_idx[cc->curframe];
-	callsite = cc->curframe > 0 ? cc->insn_idx[cc->curframe - 1] : BPF_MAIN_FUNC;
-	hash_idx = (leaf_insn ^ callsite) % env->prog->len;
-	head = &env->explored_states[hash_idx];
+	callsite = cc_callsite(cc);
 
-	list_for_each(pos_i, head) {
-		sl_i = container_of(pos_i, struct bpf_verifier_state_list, node);
+	iter_i = make_cache_iter(env, callsite, leaf_insn);
+	while ((sl_i = cache_iter_next(&iter_i))) {
 		if (!callchain_matches_state(cc, &sl_i->state))
 			continue;
-		list_for_each(pos_j, head) {
+		iter_j = make_cache_iter(env, callsite, leaf_insn);
+		while ((sl_j = cache_iter_next(&iter_j))) {
 			struct bpf_state_diff diff = {};
 
-			if (pos_i == pos_j)
+			if (sl_i == sl_j)
 				continue;
-			sl_j = container_of(pos_j, struct bpf_verifier_state_list, node);
 			if (!callchain_matches_state(cc, &sl_j->state))
 				continue;
-			if (states_equal(env, &sl_i->state, &sl_j->state, NOT_EXACT, &diff))
+			if (states_equal(env, &sl_i->state, &sl_j->state, RANGE_WITHIN, &diff))
 				continue;
 			if (diff.kind == DIFF_OTHER)
 				continue;
@@ -1723,4 +1767,49 @@ next:;
 		top_diffs[i] = diff_cnts[i].diff;
 	kvfree(diff_cnts);
 	return 0;
+}
+
+void bpf_collect_reg_samples(struct bpf_verifier_env *env,
+			     struct bpf_callchain *cc,
+			     struct bpf_state_diff *diff,
+			     struct bpf_reg_state **samples,
+			     int *nr_samples)
+{
+	struct bpf_verifier_state_list *sl;
+	struct bpf_reg_state *reg;
+	struct bpf_func_state *frame;
+	struct cache_iter iter;
+	int i, collected = 0;
+
+	iter = make_cache_iter(env, cc_callsite(cc), cc->insn_idx[cc->curframe]);
+	while ((sl = cache_iter_next(&iter))) {
+		if (collected >= *nr_samples)
+			break;
+		if (!callchain_matches_state(cc, &sl->state))
+			continue;
+
+		frame = sl->state.frame[diff->frame];
+		switch (diff->kind) {
+		case DIFF_REG:
+			reg = &frame->regs[diff->slot];
+			break;
+		case DIFF_STACK:
+			reg = &frame->stack[diff->slot].spilled_ptr;
+			break;
+		case DIFF_ARG:
+			reg = &frame->stack_arg_regs[diff->slot];
+			break;
+		default:
+			continue;
+		}
+
+		for (i = 0; i < collected; i++) {
+			reset_idmap_scratch(env);
+			if (regsafe(env, samples[i], reg, &env->idmap_scratch, RANGE_WITHIN))
+				goto next;
+		}
+		samples[collected++] = reg;
+next:;
+	}
+	*nr_samples = collected;
 }

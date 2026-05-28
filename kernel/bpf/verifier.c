@@ -1685,18 +1685,6 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 	return 0;
 }
 
-static u32 state_htab_size(struct bpf_verifier_env *env)
-{
-	return env->prog->len;
-}
-
-struct list_head *bpf_explored_state(struct bpf_verifier_env *env, int idx)
-{
-	struct bpf_verifier_state *cur = env->cur_state;
-	struct bpf_func_state *state = cur->frame[cur->curframe];
-
-	return &env->explored_states[(idx ^ state->callsite) % state_htab_size(env)];
-}
 
 static bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_state *b)
 {
@@ -1766,6 +1754,8 @@ static bool error_recoverable_with_nospec(int err)
 	return err == -EPERM || err == -EACCES || err == -EINVAL;
 }
 
+static int print_hotspots(struct bpf_verifier_env *env);
+
 static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 					     int insn_idx, int prev_insn_idx,
 					     bool speculative)
@@ -1789,6 +1779,9 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 		return ERR_PTR(-ENOMEM);
 	elem->st.speculative |= speculative;
 	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
+		err = print_hotspots(env);
+		if (err)
+			verbose(env, "Can't provide detaield hotspots report because of internal error: %d\n", err);
 		verbose(env, "The sequence of %d jumps is too complex.\n",
 			env->stack_size);
 		return ERR_PTR(-E2BIG);
@@ -17287,7 +17280,7 @@ static int print_callchain_entry(struct bpf_verifier_env *env,
 	struct bpf_callchain *cc = &entry->cc;
 	const struct bpf_line_info *linfo;
 	struct bpf_subprog_info *sub;
-	int i, err, insn_idx;
+	int i, j, err, insn_idx;
 
 	verbose(env, "#%d most visited simulated stacktrace (visited %llu times):\n",
 		idx, entry->count);
@@ -17316,6 +17309,9 @@ static int print_callchain_entry(struct bpf_verifier_env *env,
 			return err;
 		for (i = 0; i < nr_diffs; i++) {
 			struct bpf_state_diff *d = &top_diffs[i];
+			struct bpf_reg_state *samples[5];
+			struct bpf_stack_state *stack;
+			int nr_samples = ARRAY_SIZE(samples);
 
 			switch (d->kind) {
 			case DIFF_REG:
@@ -17333,6 +17329,17 @@ static int print_callchain_entry(struct bpf_verifier_env *env,
 			default:
 				/* shouldn't really happen */
 				continue;
+			}
+			bpf_collect_reg_samples(env, cc, d, samples, &nr_samples);
+			for (j = 0; j < nr_samples; j++) {
+				verbose(env, "      sample #%d:", j + 1);
+				if (d->kind == DIFF_STACK) {
+					stack = container_of(samples[j], struct bpf_stack_state, spilled_ptr);
+					bpf_print_slot_state(env, NULL, stack, d->slot);
+				} else {
+					bpf_print_reg_state(env, NULL, samples[j]);
+				}
+				verbose(env, "\n");
 			}
 		}
 	}

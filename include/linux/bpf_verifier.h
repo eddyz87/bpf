@@ -1227,6 +1227,7 @@ int bpf_update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifier_s
 void bpf_clear_jmp_history(struct bpf_verifier_state *state);
 int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 			    const struct bpf_verifier_state *src);
+u32 state_htab_size(struct bpf_verifier_env *env);
 struct list_head *bpf_explored_state(struct bpf_verifier_env *env, int idx);
 void bpf_free_verifier_state(struct bpf_verifier_state *state, bool free_self);
 void bpf_free_backedges(struct bpf_scc_visit *visit);
@@ -1445,6 +1446,12 @@ const char *dynptr_type_str(enum bpf_dynptr_type type);
 const char *iter_type_str(const struct btf *btf, u32 btf_id);
 const char *iter_state_str(enum bpf_iter_state state);
 
+void bpf_print_reg_state(struct bpf_verifier_env *env,
+		     const struct bpf_func_state *state,
+		     const struct bpf_reg_state *reg);
+void bpf_print_slot_state(struct bpf_verifier_env *env,
+		      const struct bpf_func_state *state,
+		      const struct bpf_stack_state *slot, int spi);
 void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifier_state *vstate,
 			  u32 frameno, bool print_all);
 void print_insn_state(struct bpf_verifier_env *env, const struct bpf_verifier_state *vstate,
@@ -1644,5 +1651,10 @@ int bpf_sample_state_diffs(struct bpf_verifier_env *env,
 			   struct bpf_callchain *cc,
 			   struct bpf_state_diff *top_diffs,
 			   int *nr_diffs);
+void bpf_collect_reg_samples(struct bpf_verifier_env *env,
+			     struct bpf_callchain *cc,
+			     struct bpf_state_diff *diff,
+			     struct bpf_reg_state **samples,
+			     int *nr_samples);
 
 #endif /* _LINUX_BPF_VERIFIER_H */
