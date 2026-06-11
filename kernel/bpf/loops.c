@@ -434,6 +434,7 @@ int bpf_compute_loops(struct bpf_verifier_env *env)
 {
 	int i, j, s, t, iloop, sloop, err = 0, len = env->prog->len;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_verifier_log *log = &env->log;
 	struct bpf_backedge *backedge;
 	struct loops_dfs dfs = {};
 	struct bpf_iarray *succ;
@@ -500,12 +501,18 @@ int bpf_compute_loops(struct bpf_verifier_env *env)
 			loop = aux[i].loop;
 			if (!loop)
 				continue;
+			bpf_log(log, "loop at %d", i);
+			if (aux[i].loop_header >= 0)
+				bpf_log(log, " nested in %d", aux[i].loop_header);
+			if (loop->irreducible)
+				bpf_log(log, " irreducible");
+			bpf_log(log, "\n");
 			for (j = 0; j < loop->backedges_cnt; j++) {
-				bpf_log(&env->log, "loop at %d backedge from %d, latch at %d\n",
+				bpf_log(log, "loop at %d backedge from %d, latch at %d\n",
 					i, loop->backedges[j].from, loop->backedges[j].latch);
 			}
 			for (j = 0; j < loop->exits_cnt; j++) {
-				bpf_log(&env->log, "loop at %d exit from %d to %d\n",
+				bpf_log(log, "loop at %d exit from %d to %d\n",
 					i, loop->exits[j].from, loop->exits[j].to);
 			}
 		}
