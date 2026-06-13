@@ -317,3 +317,10 @@ u64 tnum_step(struct tnum t, u64 z)
 	inc = (filled + 1) & t.mask;
 	return t.value | inc;
 }
+
+u32 tnum_alignment(struct tnum a)
+{
+	u64 v = a.value | a.mask;
+
+	return v ? __ffs(v) : 64;
+}
