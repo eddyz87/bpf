@@ -188,7 +188,7 @@ static int mark_stack_read(struct func_instance *instance, u32 frame, u32 insn_i
 	return 0;
 }
 
-static int mark_stack_write(struct func_instance *instance, u32 frame, u32 insn_idx, spis_t mask)
+static int mark_must_write(struct func_instance *instance, u32 frame, u32 insn_idx, spis_t mask)
 {
 	struct per_frame_masks *masks;
 
@@ -199,7 +199,7 @@ static int mark_stack_write(struct func_instance *instance, u32 frame, u32 insn_
 	return 0;
 }
 
-static int mark_stack_may_write(struct func_instance *instance, u32 frame, u32 insn_idx, spis_t mask)
+static int mark_may_write(struct func_instance *instance, u32 frame, u32 insn_idx, spis_t mask)
 {
 	struct per_frame_masks *masks;
 
@@ -559,6 +559,49 @@ static int cmp_instances(const void *pa, const void *pb)
 	if (ddepth)
 		return ddepth;
 	return 0;
+}
+
+/* Collapse a 4-byte-granularity spis mask into an 8-byte slot mask. */
+static u64 spis_to_slot_mask(spis_t s)
+{
+	u64 mask = 0;
+	int slot;
+
+	for (slot = 0; slot < STACK_SLOTS / 2; slot++)
+		if (spis_test_bit(s, slot * 2) || spis_test_bit(s, slot * 2 + 1))
+			mask |= 1ULL << slot;
+	return mask;
+}
+
+/*
+ * Precompute, for each instruction, the OR of may_write masks over its top
+ * frame across all func_instances reaching it, stash it in the insn_aux_data.
+ */
+static void compute_may_write_masks(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_liveness *liveness = env->liveness;
+	struct func_instance *instance;
+	struct per_frame_masks *frame;
+	int bkt, i;
+	u64 mask;
+
+	hash_for_each(liveness->func_instances, bkt, instance, hl_node) {
+		frame = instance->frames[instance->depth];
+		if (!frame)
+			continue;
+		for (i = 0; i < instance->insn_cnt; i++) {
+			if (spis_is_zero(frame[i].may_write))
+				continue;
+			mask = spis_to_slot_mask(frame[i].may_write);
+			aux[instance->subprog_start + i].may_write_mask |= mask;
+		}
+	}
+}
+
+u64 bpf_may_write_mask(struct bpf_verifier_env *env, u32 insn_idx)
+{
+	return env->insn_aux_data[insn_idx].may_write_mask;
 }
 
 /* print use/def slots for all instances ordered by callsite first, then by depth */
@@ -1279,7 +1322,7 @@ static int record_stack_access_off(struct bpf_verifier_env *env,
 		mask = SPIS_ZERO;
 		spis_or_range(&mask, 0, slot_hi);
 		err = mark_stack_read(instance, frame, insn_idx, mask);
-		return err ?: mark_stack_may_write(instance, frame, insn_idx, mask);
+		return err ?: mark_may_write(instance, frame, insn_idx, mask);
 	}
 	if (access_bytes > 0) {
 		/* Mark any touched slot as use */
@@ -1296,7 +1339,7 @@ static int record_stack_access_off(struct bpf_verifier_env *env,
 		if (slot_lo <= slot_hi && arg->off_cnt == 1) {
 			mask = SPIS_ZERO;
 			spis_or_range(&mask, slot_lo, slot_hi);
-			err = mark_stack_write(instance, frame, insn_idx, mask);
+			err = mark_must_write(instance, frame, insn_idx, mask);
 			if (err)
 				return err;
 		}
@@ -1306,7 +1349,7 @@ static int record_stack_access_off(struct bpf_verifier_env *env,
 		if (slot_lo <= slot_hi) {
 			mask = SPIS_ZERO;
 			spis_or_range(&mask, slot_lo, slot_hi);
-			err = mark_stack_may_write(instance, frame, insn_idx, mask);
+			err = mark_may_write(instance, frame, insn_idx, mask);
 			if (err)
 				return err;
 		}
@@ -1334,7 +1377,7 @@ static int record_stack_access(struct bpf_verifier_env *env,
 				return err;
 		}
 		if (access_bytes < 0 || access_bytes == S64_MIN) {
-			err = mark_stack_may_write(instance, frame, insn_idx, SPIS_ALL);
+			err = mark_may_write(instance, frame, insn_idx, SPIS_ALL);
 			if (err)
 				return err;
 		}
@@ -1368,7 +1411,7 @@ static int record_imprecise(struct func_instance *instance, s64 access_bytes, u3
 					return err;
 			}
 			if (access_bytes < 0) {
-				err = mark_stack_may_write(instance, f, insn_idx, SPIS_ALL);
+				err = mark_may_write(instance, f, insn_idx, SPIS_ALL);
 				if (err)
 					return err;
 			}
@@ -1473,7 +1516,7 @@ static int record_arg_access(struct bpf_verifier_env *env,
 			err = mark_stack_read(instance, f, insn_idx, SPIS_ALL);
 			if (err)
 				return err;
-			err = mark_stack_may_write(instance, f, insn_idx, SPIS_ALL);
+			err = mark_may_write(instance, f, insn_idx, SPIS_ALL);
 			if (err)
 				return err;
 		}
@@ -1889,7 +1932,7 @@ static int merge_may_write(struct func_instance *caller, struct func_instance *c
 			acc = spis_or(acc, callee->frames[f][i].may_write);
 		if (spis_is_zero(acc))
 			continue;
-		err = mark_stack_may_write(caller, f, call_idx, acc);
+		err = mark_may_write(caller, f, call_idx, acc);
 		if (err)
 			return err;
 	}
@@ -2123,6 +2166,8 @@ int bpf_compute_subprog_arg_access(struct bpf_verifier_env *env)
 		if (err)
 			goto out;
 	}
+
+	compute_may_write_masks(env);
 
 	if (env->log.level & BPF_LOG_LEVEL2)
 		err = print_instances(env);
