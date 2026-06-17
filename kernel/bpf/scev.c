@@ -10,6 +10,7 @@
 
 #define REGS_NUM (MAX_BPF_REG + 64)
 #define UNKNOWN_EXPR_ID 0
+#define OPAQUE_EXPR_ID  1
 
 // TODO: An alternative is to use bpf_insn as a whole, hijack the illegal opcode
 //         { .code = (BPF_LD | BPF_W | BPF_IMM), .imm = <custom-opcode> }
@@ -40,13 +41,15 @@ enum expr_op {
 	BSWAP64 = 12 << 8,
 	/* during the loop body execution the value can be either of param[0] or param[1] */
 	ANY     = 13 << 8,
+	/* some value that verifier is not going to track precisely */
+	OPAQUE  = 14 << 8,
 	/*
 	 * SCEV expression corresponding to linear equation 'param[0] + param[1] * k',
 	 * where k is a loop iteration number. Loop here refers to innermost loop
 	 * containing instruction associated with this expression, as returned by
 	 * bpf_loop_at_index().
 	 */
-	LINEAR_SCEV = 14 << 8,
+	LINEAR_SCEV = 15 << 8,
 };
 
 struct expr {
@@ -195,6 +198,13 @@ static bool is_imm(struct scev *scev, int id, s64 *imm)
 	return true;
 }
 
+static bool is_op(struct scev *scev, int id, u32 op)
+{
+	if (scev->exprs[id].op != op)
+		return false;
+	return true;
+}
+
 static bool is_unop(struct scev *scev, enum expr_op op, int id, u32 *p0)
 {
 	if (scev->exprs[id].op != op)
@@ -234,6 +244,11 @@ static bool is_any(struct scev *scev, int id, u32 *left, u32 *right) {
 static bool is_linear(struct scev *scev, int id, u32 *base, u32 *slope)
 {
 	return is_binop(scev, LINEAR_SCEV, id, base, slope);
+}
+
+static bool is_opaque(struct scev *scev, int id)
+{
+	return is_op(scev, id, OPAQUE);
 }
 
 static void log_reg(struct bpf_verifier_env *env, u32 reg)
@@ -819,6 +834,16 @@ static int worklist_push(struct scev *scev, int idx)
 	return 0;
 }
 
+static bool is_probe_read_helper(u32 func_id)
+{
+	return func_id == BPF_FUNC_probe_read ||
+	       func_id == BPF_FUNC_probe_read_kernel ||
+	       func_id == BPF_FUNC_probe_read_user ||
+	       func_id == BPF_FUNC_probe_read_str ||
+	       func_id == BPF_FUNC_probe_read_kernel_str ||
+	       func_id == BPF_FUNC_probe_read_user_str;
+}
+
 /*
  * If instruction is an indirect write to stack, invalidate SCEVs for spi's
  * that this instruction can touch.
@@ -832,6 +857,7 @@ static void reset_scevs_at_indirect_writes(struct bpf_verifier_env *env, struct 
 	bool invalidated = false;
 	u64 mask, pos;
 	u32 spi, reg;
+	bool opaque;
 
 	/* Direct fp stores are fine. */
 	if ((class == BPF_ST || class == BPF_STX) && insn->dst_reg == BPF_REG_FP)
@@ -842,6 +868,7 @@ static void reset_scevs_at_indirect_writes(struct bpf_verifier_env *env, struct 
 		bpf_log(log, "at %d invalidating SCEVs for ", idx);
 
 	mask = bpf_may_write_mask(env, idx);
+	opaque = bpf_helper_call(insn) && is_probe_read_helper(insn->imm);
 	for (spi = 0; mask; spi++, mask >>= 1) {
 		if (!(mask & 1))
 			continue;
@@ -852,7 +879,7 @@ static void reset_scevs_at_indirect_writes(struct bpf_verifier_env *env, struct 
 			bpf_log(log, invalidated ? "," : "");
 			log_reg(env, reg);
 		}
-		replace_reg(scev, cur_env, reg, UNKNOWN_EXPR_ID);
+		replace_reg(scev, cur_env, reg, opaque ? OPAQUE_EXPR_ID : UNKNOWN_EXPR_ID);
 		invalidated = true;
 	}
 
@@ -1025,13 +1052,11 @@ static bool is_any_imm_reg(struct scev *scev, u32 id)
 	while (expr_next(scev, &id, &order)) {
 		if (order & DEPTH_LIMIT)
 			return false;
-		if (!(order & PRE))
-			continue;
-		if (is_imm(scev, id, &imm))
-			continue;
-		if (is_reg(scev, id, &reg))
-			continue;
-		if (is_any(scev, id, &l, &r))
+		if (!(order & PRE) ||
+		    is_imm(scev, id, &imm) ||
+		    is_reg(scev, id, &reg) ||
+		    is_opaque(scev, id) ||
+		    is_any(scev, id, &l, &r))
 			continue;
 		return false;
 	}
@@ -1280,7 +1305,7 @@ int bpf_init_scev(struct bpf_verifier_env *env)
 	env->scev = scev;
 	/* Order worklist in reverse post-order. */
 	bpf_min_heap_init(&scev->worklist, reverse_ranked_compare, env->cfg.postorder_nums);
-	if (expr0(scev, UNKNOWN) < 0)
+	if (expr0(scev, UNKNOWN) < 0 || expr0(scev, OPAQUE)  < 0)
 		goto nomem;
 	/*
 	 * Remember original program length, in case bpf_free_scev()
