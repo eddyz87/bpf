@@ -2435,3 +2435,183 @@ out:
 	kvfree(state);
 	return err;
 }
+
+enum static_type {
+	ST_SCALAR		= BIT(0),
+	ST_PTR_TO_STACK		= BIT(1),
+	ST_PTR_TO_BTF_ID	= BIT(2),
+	ST_PTR			= BIT(3),
+	ST_UNKNOWN		= U32_MAX,
+};
+
+typedef u32 type_mask_t;
+
+struct frame_type_env {
+	type_mask_t regs[MAX_BPF_REG];
+	type_mask_t stack[MAX_ARG_SPILL_SLOTS];
+	type_mask_t out_args[MAX_STACK_ARG_SLOTS];
+};
+
+static int types_xfer(struct bpf_verifier_env *env, struct subprog_at_info *at_info,
+		      struct frame_type_env *out, int depth, int insn_idx)
+{
+	struct bpf_subprog_info *subprog = bpf_find_containing_subprog(env, insn_idx);
+	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
+	struct arg_track *at_dst, *at_src;
+	struct scev *scev = env->scev;
+	u8 class = BPF_CLASS(insn->code);
+	u8 opcode = BPF_OP(insn->code);
+	u8 size = BPF_SIZE(insn->code);
+	u8 mode = BPF_SRC(insn->code);
+	u32 dst = insn->dst_reg;
+	u32 src = insn->src_reg;
+	bool alu32 = false;
+	u32 rel_insn_idx;
+	s64 imm;
+	u32 i;
+
+	rel_insn_idx = insn_idx - subprog->start;
+	at_dst = &at_info->at_in[rel_insn_idx][insn->dst_reg];
+	at_src = &at_info->at_in[rel_insn_idx][insn->src_reg];
+	switch (class) {
+	case BPF_ALU:
+		/* all 32-bit ops produce scalars */
+		goto mark_dst_scalar;
+	case BPF_ALU64:
+		switch (opcode) {
+		case BPF_MOV:
+			switch (insn->off) {
+			case 0:
+				break;
+			case 8:
+			case 16:
+			case 32:
+				/* sign extension produces scalar */
+				goto mark_dst_scalar;
+			default:
+				goto mark_dst_unknown;
+			}
+			if (mode == BPF_X && insn->imm == 0)
+				out->regs[dst] = out->regs[src];
+			else if (mode == BPF_K && src == 0 && insn->off == 0)
+				goto mark_dst_scalar;
+			return 0;
+		case BPF_ADD:
+		case BPF_SUB:
+			/* dst type is either scalar or a pointer and it does not change */
+			return 0;
+		case BPF_MUL:
+		case BPF_DIV:
+		case BPF_MOD:
+		case BPF_OR:
+		case BPF_XOR:
+		case BPF_AND:
+		case BPF_LSH:
+		case BPF_RSH:
+		case BPF_ARSH:
+		case BPF_NEG:
+		case BPF_END:
+			goto mark_dst_scalar;
+		default:
+			return 0;
+		}
+		break;
+	case BPF_LDX:
+		if (mode == BPF_MEM && size == BPF_DW) {
+			type_mask_t mask = 0;
+
+			// TODO: map, context
+			if (out->regs[src] & ST_PTR_TO_BTF_ID)
+				mask |= ST_PTR_TO_BTF_ID;
+
+			if (src == BPF_REG_FP && insn->off % BPF_REG_SIZE == 0) {
+				mask |= out->stack[-insn->off / BPF_REG_SIZE - 1]; // TODO: frame
+			} else if (at_src->frame == ARG_IMPRECISE) {
+				for (u32 i = 0; i < MAX_CALL_FRAMES; i++)
+					if (at_src->mask & BIT(i))
+						;
+			} else if (at_src->frame != ARG_NONE) {
+				for (u32 i = 0; i < at_src->off_cnt; i++)
+					// TODO: arg_add(insn->off)
+					mask |= out->stack[-at_src->off[i] / BPF_REG_SIZE - 1]; // TODO: frame
+			}
+			out->regs[dst] = mask;
+		} else if (mode == BPF_MEM || mode == BPF_MEMSX) {
+			/* non 64-bit loads, sign extended loads, odd offsets */
+			goto mark_dst_scalar;
+		} else {
+			goto mark_dst_unknown;
+		}
+	case BPF_STX:
+		switch (mode) {
+		case BPF_MEM:
+			/* no changes */
+			break;
+		case BPF_ATOMIC:
+			switch (insn->imm) {
+			case BPF_CMPXCHG:
+				return replace_reg(scev, e, BPF_REG_0, UNKNOWN_EXPR_ID);
+			case BPF_LOAD_ACQ:
+				goto mark_dst_unknown;
+			case BPF_STORE_REL:
+				/* no changes */
+				break;
+			default:
+				if (insn->imm & BPF_FETCH)
+					return replace_reg(scev, e, src, UNKNOWN_EXPR_ID); // TODO: double-check
+				break;
+			}
+			break;
+		}
+		break;
+	case BPF_ST:
+		switch (mode) {
+		case BPF_MEM:
+			// if DST can be stack pointer
+			// TODO: for a single possible DST:
+			//   if out->regs[dst] == stack pointer => mark it as a scalar
+			//   else mark it as possibly scalar
+			// TODO: for multiple possible DSTs, mark them as possibly scalar
+			break;
+		}
+		break;
+	case BPF_JMP:
+	case BPF_JMP32:
+		if (opcode == BPF_CALL) {
+			out->regs[BPF_REG_0] = ST_UNKNOWN; // TODO: smth more precise here
+			goto forget_call_regs;
+		}
+		/* for non-CALL there are no changes in register states */
+		break;
+	case BPF_LD:
+		switch (mode) {
+		case BPF_IMM:
+			if (BPF_SIZE(insn->code) == BPF_DW)
+				goto mark_dst_scalar;
+			goto mark_dst_unknown;
+		case BPF_LD | BPF_ABS:
+		case BPF_LD | BPF_IND:
+			out->regs[BPF_REG_0] = ST_SCALAR;
+			goto forget_call_regs;
+		default:
+			goto mark_dst_unknown;
+		}
+		break;
+	default:
+	}
+	return 0;
+
+mark_dst_scalar:
+	out->regs[dst] = ST_SCALAR;
+	return 0;
+
+forget_call_regs:
+	for (i = 1; i < 5; ++i)
+		out->regs[BPF_REG_1 + i] = 0;
+	return 0;
+
+mark_dst_unknown:
+	out->regs[dst] = ST_UNKNOWN;
+	return 0;
+
+}
