@@ -191,6 +191,8 @@ struct bpf_verifier_stack_elem {
 	struct bpf_verifier_stack_elem *next;
 	/* length of verifier log at the time this state was pushed on stack */
 	u32 log_pos;
+	u32 insns_processed:31;
+	u32 checkpoint:1;
 };
 
 #define BPF_COMPLEXITY_LIMIT_JMP_SEQ	8192
@@ -199,6 +201,8 @@ struct bpf_verifier_stack_elem {
 #define BPF_GLOBAL_PERCPU_MA_MAX_SIZE  512
 
 #define BPF_PRIV_STACK_MIN_SIZE		64
+
+#define ECHECKPOINT			4094
 
 static int acquire_reference(struct bpf_verifier_env *env, int insn_idx, int parent_id);
 static int release_reference_nomark(struct bpf_verifier_state *state, int id);
@@ -1638,6 +1642,7 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 		return err;
 	dst_state->speculative = src->speculative;
 	dst_state->in_sleepable = src->in_sleepable;
+	dst_state->invalid = src->invalid;
 	dst_state->curframe = src->curframe;
 	dst_state->branches = src->branches;
 	dst_state->parent = src->parent;
@@ -1702,33 +1707,89 @@ void bpf_free_backedges(struct bpf_scc_visit *visit)
 	visit->backedges = NULL;
 }
 
-static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
-		     int *insn_idx, bool pop_log)
+static void free_stack_head(struct bpf_verifier_env *env)
 {
-	struct bpf_verifier_state *cur = env->cur_state;
-	struct bpf_verifier_stack_elem *elem, *head = env->head;
-	int err;
+	struct bpf_verifier_stack_elem *elem, *head;
 
-	if (env->head == NULL)
-		return -ENOENT;
+	if (env->stack_size == 0)
+		return;
 
-	if (cur) {
-		err = bpf_copy_verifier_state(cur, &head->st);
-		if (err)
-			return err;
-	}
-	if (pop_log)
-		bpf_vlog_reset(&env->log, head->log_pos);
-	if (insn_idx)
-		*insn_idx = head->insn_idx;
-	if (prev_insn_idx)
-		*prev_insn_idx = head->prev_insn_idx;
+	head = env->head;
 	elem = head->next;
 	bpf_free_verifier_state(&head->st, false);
 	kfree(head);
 	env->head = elem;
 	env->stack_size--;
+}
+
+static int pop_stack_head(struct bpf_verifier_env *env, int *prev_insn_idx, int *insn_idx)
+{
+	struct bpf_verifier_stack_elem *head = env->head;
+	int err;
+
+	if (head == NULL)
+		return -ENOENT;
+
+	err = bpf_copy_verifier_state(env->cur_state, &head->st);
+	if (err)
+		return err;
+
+	if (!(env->log.level & BPF_LOG_LEVEL2))
+		bpf_vlog_reset(&env->log, head->log_pos);
+	*insn_idx = head->insn_idx;
+	*prev_insn_idx = head->prev_insn_idx;
+	free_stack_head(env);
 	return 0;
+}
+
+static int discard_stack_head(struct bpf_verifier_env *env)
+{
+	int err;
+
+	err = bpf_update_branch_counts(env, &env->head->st);
+	if (err)
+		return err;
+	free_stack_head(env);
+	return 0;
+}
+
+static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx, int *insn_idx)
+{
+	int err;
+
+	while (env->head && env->head->checkpoint) {
+		err = discard_stack_head(env);
+		if (err)
+			return err;
+	}
+
+	return pop_stack_head(env, prev_insn_idx, insn_idx);
+}
+
+static int pop_checkpoint(struct bpf_verifier_env *env, int *prev_insn_idx, int *insn_idx)
+{
+	int err;
+
+	while (env->head && !env->head->checkpoint) {
+		err = discard_stack_head(env);
+		if (err)
+			return err;
+	}
+
+	if (env->head)
+		env->insn_processed = env->head->insns_processed;
+
+	return pop_stack_head(env, prev_insn_idx, insn_idx);
+}
+
+static struct bpf_verifier_state *find_checkpoint(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_stack_elem *e;
+
+	for (e = env->head; e; e = e->next)
+		if (e->checkpoint)
+			return &e->st;
+	return NULL;
 }
 
 static bool error_recoverable_with_nospec(int err)
@@ -1743,9 +1804,9 @@ static bool error_recoverable_with_nospec(int err)
 	return err == -EPERM || err == -EACCES || err == -EINVAL;
 }
 
-static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
-					     int insn_idx, int prev_insn_idx,
-					     bool speculative)
+static struct bpf_verifier_stack_elem *__push_stack(struct bpf_verifier_env *env,
+						    int insn_idx, int prev_insn_idx,
+						    bool speculative)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 	struct bpf_verifier_stack_elem *elem;
@@ -1782,7 +1843,18 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 		 * which might have large 'branches' count.
 		 */
 	}
-	return &elem->st;
+	return elem;
+}
+
+static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
+					     int insn_idx, int prev_insn_idx,
+					     bool speculative)
+{
+	struct bpf_verifier_stack_elem *elem;
+
+	elem = __push_stack(env, insn_idx, prev_insn_idx, speculative);
+	return elem ? &elem->st : NULL;
+
 }
 
 static const char *reg_arg_name(struct bpf_verifier_env *env, argno_t argno)
@@ -17523,8 +17595,7 @@ static int maybe_clamp_scev_regs(struct bpf_verifier_env *env)
 
 static int do_check(struct bpf_verifier_env *env)
 {
-	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
-	struct bpf_verifier_state *state = env->cur_state;
+	struct bpf_verifier_state *checkpoint, *state = env->cur_state;
 	struct bpf_insn *insns = env->prog->insnsi;
 	struct bpf_loop_iters iters;
 	int insn_cnt = env->prog->len;
@@ -17693,6 +17764,8 @@ static int do_check(struct bpf_verifier_env *env)
 			 */
 			insn_aux->alu_state = 0;
 			goto process_bpf_exit;
+		} else if (err == -ECHECKPOINT) {
+			goto restore_checkpoint;
 		} else if (err < 0) {
 			return err;
 		} else if (err == PROCESS_BPF_EXIT) {
@@ -17727,8 +17800,7 @@ process_bpf_exit:
 			err = bpf_update_branch_counts(env, env->cur_state);
 			if (err)
 				return err;
-			err = pop_stack(env, &prev_insn_idx, &env->insn_idx,
-					pop_log);
+			err = pop_stack(env, &prev_insn_idx, &env->insn_idx);
 			if (err < 0) {
 				if (err != -ENOENT)
 					return err;
@@ -17737,6 +17809,36 @@ process_bpf_exit:
 				do_print_state = true;
 				continue;
 			}
+restore_checkpoint:
+			mark_verifier_state_scratched(env);
+			checkpoint = find_checkpoint(env);
+			for (state = env->cur_state; state != NULL; state = state->parent) {
+				if (state->dfs_depth < checkpoint->dfs_depth)
+					break;
+				state->invalid = true;
+			}
+			/*
+			 * Every state with dfs_depth >= checkpoint->dfs_depth was
+			 * produced after the checkpoint and is being discarded.
+			 * Drop backedges registered by that exploration before
+			 * unwinding branch counts, so that maybe_exit_scc() fired
+			 * during unwinding does not propagate precision over the
+			 * discarded states.
+			 */
+			bpf_evict_scc_backedges(env, checkpoint->dfs_depth);
+			err = bpf_update_branch_counts(env, env->cur_state);
+			if (err)
+				return err;
+			err = pop_checkpoint(env, &prev_insn_idx, &env->insn_idx);
+			if (err == -ENOENT) {
+				verifier_bug(env, "Restore from a checkpoint is requested at %d, but no checkpoint can be found\n",
+					     env->insn_idx);
+				return -EFAULT;
+			}
+			if (err < 0)
+				return err;
+			do_print_state = true;
+			continue;
 		}
 	}
 
@@ -18536,7 +18638,8 @@ static void free_states(struct bpf_verifier_env *env)
 
 	bpf_free_verifier_state(env->cur_state, true);
 	env->cur_state = NULL;
-	while (!pop_stack(env, NULL, NULL, false));
+	while (env->head)
+		free_stack_head(env);
 
 	list_for_each_safe(pos, tmp, &env->free_list) {
 		sl = container_of(pos, struct bpf_verifier_state_list, node);

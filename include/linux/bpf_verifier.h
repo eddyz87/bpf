@@ -529,6 +529,7 @@ struct bpf_verifier_state {
 
 	bool speculative;
 	bool in_sleepable;
+	bool invalid;
 
 	/* first and last insn idx of this verifier state */
 	u32 first_insn_idx;
@@ -1243,6 +1244,7 @@ int mark_chain_precision(struct bpf_verifier_env *env, int regno);
 
 int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx, bool entering_loop);
 int bpf_update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
+void bpf_evict_scc_backedges(struct bpf_verifier_env *env, u32 min_dfs_depth);
 
 void bpf_clear_jmp_history(struct bpf_verifier_state *state);
 int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,

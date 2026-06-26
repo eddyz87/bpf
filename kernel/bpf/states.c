@@ -252,6 +252,39 @@ static int add_scc_backedge(struct bpf_verifier_env *env,
 	return 0;
 }
 
+/*
+ * Drop accumulated backedges produced after a checkpoint was created, i.e.
+ * backedges whose taking state has dfs_depth >= @min_dfs_depth.
+ */
+void bpf_evict_scc_backedges(struct bpf_verifier_env *env, u32 min_dfs_depth)
+{
+	struct bpf_scc_backedge *backedge, **pprev;
+	struct bpf_scc_visit *visit;
+	struct bpf_scc_info *info;
+	int i, j;
+
+	for (i = 0; i < env->scc_cnt; ++i) {
+		info = env->scc_info[i];
+		if (!info)
+			continue;
+		for (j = 0; j < info->num_visits; j++) {
+			visit = &info->visits[j];
+			pprev = &visit->backedges;
+			while ((backedge = *pprev)) {
+				if (backedge->state.dfs_depth < min_dfs_depth) {
+					pprev = &backedge->next;
+					continue;
+				}
+				*pprev = backedge->next;
+				bpf_free_verifier_state(&backedge->state, false);
+				kfree(backedge);
+				visit->num_backedges--;
+				env->num_backedges--;
+			}
+		}
+	}
+}
+
 /* bpf_reg_state->live marks for registers in a state @st are incomplete,
  * if state @st is in some SCC and not all execution paths starting at this
  * SCC are fully explored.
@@ -1374,6 +1407,10 @@ int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx, bool enteri
 	head = bpf_explored_state(env, insn_idx);
 	list_for_each_safe(pos, tmp, head) {
 		sl = container_of(pos, struct bpf_verifier_state_list, node);
+
+		if (sl->state.invalid)
+			goto evict;
+
 		states_cnt++;
 		if (sl->state.insn_idx != insn_idx)
 			continue;
@@ -1672,6 +1709,7 @@ miss:
 		n = (bpf_is_force_checkpoint(env, insn_idx) || loop_checkpoint) &&
 		    sl->state.branches > 0 ? 64 : 3;
 		if (sl->miss_cnt > sl->hit_cnt * n + n) {
+evict:
 			/* the state is unlikely to be useful. Remove it to
 			 * speed up verification
 			 */
