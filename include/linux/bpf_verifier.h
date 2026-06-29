@@ -181,6 +181,13 @@ struct bpf_reg_state {
 	 * patching which only happens after main verification finished.
 	 */
 	s32 subreg_def;
+	/*
+	 * The value described by this register is some point lying on
+	 * a line described by a linear equation base + step * k.
+	 * Invariant: base < step.
+	 */
+	u16 base;
+	u16 step;
 	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
 	bool precise;
 };
