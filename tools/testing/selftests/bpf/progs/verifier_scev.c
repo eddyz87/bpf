@@ -2,8 +2,10 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/bpf.h>
+#include <stdbool.h>
 #include <bpf/bpf_helpers.h>
 #include "bpf_misc.h"
+#include "bpf_kfuncs.h"
 
 struct map_val {
 	char foo[1024];
@@ -696,6 +698,146 @@ __naked void widen_nonconst_base(void)
 "	:
 	: __imm(bpf_get_prandom_u32)
 	: __clobber_all);
+}
+
+/*
+ * A loop induction variable used to compute the base address of a store to the
+ * stack must not be widened: the spill offset would become varying, which the
+ * verifier does not track.
+ */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 2, can't widen r2, expr is (+ r2 8), addresses a stack spill")
+__naked void no_widen_stack_spill(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	r2 = 0;						\
+1:	r3 = r10;					\
+	r3 += -64;					\
+	r3 += r2;					\
+	*(u64 *)(r3 + 0) = r0;				\
+	r0 += 1;					\
+	r2 += 8;					\
+	if r0 < 4 goto 1b;				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/*
+ * Same hazard across a loop nest: the outer induction variable r2 addresses a
+ * stack store performed inside the inner loop. The dependency is pulled up from
+ * the inner loop, so the outer loop must not widen r2.
+ */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 2, can't widen r2, expr is (+ r2 8), addresses a stack spill")
+__msg("loop header at 3, widening r1 to 0..1 step 1")
+__naked void no_widen_stack_spill_nested(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	r2 = 0;						\
+1:	r1 = 0;						\
+2:	r3 = r10;					\
+	r3 += -64;					\
+	r3 += r2;					\
+	*(u64 *)(r3 + 0) = r1;				\
+	r1 += 1;					\
+	if r1 < 2 goto 2b;				\
+	r0 += 1;					\
+	r2 += 8;					\
+	if r0 < 4 goto 1b;				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/*
+ * Complement of no_widen_stack_spill: a sub-register (1-byte) store to the stack
+ * lands as STACK_MISC and carries no tracked value, so the induction variable
+ * addressing it (r2) is still widened.
+ */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("widening r2 to 0..24 step 8")
+__naked void widen_byte_stack_store(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	r2 = 0;						\
+1:	r3 = r10;					\
+	r3 += -64;					\
+	r3 += r2;					\
+	*(u8 *)(r3 + 0) = r0;				\
+	r0 += 1;					\
+	r2 += 8;					\
+	if r0 < 4 goto 1b;				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/*
+ * A fill (BPF_LDX) at a varying stack offset loses precision just like a spill,
+ * so the induction variable computing the load base (r2) must not be widened.
+ * The slots are initialized up front so the fill itself is a valid read.
+ */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 6, can't widen r2, expr is (+ r2 8), addresses a stack spill")
+__naked void no_widen_stack_fill(void)
+{
+	asm volatile ("					\
+	r0 = 0;						\
+	*(u64 *)(r10 - 64) = r0;			\
+	*(u64 *)(r10 - 56) = r0;			\
+	*(u64 *)(r10 - 48) = r0;			\
+	*(u64 *)(r10 - 40) = r0;			\
+	r2 = 0;						\
+1:	r3 = r10;					\
+	r3 += -64;					\
+	r3 += r2;					\
+	r4 = *(u64 *)(r3 + 0);				\
+	r0 += 1;					\
+	r2 += 8;					\
+	if r0 < 4 goto 1b;				\
+	r0 = 0;						\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/*
+ * A dynptr/iter/irq/res_spin_lock call initializes a stack object through a
+ * pointer argument, which acts like a spill base: the induction variable
+ * computing that argument's varying stack offset must not be widened, otherwise
+ * the slot can't be resolved. Here each iteration constructs an xdp dynptr at
+ * &dptrs[i].
+ */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("can't widen {{.*}}, addresses a stack spill")
+int no_widen_dynptr_kfunc_arg(struct xdp_md *ctx)
+{
+	struct bpf_dynptr dptrs[4];
+	int i;
+
+#pragma clang loop unroll(disable)
+	for (i = 0; i < 4; i++)
+		bpf_dynptr_from_xdp(ctx, 0, &dptrs[i]);
+
+	return 0;
 }
 
 char _license[] SEC("license") = "GPL";
