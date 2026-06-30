@@ -693,6 +693,9 @@ struct bpf_loop_exit {
 	int to; /* instruction outside the loop */
 };
 
+/* SCEV/widening register space: r0..r10 plus up to 64 tracked stack slots. */
+#define BPF_SCEV_REGS_NUM (MAX_BPF_REG + 64)
+
 struct bpf_loop {
 	struct bpf_backedge backedges[MAX_BACKEDGES];
 	/* edges exiting from this loop, includes edges from nested loops */
@@ -702,6 +705,11 @@ struct bpf_loop {
 	bool irreducible;
 	bool backedges_overflow;
 	bool exits_overflow;
+	/*
+	 * Loop-entry registers that are used to compute base addresses
+	 * of the BPF_ST/STX writing to stack in this and nested loops.
+	 */
+	unsigned long store_base_regs[BITS_TO_LONGS(BPF_SCEV_REGS_NUM)];
 };
 
 struct bpf_insn_aux_data {
@@ -743,6 +751,7 @@ struct bpf_insn_aux_data {
 	 * that this instruction may write to.
 	 */
 	u64 may_write_mask;
+	u16 stack_ptrs; /* bitmask of regs that may hold a frame pointer here (arg_track) */
 	int ctx_field_size; /* the ctx field size for load insn, maybe 0 */
 	u32 seen; /* this insn was processed by the verifier at env->pass_cnt */
 	bool nospec; /* do not execute this instruction speculatively */
@@ -1631,6 +1640,7 @@ int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);
 int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
 u64 bpf_may_write_mask(struct bpf_verifier_env *env, u32 insn_idx);
+bool bpf_needs_fixed_stack_off(struct bpf_verifier_env *env, int insn_idx);
 bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 spi);
 int bpf_compute_live_registers(struct bpf_verifier_env *env);
 

@@ -8,7 +8,7 @@
 #include <linux/tnum.h>
 #include <linux/overflow.h>
 
-#define REGS_NUM (MAX_BPF_REG + 64)
+#define REGS_NUM BPF_SCEV_REGS_NUM
 #define UNKNOWN_EXPR_ID 0
 #define OPAQUE_EXPR_ID  1
 
@@ -933,11 +933,72 @@ static void reset_scevs_at_indirect_writes(struct bpf_verifier_env *env, struct 
 	}
 }
 
+/* OR the loop-entry registers referenced by expr 'id' into 'mask'. */
+static void or_expr_regs(struct bpf_verifier_env *env, u32 id, unsigned long *mask)
+{
+	struct scev *scev = env->scev;
+	u32 order;
+
+	scev->stack_sz = 0;
+	expr_stack_push(scev, id);
+	while (expr_next(scev, &id, &order)) {
+		/* Ignore DEPTH_LIMIT and do not resort to marking all as bases for now. */
+		if ((order & PRE) && scev->exprs[id].op == REG)
+			__set_bit(scev->exprs[id].params[0], mask);
+	}
+}
+
+/* Mask of argument registers (R1..R5) a call at 'idx' passes by register. */
+static u16 call_params_mask(struct bpf_verifier_env *env, int idx)
+{
+	struct bpf_insn *insn = &env->prog->insnsi[idx];
+	struct bpf_call_summary cs;
+	int n = bpf_get_call_summary(env, insn, &cs) ? cs.num_params : MAX_BPF_FUNC_REG_ARGS;
+
+	return n ? GENMASK(BPF_REG_1 + n - 1, BPF_REG_1) : 0;
+}
+
+/*
+ * For instructions like:
+ * - *(u64 *)(rBase + off) = rX
+ * - rX = *(u64 *)(rBase + off)
+ * - calls that construct objects on stack (e.g. dynptr_from_mem(rBase, ...))
+ * When 'rBase' can be a stack pointer and is derived from some registers Rs
+ * defined at loop entry, record Rs into 'mask'.
+ */
+static void collect_store_base_regs(struct bpf_verifier_env *env,
+				    struct env *cur_env, int idx, unsigned long *mask)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_insn *insn = &env->prog->insnsi[idx];
+	u8 class = BPF_CLASS(insn->code);
+	u8 size = BPF_SIZE(insn->code);
+	u16 base_regs = 0;
+	u32 r;
+
+	if (size == BPF_W || size == BPF_DW) {
+		if ((class == BPF_STX || class == BPF_ST) && insn->dst_reg != BPF_REG_FP)
+			base_regs |= BIT(insn->dst_reg);
+		else if (class == BPF_LDX && insn->src_reg != BPF_REG_FP)
+			base_regs |= BIT(insn->src_reg);
+	}
+
+	if (class == BPF_JMP && BPF_OP(insn->code) == BPF_CALL &&
+	    bpf_needs_fixed_stack_off(env, idx))
+		base_regs |= call_params_mask(env, idx);
+
+	base_regs &= aux[idx].stack_ptrs;
+	for (r = 0; r < MAX_BPF_REG; r++)
+		if (base_regs & BIT(r))
+			or_expr_regs(env, cur_env->reg2expr[r], mask);
+}
+
 static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 {
 	struct env *cur_env, *succ_env, *before_env, *to_env, *nested_header_env;
 	struct bpf_min_heap *worklist = &env->scev->worklist;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_loop *cur_loop = aux[cur_header].loop;
 	struct bpf_verifier_log *log = &env->log;
 	struct scev *scev = env->scev;
 	struct bpf_loop_exit *exit;
@@ -945,6 +1006,7 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 	struct bpf_iarray *succ;
 	int s, e, err, idx, succ_idx;
 	bool first;
+	u32 r;
 
 	cur_env = kzalloc(sizeof(*cur_env), GFP_KERNEL_ACCOUNT);
 	if (!cur_env) {
@@ -981,6 +1043,7 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 		/* Iterate instructions within a single basic block starting at 'idx' mutating 'cur_env'. */
 		memcpy(cur_env, scev->envs[idx], sizeof(*cur_env));
 		for (;;) {
+			collect_store_base_regs(env, cur_env, idx, cur_loop->store_base_regs);
 			err = transfer(env, cur_env, idx);
 			if (err)
 				goto out;
@@ -1047,6 +1110,9 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 					if (err)
 						goto out;
 				}
+				/* Pull the nested loop's stack-store base dependencies up. */
+				for_each_set_bit(r, nested_loop->store_base_regs, BPF_SCEV_REGS_NUM)
+					or_expr_regs(env, cur_env->reg2expr[r], cur_loop->store_base_regs);
 				continue;
 			}
 		}
@@ -1796,6 +1862,7 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	header_env = scev->envs[insn_idx];
 	for (r = 0; r < REGS_NUM; r++) {
 		u32 ra, r_scev, r_expr;
+		bool spill_base = false;
 
 		//bpf_log(log, "bpf_widen_scev_regs: r=%d\n", r);
 		if (!scev_reg_alive(env, st, r))
@@ -1807,10 +1874,16 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		/* If SCEV for r is (linear <reg> <slope>) */
 		if (is_simple_linear(scev, r_scev, &base_reg, &slope_imm) && // TODO: match loop invariants here
 		    is_widenable_reg_type(scev_regno_to_reg(cur_func, r))) {
-			/* Can't widen if the iteration range overflows */
-			if (base_reg == r &&
-			    !linear_bounds(scev_regno_to_reg(cur_func, r), iters, slope_imm, &bounds))
-				goto cant_widen;
+			if (base_reg == r) {
+				/* Can't widen if the iteration range overflows */
+				if (!linear_bounds(scev_regno_to_reg(cur_func, r), iters, slope_imm, &bounds))
+					goto cant_widen;
+				/* Spills at varying offsets loose precision */
+				if (test_bit(r, loop->store_base_regs)) {
+					spill_base = true;
+					goto cant_widen;
+				}
+			}
 			//bpf_log(log, "bpf_widen_scev_regs: r=%d linear\n", r);
 			continue;
 		}
@@ -1834,6 +1907,8 @@ cant_widen:
 			log_reg(env, r);
 			bpf_log(log, ", expr is ");
 			log_expr(env, r_expr);
+			if (spill_base)
+				bpf_log(log, ", addresses a stack spill");
 			bpf_log(log, "\n");
 		}
 		return 0;
