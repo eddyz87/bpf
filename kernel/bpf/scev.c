@@ -1146,7 +1146,7 @@ static int __transform_expr(struct scev *scev, u32 lvl, u32 root, void *priv,
 		return UNKNOWN_EXPR_ID;
 
         expr = scev->exprs[root]; /* snapshot the expr before potential realloc */
-	switch (op_params_num(expr->op)) {
+	switch (op_params_num(expr.op)) {
 	case 0:
 		id = root;
 		break;
