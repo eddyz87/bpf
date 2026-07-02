@@ -515,13 +515,20 @@ static bool is_spill_size(u8 code)
 	return BPF_SIZE(code) == BPF_DW || BPF_SIZE(code) == BPF_W;
 }
 
+static bool is_spill_off(int off)
+{
+	return off % BPF_REG_SIZE == 0 &&
+	       off <= -BPF_REG_SIZE &&
+	       off >= -MAX_BPF_STACK;
+}
+
 static bool is_reg_fill(struct bpf_insn *insn)
 {
 	return BPF_CLASS(insn->code) == BPF_LDX &&
 	       BPF_MODE(insn->code) == BPF_MEM &&
 	       is_spill_size(insn->code) &&
 	       insn->src_reg == BPF_REG_FP &&
-	       (insn->off % BPF_REG_SIZE == 0);
+	       is_spill_off(insn->off);
 }
 
 static bool is_stack_spill(struct bpf_insn *insn)
@@ -530,10 +537,9 @@ static bool is_stack_spill(struct bpf_insn *insn)
 	       BPF_MODE(insn->code) == BPF_MEM &&
 	       is_spill_size(insn->code) &&
 	       insn->dst_reg == BPF_REG_FP &&
-	       (insn->off % BPF_REG_SIZE == 0);
+	       is_spill_off(insn->off);
 }
 
-__attribute__((optimize("O1")))
 static int transfer(struct bpf_verifier_env *env, struct env *e, int idx)
 {
 	const bool little_endian = htons(0x3412) == 0x1234;
@@ -631,11 +637,11 @@ static int transfer(struct bpf_verifier_env *env, struct env *e, int idx)
 				goto mark_dst_unknown;
 			}
 
-			if (class == BPF_ALU && src == 0 && insn->off == 0 && little_endian)
+			if (class == BPF_ALU && mode == BPF_TO_LE && insn->off == 0 && little_endian)
 				op = 0; /* little-endian to little-endian is noop */
-			else if (class == BPF_ALU && src == 1 && insn->off == 0 && !little_endian)
+			else if (class == BPF_ALU && mode == BPF_TO_BE && insn->off == 0 && !little_endian)
 				op = 0; /* big-endian to big-endian is noop */
-			else if (class == BPF_ALU64 && src == 0 && insn->off == 0)
+			else if (class == BPF_ALU64 && mode == 0 && insn->off == 0)
 				/* always swap */;
 			else
 				goto mark_dst_unknown;
@@ -779,7 +785,6 @@ next:;
 	return id;
 }
 
-__attribute__((optimize("O1")))
 static int join(struct scev *scev, struct env *acc, struct env *cur)
 {
 	int i, id;
@@ -802,7 +807,6 @@ static int join(struct scev *scev, struct env *acc, struct env *cur)
 }
 
 /* Mark any register modified in 'header_env' as unknown in 'acc'. */
-__attribute__((optimize("O1")))
 static void forget_non_invariants(struct scev *scev, struct env *acc, struct env *header_env)
 {
 	struct expr *header_expr;
@@ -951,7 +955,6 @@ static void collect_store_base_regs(struct bpf_verifier_env *env,
 			or_expr_regs(env, cur_env->reg2expr[r], mask);
 }
 
-__attribute__((optimize("O1")))
 static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 {
 	struct env *cur_env, *succ_env, *before_env, *to_env, *nested_header_env;
@@ -1136,25 +1139,25 @@ static bool is_any_imm_reg(struct scev *scev, u32 id)
 static int __transform_expr(struct scev *scev, u32 lvl, u32 root, void *priv,
                             int (*fn)(struct scev *scev, u32 id, void *priv))
 {
-	struct expr *expr;
+	struct expr expr;
 	int p0, p1, id;
 
 	if (lvl >= EXPR_STACK_DEPTH)
 		return UNKNOWN_EXPR_ID;
 
-        expr = &scev->exprs[root];
+        expr = scev->exprs[root]; /* snapshot the expr before potential realloc */
 	switch (op_params_num(expr->op)) {
 	case 0:
 		id = root;
 		break;
 	case 1:
-		p0 = __transform_expr(scev, lvl + 1, expr->params[0], priv, fn);
-		id = expr1(scev, expr->op, p0);
+		p0 = __transform_expr(scev, lvl + 1, expr.params[0], priv, fn);
+		id = expr1(scev, expr.op, p0);
 		break;
 	case 2:
-		p0 = __transform_expr(scev, lvl + 1, expr->params[0], priv, fn);
-		p1 = __transform_expr(scev, lvl + 1, expr->params[1], priv, fn);
-		id = expr2(scev, expr->op, p0, p1);
+		p0 = __transform_expr(scev, lvl + 1, expr.params[0], priv, fn);
+		p1 = __transform_expr(scev, lvl + 1, expr.params[1], priv, fn);
+		id = expr2(scev, expr.op, p0, p1);
 		break;
 	}
 	return id < 0 ? id : fn(scev, id, priv);
@@ -1354,6 +1357,7 @@ void bpf_free_scev(struct bpf_verifier_env *env)
 		kfree(scev->envs[i]);
 	for (i = 0; i < ARRAY_SIZE(scev->exprs_ht); i++)
 		kfree(scev->exprs_ht[i]);
+	bpf_min_heap_free(&scev->worklist);
 	kvfree(scev->envs);
 	kvfree(scev->exprs);
 	kvfree(scev->discovered);
@@ -1373,16 +1377,16 @@ int bpf_init_scev(struct bpf_verifier_env *env)
 	bpf_min_heap_init(&scev->worklist, reverse_ranked_compare, env->cfg.postorder_nums);
 	if (expr0(scev, UNKNOWN) < 0 || expr0(scev, OPAQUE)  < 0)
 		goto nomem;
+	scev->envs = kvcalloc(env->prog->len, sizeof(*scev->envs), GFP_KERNEL_ACCOUNT);
+	scev->discovered = kvcalloc(env->prog->len, sizeof(*scev->discovered), GFP_KERNEL_ACCOUNT);
+	if (!scev->envs || !scev->discovered)
+		goto nomem;
 	/*
 	 * Remember original program length, in case bpf_free_scev()
          * is called after bpf program rewrites that increase program
          * length.
 	 */
 	scev->envs_cnt = env->prog->len;
-	scev->envs = kvcalloc(env->prog->len, sizeof(*scev->envs), GFP_KERNEL_ACCOUNT);
-	scev->discovered = kvcalloc(env->prog->len, sizeof(*scev->discovered), GFP_KERNEL_ACCOUNT);
-	if (!scev->envs || !scev->discovered)
-		goto nomem;
 	return 0;
 nomem:
 	bpf_free_scev(env);
