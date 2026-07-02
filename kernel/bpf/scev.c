@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2025 Meta Platforms, Inc. and affiliates. */
 
-#include "linux/cnum.h"
 #include <linux/bpf_verifier.h>
 #include <linux/jhash.h>
 #include <linux/bug.h>
@@ -12,50 +11,34 @@
 #define UNKNOWN_EXPR_ID 0
 #define OPAQUE_EXPR_ID  1
 
-// TODO: An alternative is to use bpf_insn as a whole, hijack the illegal opcode
-//         { .code = (BPF_LD | BPF_W | BPF_IMM), .imm = <custom-opcode> }
-//       for custom operations.
 /*
  * BPF instructions use 'code', 'src_reg', 'off' and 'imm' fields for instruction encoding.
  * For scalar evolution purpose we want to reuse most of the opcode definitions,
  * but also add a few custom operations (REG and IMM).
- * To simplify matching instructions use a 2-byte representation:
- * - 1st byte for standard opcodes (bpf_insn->code field);
- * - 2nd byte for custom opcodes and opcodes that require additional 'bpf_insn' fields for encoding.
- * For now, only represent BPF_ALU{,64} class instructions and represent all operations
- * as having BPF_K source.
+ * Use the enum below to uniformly represent all opertions relevalnt for SCEV.
  */
 enum expr_op {
 	/* leave range 0..255 for standard bpf opcodes */
-	UNKNOWN = 1 << 8, /* start custom opcodes from the second byte */
-	REG     = 2 << 8,
-	IMM     = 3 << 8,
-	SDIV    = 4 << 8,
-	SMOD    = 5 << 8,
-	SEXT8   = 6 << 8,
-	SEXT16  = 7 << 8,
-	SEXT32  = 8 << 8,
-	ZEXT8   = 9 << 8,
-	ZEXT16  = 10 << 8,
-	ZEXT32  = 11 << 8,
-	BSWAP16 = 12 << 8,
-	BSWAP32 = 13 << 8,
-	BSWAP64 = 14 << 8,
+	UNKNOWN = 256, /* start custom opcodes from the second byte */
+	REG,
+	IMM,
+	SDIV, SMOD,
+	SEXT8, SEXT16, SEXT32,
+	ZEXT8, ZEXT16, ZEXT32,
+	BSWAP16, BSWAP32, BSWAP64,
 	/* during the loop body execution the value can be either of param[0] or param[1] */
-	ANY     = 15 << 8,
+	ANY,
 	/* some value that verifier is not going to track precisely */
-	OPAQUE  = 16 << 8,
-	/* '*(u8/16/32 *)(r10 + ...) = ...' writes define slot contents only partially */
-	SPILL8  = 17 << 8,
-	SPILL16 = 18 << 8,
-	SPILL32 = 19 << 8,
+	OPAQUE,
+	/* '*(u8/16/32 *)(r10 + X) = Y' writes define slot contents only partially */
+	SPILL8, SPILL16, SPILL32,
 	/*
 	 * SCEV expression corresponding to linear equation 'param[0] + param[1] * k',
 	 * where k is a loop iteration number. Loop here refers to innermost loop
 	 * containing instruction associated with this expression, as returned by
 	 * bpf_loop_at_index().
 	 */
-	LINEAR_SCEV = 255 << 8,
+	LINEAR_SCEV,
 };
 
 struct expr {
