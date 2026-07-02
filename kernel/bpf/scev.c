@@ -35,21 +35,27 @@ enum expr_op {
 	SEXT8   = 6 << 8,
 	SEXT16  = 7 << 8,
 	SEXT32  = 8 << 8,
-	ZEXT32  = 9 << 8,
-	BSWAP16 = 10 << 8,
-	BSWAP32 = 11 << 8,
-	BSWAP64 = 12 << 8,
+	ZEXT8   = 9 << 8,
+	ZEXT16  = 10 << 8,
+	ZEXT32  = 11 << 8,
+	BSWAP16 = 12 << 8,
+	BSWAP32 = 13 << 8,
+	BSWAP64 = 14 << 8,
 	/* during the loop body execution the value can be either of param[0] or param[1] */
-	ANY     = 13 << 8,
+	ANY     = 15 << 8,
 	/* some value that verifier is not going to track precisely */
-	OPAQUE  = 14 << 8,
+	OPAQUE  = 16 << 8,
+	/* '*(u8/16/32 *)(r10 + ...) = ...' writes define slot contents only partially */
+	SPILL8  = 17 << 8,
+	SPILL16 = 18 << 8,
+	SPILL32 = 19 << 8,
 	/*
 	 * SCEV expression corresponding to linear equation 'param[0] + param[1] * k',
 	 * where k is a loop iteration number. Loop here refers to innermost loop
 	 * containing instruction associated with this expression, as returned by
 	 * bpf_loop_at_index().
 	 */
-	LINEAR_SCEV = 15 << 8,
+	LINEAR_SCEV = 255 << 8,
 };
 
 struct expr {
@@ -279,10 +285,15 @@ static const char *op_str(u32 op)
 	case SEXT8:    return "sext8";
 	case SEXT16:   return "sext16";
 	case SEXT32:   return "sext32";
+	case ZEXT8:    return "zext8";
+	case ZEXT16:   return "zext16";
 	case ZEXT32:   return "zext32";
 	case BSWAP16:  return "bswap16";
 	case BSWAP32:  return "bswap32";
 	case BSWAP64:  return "bswap64";
+	case SPILL8:   return "spill8";
+	case SPILL16:  return "spill16";
+	case SPILL32:  return "spill32";
 	case ANY:      return "any";
 	case LINEAR_SCEV:  return "linear";
 	}
@@ -312,10 +323,15 @@ static u32 op_params_num(u32 op)
 	case SEXT8:
 	case SEXT16:
 	case SEXT32:
+	case ZEXT8:
+	case ZEXT16:
 	case ZEXT32:
 	case BSWAP16:
 	case BSWAP32:
 	case BSWAP64:
+	case SPILL8:
+	case SPILL16:
+	case SPILL32:
 		return 1;
 	case REG:
 	case IMM:
@@ -510,9 +526,9 @@ static u32 spill_spi(struct bpf_insn *insn)
 	return -insn->off / BPF_REG_SIZE - 1;
 }
 
-static bool is_spill_size(u8 code)
+static u32 off_to_reg(struct bpf_insn *insn)
 {
-	return BPF_SIZE(code) == BPF_DW || BPF_SIZE(code) == BPF_W;
+	return spill_spi(insn) + MAX_BPF_REG;
 }
 
 static bool is_spill_off(int off)
@@ -522,22 +538,63 @@ static bool is_spill_off(int off)
 	       off >= -MAX_BPF_STACK;
 }
 
-static bool is_reg_fill(struct bpf_insn *insn)
+static void mark_opaque(struct env *e, int off, int size)
 {
-	return BPF_CLASS(insn->code) == BPF_LDX &&
-	       BPF_MODE(insn->code) == BPF_MEM &&
-	       is_spill_size(insn->code) &&
-	       insn->src_reg == BPF_REG_FP &&
-	       is_spill_off(insn->off);
+	int b, spi;
+
+	for (b = off; b < off + size; b++) {
+		if (b >= 0 || b < -MAX_BPF_STACK)
+			continue;
+		spi = (-b - 1) / BPF_REG_SIZE;
+		e->reg2expr[MAX_BPF_REG + spi] = OPAQUE_EXPR_ID;
+	}
 }
 
-static bool is_stack_spill(struct bpf_insn *insn)
+static int mk_spill(struct scev *scev, u8 size, int id)
 {
-	return BPF_CLASS(insn->code) == BPF_STX &&
-	       BPF_MODE(insn->code) == BPF_MEM &&
-	       is_spill_size(insn->code) &&
-	       insn->dst_reg == BPF_REG_FP &&
-	       is_spill_off(insn->off);
+	switch (size) {
+	case BPF_B:  return expr1(scev, SPILL8,  id);
+	case BPF_H:  return expr1(scev, SPILL16, id);
+	case BPF_W:  return expr1(scev, SPILL32, id);
+	case BPF_DW: return id;
+	}
+	return UNKNOWN_EXPR_ID;
+}
+
+static int mk_fill(struct scev *scev, int id, u8 code)
+{
+	bool sx = BPF_MODE(code) == BPF_MEMSX;
+
+	switch (BPF_SIZE(code)) {
+	case BPF_B:  return expr1(scev, sx ? SEXT8  : ZEXT8,  id);
+	case BPF_H:  return expr1(scev, sx ? SEXT16 : ZEXT16, id);
+	case BPF_W:  return expr1(scev, sx ? SEXT32 : ZEXT32, id);
+	case BPF_DW: return sx ? UNKNOWN_EXPR_ID : id; /* DW sign-extended load is invalid */
+	}
+	return UNKNOWN_EXPR_ID;
+}
+
+static int maybe_store_fp(struct scev *scev, struct env *e, struct bpf_insn *insn, int id)
+{
+	u8 size = BPF_SIZE(insn->code);
+
+	if (insn->dst_reg != BPF_REG_FP)
+		return 0;
+	if (is_spill_off(insn->off))
+		return replace_reg(scev, e, off_to_reg(insn), mk_spill(scev, size, id));
+	mark_opaque(e, insn->off, bpf_size_to_bytes(size));
+	return 0;
+}
+
+static int maybe_load_fp(struct scev *scev, struct env *e, struct bpf_insn *insn)
+{
+	int id;
+
+	if (insn->src_reg == BPF_REG_FP && is_spill_off(insn->off))
+		id = mk_fill(scev, e->reg2expr[off_to_reg(insn)], insn->code);
+	else
+		id = OPAQUE_EXPR_ID;
+	return replace_reg(scev, e, insn->dst_reg, id);
 }
 
 static int transfer(struct bpf_verifier_env *env, struct env *e, int idx)
@@ -659,46 +716,43 @@ static int transfer(struct bpf_verifier_env *env, struct env *e, int idx)
 		}
 		break;
 	case BPF_LDX:
-		if (is_reg_fill(insn)) {
-			src = spill_spi(insn) + MAX_BPF_REG;
-			id = reg2expr[src];
-			if (BPF_SIZE(insn->code) == BPF_W)
-				id = expr1(scev, ZEXT32, id);
-			return replace_reg(scev, e, dst, id);
-		}
-		goto mark_dst_unknown;
-	case BPF_STX:
-		if (is_stack_spill(insn)) {
-			dst = spill_spi(insn) + MAX_BPF_REG;
-			id = reg2expr[src];
-			if (BPF_SIZE(insn->code) == BPF_W)
-				id = expr1(scev, ZEXT32, id);
-			return replace_reg(scev, e, dst, id);
-		}
 		switch (BPF_MODE(insn->code)) {
 		case BPF_MEM:
-			/* no changes */
-			break;
+		case BPF_MEMSX:
+			return maybe_load_fp(scev, e, insn);
+		default:
+			goto mark_dst_unknown;
+		}
+	case BPF_STX:
+		switch (BPF_MODE(insn->code)) {
+		case BPF_MEM:
+			return maybe_store_fp(scev, e, insn, reg2expr[src]);
 		case BPF_ATOMIC:
-			switch (insn->imm) {
-			case BPF_CMPXCHG:
-				return replace_reg(scev, e, BPF_REG_0, UNKNOWN_EXPR_ID);
-			case BPF_LOAD_ACQ:
-				goto mark_dst_unknown;
-			case BPF_STORE_REL:
-				/* no changes */
-				break;
-			default:
-				if (insn->imm & BPF_FETCH)
-					return replace_reg(scev, e, src, UNKNOWN_EXPR_ID); // TODO: double-check
-				break;
+			if (insn->imm == BPF_LOAD_ACQ)
+				return maybe_load_fp(scev, e, insn);
+			if (insn->imm == BPF_STORE_REL) {
+				return maybe_store_fp(scev, e, insn, reg2expr[src]);
 			}
+			/*
+			 * verifier does not track other atomic ops precisely,
+			 * hence mark the results as opaque.
+			 */
+			if (insn->dst_reg == BPF_REG_FP)
+				mark_opaque(e, insn->off, bpf_size_to_bytes(BPF_SIZE(insn->code)));
+			if (insn->imm == BPF_CMPXCHG)
+				return replace_reg(scev, e, BPF_REG_0, OPAQUE_EXPR_ID);
+			if (insn->imm & BPF_FETCH)
+				return replace_reg(scev, e, src, OPAQUE_EXPR_ID);
 			break;
 		}
 		break;
 	case BPF_ST:
-		// TODO: might assign unknown here, or mark non spill/fill use in check_stack_write_fixed_off.
-		/* no changes */
+		if (insn->dst_reg == BPF_REG_FP) {
+			id = imm_expr(scev, insn->imm);
+			if (id < 0)
+				return id;
+			return maybe_store_fp(scev, e, insn, id);
+		}
 		break;
 	case BPF_JMP:
 	case BPF_JMP32:
