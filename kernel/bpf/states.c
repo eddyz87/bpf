@@ -1372,6 +1372,7 @@ int bpf_split_cur_state(struct bpf_verifier_env *env)
 	}
 
 	cur->parent = new;
+	cur->last_insn_idx = insn_idx;
 	cur->first_insn_idx = insn_idx;
 	cur->dfs_depth = new->dfs_depth + 1;
 	bpf_clear_jmp_history(cur);
@@ -1379,29 +1380,20 @@ int bpf_split_cur_state(struct bpf_verifier_env *env)
 	return 0;
 }
 
-/*
- * Force a checkpoint:
- * - on the loop entry edge, so that bpf_widen_scev_regs() finds
- *   a freshly spawned header state to use as the widening entry_state;
- *   TODO: remove this condition by adding a utility function to split
- *         a new state and use it in bpf_widen_scev_regs().
- * - on subsequent iterations of a loop that SCEV proved terminating.
- */
-static bool need_loop_checkpoint(struct bpf_verifier_env *env, int insn_idx, bool entering_loop)
+/* Force a checkpoint upon reaching a loop header for a terminating loop. */
+static bool need_loop_checkpoint(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state *cur = env->cur_state;
 	struct bpf_func_state *frame = cur->frame[cur->curframe];
 	struct loop_stack_entry *top;
 
-	if (entering_loop)
-		return true;
 	if (bpf_loop_at_index(env, insn_idx) != insn_idx || !frame->loop_stack_cnt)
 		return false;
 	top = &frame->loop_stack[frame->loop_stack_cnt - 1];
 	return top->loop_id == insn_idx && top->terminates;
 }
 
-int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx, bool entering_loop)
+int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *sl;
 	struct bpf_verifier_state *cur = env->cur_state;
@@ -1410,7 +1402,7 @@ int bpf_is_state_visited(struct bpf_verifier_env *env, int insn_idx, bool enteri
 	struct list_head *pos, *tmp, *head;
 	bool log_miss = true;
 
-	loop_checkpoint = need_loop_checkpoint(env, insn_idx, entering_loop);
+	loop_checkpoint = need_loop_checkpoint(env, insn_idx);
 	force_new_state = env->test_state_freq || bpf_is_force_checkpoint(env, insn_idx) ||
 			  loop_checkpoint ||
 			  /* Avoid accumulating infinitely long jmp history */

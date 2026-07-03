@@ -1788,14 +1788,13 @@ static bool linear_bounds(struct bpf_reg_state *reg, struct bpf_loop_iters *iter
 	return true;
 }
 
-int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
-			struct bpf_loop_iters *iters)
+int bpf_compute_loop_iters(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			   struct bpf_loop_iters *iters)
 {
 	struct bpf_func_state *cur_func = st->frame[st->curframe];
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_verifier_log *log = &env->log;
 	struct scev *scev = env->scev;
-	struct bpf_reg_state *reg;
 	struct env *header_env;
 	struct linear_latch latch;
 	struct bpf_loop *loop;
@@ -1914,6 +1913,24 @@ cant_widen:
 		return 0;
 	}
 
+	return 1;
+}
+
+int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			struct bpf_loop_iters *iters)
+{
+	struct bpf_func_state *cur_func = st->frame[st->curframe];
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	struct bpf_reg_state *reg;
+	struct env *header_env;
+	struct bounds bounds;
+	int insn_idx = st->insn_idx;
+	u32 r, base_reg;
+	s64 slope_imm;
+	int err;
+
+	header_env = scev->envs[insn_idx];
 	for (r = 0; r < REGS_NUM; r++) {
 		u32 r_expr;
 

@@ -17655,12 +17655,51 @@ static int maybe_clamp_scev_regs(struct bpf_verifier_env *env)
 	return bpf_clamp_scev_regs(env, frame, env->insn_idx, entry->entry_state, &entry->iters);
 }
 
+static int handle_loop_entry_exit(struct bpf_verifier_env *env)
+{
+	struct bpf_loop_iters iters;
+	bool terminates;
+	int err;
+
+	if (is_next_loop_iteration(env)) {
+		err = maybe_clamp_scev_regs(env);
+		if (err)
+			return err;
+	}
+	if (has_exited_loop(env)) {
+		if (env->log.level & BPF_LOG_LEVEL2)
+			verbose(env, "exiting loop %d\n", bpf_loop_at_index(env, env->prev_insn_idx));
+		err = loop_stack_pop(env);
+		if (err)
+			return err;
+	}
+	if (has_entered_loop(env)) {
+		if (env->log.level & BPF_LOG_LEVEL2)
+			verbose(env, "entering loop %d\n", bpf_loop_at_index(env, env->insn_idx));
+		err = bpf_compute_loop_iters(env, env->cur_state, &iters);
+		if (err < 0)
+			return err;
+		terminates = err == 1;
+		if (terminates) {
+			err = bpf_split_cur_state(env);
+			if (err)
+				return err;
+			err = bpf_widen_scev_regs(env, env->cur_state, &iters);
+			if (err < 0)
+				return err;
+		}
+		err = loop_stack_push(env, env->cur_state->parent, terminates, &iters);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
 static int do_check(struct bpf_verifier_env *env)
 {
 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_insn *insns = env->prog->insnsi;
-	struct bpf_loop_iters iters;
 	int insn_cnt = env->prog->len;
 	bool do_print_state = false;
 	int prev_insn_idx = -1;
@@ -17669,6 +17708,12 @@ static int do_check(struct bpf_verifier_env *env)
 		struct bpf_insn *insn;
 		struct bpf_insn_aux_data *insn_aux;
 		int err;
+
+		if (signal_pending(current))
+			return -EAGAIN;
+
+		if (need_resched())
+			cond_resched();
 
 		/* reset current history entry on each new instruction */
 		env->cur_hist_ent = NULL;
@@ -17693,14 +17738,17 @@ static int do_check(struct bpf_verifier_env *env)
 		state->last_insn_idx = env->prev_insn_idx;
 		state->insn_idx = env->insn_idx;
 
-		if (is_next_loop_iteration(env)) {
-			err = maybe_clamp_scev_regs(env);
-			if (err)
-				return err;
-		}
+		/*
+		 * Possibly widen the registers before creating a checkpoint
+		 * in bpf_is_state_visited(). The next loop iteration will
+		 * have a chance to hit this checkpoint and converge.
+		 */
+		err = handle_loop_entry_exit(env);
+		if (err)
+			return err;
 
 		if (bpf_is_prune_point(env, env->insn_idx)) {
-			err = bpf_is_state_visited(env, env->insn_idx, has_entered_loop(env));
+			err = bpf_is_state_visited(env, env->insn_idx);
 			if (err < 0)
 				return err;
 			if (err == 1) {
@@ -17720,33 +17768,6 @@ static int do_check(struct bpf_verifier_env *env)
 
 		if (bpf_is_jmp_point(env, env->insn_idx)) {
 			err = bpf_push_jmp_history(env, state, 0, 0, 0, 0);
-			if (err)
-				return err;
-		}
-
-		if (signal_pending(current))
-			return -EAGAIN;
-
-		if (need_resched())
-			cond_resched();
-
-		// TODO: move me to the point after do_check_insn
-		if (has_exited_loop(env)) {
-			if (env->log.level & BPF_LOG_LEVEL2)
-				verbose(env, "exiting loop %d\n", bpf_loop_at_index(env, env->prev_insn_idx));
-			err = loop_stack_pop(env);
-			if (err)
-				return err;
-		}
-
-		// TODO: move me before bpf_is_state_visited
-		if (has_entered_loop(env)) {
-			if (env->log.level & BPF_LOG_LEVEL2)
-				verbose(env, "entering loop %d\n", bpf_loop_at_index(env, env->insn_idx));
-			err = bpf_widen_scev_regs(env, env->cur_state, &iters);
-			if (err < 0)
-				return err;
-			err = loop_stack_push(env, env->cur_state->parent, err > 0, &iters);
 			if (err)
 				return err;
 		}
