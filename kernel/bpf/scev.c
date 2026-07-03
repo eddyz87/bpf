@@ -1596,6 +1596,12 @@ static bool eval_expr(struct bpf_verifier_env *env, struct scev *scev, struct bp
 	return false;
 }
 
+/* Like DIV_ROUND_UP() but overflow safe */
+static u64 div_round_up(u64 a, u64 b)
+{
+	return a / b + (a % b != 0);
+}
+
 /*
  * Loop with post-condition:
  *
@@ -1641,30 +1647,31 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 	    !eval_expr(env, scev, st, latch->reg_expr, &initial))
 		return false;
 
-	bpf_log(&env->log, "compute_max_iters: bound=%lld initial=%lld step=%lld op=%x\n",
-		bound, initial, step, op);
-	if (step == 0) // TODO: still can infer 0 or inf
+	if (step == 0)
 		return false;
-
+	if ((s64)step == S64_MIN)
+		return false;
 	if ((s64)step < 0) {
 		/* Multiply both sides of the equation by -1, e.g. -2*i > -3 becomes 2*i < 3 */
 		op = bpf_flip_opcode(op);
-		step = -step; // TODO: check overflow
+		step = -step;
 		swap(bound, initial);
 	}
 	diff = bound - initial;
+	if (diff / step == U64_MAX)
+		return false;
 	switch (op) {
 	case BPF_JLT:
-		max_iters = (u64)initial >= (u64)bound ? 0 : DIV_ROUND_UP(diff, step);
+		max_iters = (u64)initial >= (u64)bound ? 0 : div_round_up(diff, step);
 		break;
 	case BPF_JLE:
 		max_iters = (u64)initial >  (u64)bound ? 0 : diff / step + 1;
 		break;
 	case BPF_JSLT:
-		max_iters = (s64)initial >= (s64)bound ? 0 : DIV_ROUND_UP((s64)diff, (s64)step);
+		max_iters = (s64)initial >= (s64)bound ? 0 : div_round_up(diff, step);
 		break;
 	case BPF_JSLE:
-		max_iters = (s64)initial >  (s64)bound ? 0 : (s64)diff / step + 1;
+		max_iters = (s64)initial >  (s64)bound ? 0 : diff / step + 1;
 		break;
 	/*
 	 * case BPF_JGT:
@@ -1675,13 +1682,11 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 	 * 	break;
 	 */
 	case BPF_JNE:
-		max_iters = diff % step ? U32_MAX : max(0, DIV_ROUND_UP(diff, step));
+		max_iters = diff % step ? U32_MAX : div_round_up(diff, step);
 		break;
 	default:
 		return false;
 	}
-	bpf_log(&env->log, "compute_max_iters: diff=%lld bound=%lld initial=%lld step=%lld max_iters=%lld, op=%x\n",
-		diff, bound, initial, step, max_iters, op);
 
 	if (max_iters > U32_MAX)
 		return false;
