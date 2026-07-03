@@ -190,7 +190,7 @@ __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
 __msg("loop header at 1, header_count is 10 post-cond")
 __msg("loop header at 1, widening r0 to 0..9 step 1")
-__msg("processed 6 insns")
+__msg("processed 5 insns")
 __naked void post_cond_jlt(void)
 {
 	asm volatile ("					\
@@ -208,7 +208,7 @@ __flag(BPF_F_TEST_STATE_FREQ)
 __msg("loop header at 1, header_count is 8")
 __msg("loop header at 1, widening r0 to 2..9 step 1")
 __msg("1: R0=scalar(smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=9,{{.*}})")
-__msg("processed 6 insns")
+__msg("processed 5 insns")
 __naked void post_cond_jlt_with_base(void)
 {
 	asm volatile ("					\
@@ -226,7 +226,7 @@ __flag(BPF_F_TEST_STATE_FREQ)
 __msg("loop header at 1, header_count is 11")
 __msg("loop header at 1, widening r0 to 0..10 step 1")
 __msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=10,{{.*}})") // TODO: __msg_next
-__msg("processed 6 insns")
+__msg("processed 5 insns")
 __naked void post_cond_jle(void)
 {
 	asm volatile ("					\
@@ -244,7 +244,7 @@ __flag(BPF_F_TEST_STATE_FREQ)
 __msg("loop header at 1, header_count is 10")
 __msg("loop header at 1, widening r0 to 0..9 step 1")
 __msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=9,{{.*}})")
-__msg("processed 7 insns")
+__msg("processed 6 insns")
 __naked void post_cond_jge(void)
 {
 	asm volatile ("					\
@@ -263,7 +263,7 @@ __flag(BPF_F_TEST_STATE_FREQ)
 __msg("loop header at 1, header_count is 11")
 __msg("loop header at 1, widening r0 to 0..10 step 1")
 __msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=10,{{.*}})")
-__msg("processed 10 insns")
+__msg("processed 6 insns")
 __naked void pre_cond_jge(void)
 {
 	asm volatile ("					\
@@ -303,11 +303,8 @@ __msg("1: (07) r0 += 1                       ; R0=scalar(smin=umin=smin32=umin32
 __msg("2: (55) if r0 != 0x3 goto pc-2")
 __msg("3: (95) exit")
 __msg("loop header at 1, clamping r0")
-__msg("from 2 to 1:")
-__msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=2,{{.*}})")
-__msg("1: (07) r0 += 1")
-__msg("2: safe")
-__msg("processed 6 insns")
+__msg("from 2 to 1: safe")
+__msg("processed 5 insns")
 __naked void post_cond_jne(void)
 {
 	asm volatile ("					\
@@ -328,7 +325,7 @@ __msg("loop header at 1, header_count is 3 post-cond")
 __msg("loop header at 1, widening r0 to 1..3 step 1")
 __msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,var_off=(0x0; 0x3)) loop_stack=1")
 __msg("loop header at 1, clamping r0 to 1..2 step 1")
-__msg("processed 6 insns")
+__msg("processed 5 insns")
 __naked void post_cond_jne_neg_step(void)
 {
 	asm volatile ("					\
@@ -352,15 +349,11 @@ __msg("1: (15) if r0 == 0x3 goto pc+2        ; R0=scalar(smin=smin32=0,smax=umax
 __msg("2: (07) r0 += 1                       ; R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,{{.*}})")
 __msg("3: (05) goto pc-3")
 __msg("loop header at 1, clamping r0")
-__msg("1: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,{{.*}})")
-__msg("1: (15) if r0 == 0x3 goto pc+2        ; R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=2,{{.*}})")
-__msg("2: (07) r0 += 1                       ; R0=scalar(smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=3,{{.*}})")
-__msg("3: (05) goto pc-3")
 __msg("1: safe")
 __msg("from 1 to 4: R0=3")
 __msg("4: R0=3")
 __msg("4: (95) exit")
-__msg("processed 10 insns")
+__msg("processed 6 insns")
 __naked void pre_cond_je1(void)
 {
 	asm volatile ("					\
@@ -407,17 +400,14 @@ __msg("16: (a5) if r0 < 0x8 goto pc-6")
 __msg("exiting loop 11")
 /* TODO: after finalize loop regs is done, match that r0 is 8 and r1 is 16 at the loop exit */
 __msg("17: (95) exit")
-/* second iteration (checkpoint is at latch) */
+/* second iteration */
 __msg("loop header at 11, clamping r0")
 __msg("loop header at 11, clamping r1")
-__msg("11: R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=7,var_off=(0x0; 0x7)) R1=scalar(smin=umin=smin32=umin32=2,smax=umax=smax32=umax32=14,var_off=(0x0; 0xe),step=0+2)")
 /* iteration convergence */
-__msg("16: safe")
+__msg("from 16 to 11: safe")
 __not_msg("{{^}}11:")
 /* map lookup error path */
-__msg("from 7 to 17: R0=0")
-__msg("17: R0=0")
-__msg("17: (95) exit")
+__msg("from 7 to 17: safe")
 __naked void correlated_regs(void)
 {
 	asm volatile ("					\
@@ -574,7 +564,7 @@ __log_level(2)
 __msg("loop header at 2, header_count is 100 post-cond")
 __msg("loop header at 4, header_count is [0..100] post-cond")
 __msg("loop header at 6, header_count is [0..100] post-cond")
-__msg("processed 26 insns")
+__msg("processed 20 insns")
 __flag(BPF_F_TEST_STATE_FREQ)
 __naked void nested_loop_with_two_exits(void)
 {
