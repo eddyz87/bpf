@@ -591,10 +591,14 @@ static void compute_may_write_masks(struct bpf_verifier_env *env)
 		if (!frame)
 			continue;
 		for (i = 0; i < instance->insn_cnt; i++) {
-			if (spis_is_zero(frame[i].may_write))
-				continue;
-			mask = spis_to_slot_mask(frame[i].may_write);
-			aux[instance->subprog_start + i].may_write_mask |= mask;
+			if (!spis_is_zero(frame[i].may_write)) {
+				mask = spis_to_slot_mask(frame[i].may_write);
+				aux[instance->subprog_start + i].may_write_mask |= mask;
+			}
+			if (!spis_is_zero(frame[i].live_before)) {
+				mask = spis_to_slot_mask(frame[i].live_before);
+				aux[instance->subprog_start + i].live_stack_before |= mask;
+			}
 		}
 	}
 }
