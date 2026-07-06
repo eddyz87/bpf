@@ -751,6 +751,7 @@ struct bpf_insn_aux_data {
 	 * that this instruction may write to.
 	 */
 	u64 may_write_mask;
+	u64 live_stack_before;
 	u16 stack_ptrs; /* bitmask of regs that may hold a frame pointer here (arg_track) */
 	int ctx_field_size; /* the ctx field size for load insn, maybe 0 */
 	u32 seen; /* this insn was processed by the verifier at env->pass_cnt */
