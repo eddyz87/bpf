@@ -319,6 +319,7 @@ static u32 op_params_num(u32 op)
 		return 1;
 	case REG:
 	case IMM:
+	case OPAQUE:
 		return 0;
 	default:
 		return 0;
@@ -392,6 +393,10 @@ static void log_expr(struct bpf_verifier_env *env, u32 id)
 		case UNKNOWN:
 			if (order & PRE)
 				bpf_log(log, "?");
+			break;
+		case OPAQUE:
+			if (order & PRE)
+				bpf_log(log, "_");
 			break;
 		case REG:
 			if (order & PRE)
