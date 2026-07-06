@@ -1221,8 +1221,8 @@ static bool is_any_imm_reg(struct scev *scev, u32 id)
  * Can implement explicit stack version, but it is harder to read.
  * Stick with recursive version for now.
  */
-static int __transform_expr(struct scev *scev, u32 lvl, u32 root, void *priv,
-                            int (*fn)(struct scev *scev, u32 id, void *priv))
+static int transform_expr_once(struct scev *scev, u32 lvl, u32 root, void *priv,
+                               int (*fn)(struct scev *scev, u32 id, void *priv))
 {
 	struct expr expr;
 	int p0, p1, id;
@@ -1236,12 +1236,12 @@ static int __transform_expr(struct scev *scev, u32 lvl, u32 root, void *priv,
 		id = root;
 		break;
 	case 1:
-		p0 = __transform_expr(scev, lvl + 1, expr.params[0], priv, fn);
+		p0 = transform_expr_once(scev, lvl + 1, expr.params[0], priv, fn);
 		id = expr1(scev, expr.op, p0);
 		break;
 	case 2:
-		p0 = __transform_expr(scev, lvl + 1, expr.params[0], priv, fn);
-		p1 = __transform_expr(scev, lvl + 1, expr.params[1], priv, fn);
+		p0 = transform_expr_once(scev, lvl + 1, expr.params[0], priv, fn);
+		p1 = transform_expr_once(scev, lvl + 1, expr.params[1], priv, fn);
 		id = expr2(scev, expr.op, p0, p1);
 		break;
 	}
@@ -1251,25 +1251,22 @@ static int __transform_expr(struct scev *scev, u32 lvl, u32 root, void *priv,
 static int transform_expr(struct scev *scev, u32 root, void *priv,
                           int (*fn)(struct scev *scev, u32 id, void *priv))
 {
-	int id1, id2;
+	int id_old, id_new = root;
 
-	for (id1 = root, id2 = -1; id1 != id2; id1 = id2) {
-		id2 = __transform_expr(scev, 0, id1, priv, fn);
-		if (id2 < 0)
-			return id2;
-	}
-	return id2;
+	do {
+		id_old = id_new;
+		id_new = transform_expr_once(scev, 0, id_old, priv, fn);
+		if (id_new < 0)
+			return id_new;
+	} while (id_old != id_new);
+	return id_new;
 }
 
+// TODO: apply simplify in replace_reg?
 static int simplify(struct scev *scev, u32 id, void *priv)
 {
-	u32 l, r, reg, base, slope, *reg2scev = priv;
+	u32 l, r, base, slope;
 	s64 imm1, imm2;
-
-	/* (reg r) -> (linear ...), where r is a LINEAR_SCEV in the header */
-	if (is_reg(scev, id, &reg) &&
-	    is_linear(scev, reg2scev[reg], &base, &slope))
-		return reg2scev[reg];
 
 	/* (+ (linear base slope) imm) -> (linear (+ base imm) slope) */
 	if (is_add(scev, id, &l, &r) &&
@@ -1297,7 +1294,7 @@ static int compute_header_scevs(struct bpf_verifier_env *env, struct env *header
 	int id;
 
 	for (ra = 0; ra < REGS_NUM; ra++) {
-		id = transform_expr(scev, header_env->reg2expr[ra], header_env->reg2scev, simplify);
+		id = transform_expr(scev, header_env->reg2expr[ra], NULL, simplify);
 		if (id < 0)
 			return id;
 		header_env->reg2expr[ra] = id;
@@ -1332,6 +1329,16 @@ static int compute_header_scevs(struct bpf_verifier_env *env, struct env *header
 	}
 	return 0;
 }
+static int instantiate_header_scevs(struct scev *scev, u32 id, void *priv)
+{
+	u32 reg, base, slope, *reg2scev = priv;
+
+	/* (reg r) -> (linear ...), where r is a LINEAR_SCEV in the header */
+	if (is_reg(scev, id, &reg) &&
+	    is_linear(scev, reg2scev[reg], &base, &slope))
+		return reg2scev[reg];
+	return id;
+}
 
 static int compute_insn_scevs(struct bpf_verifier_env *env, struct env *eheader, struct env *einsn)
 {
@@ -1339,7 +1346,11 @@ static int compute_insn_scevs(struct bpf_verifier_env *env, struct env *eheader,
 	int id, reg;
 
 	for (reg = 0; reg < REGS_NUM; reg++) {
-		id = transform_expr(scev, einsn->reg2expr[reg], eheader->reg2scev, simplify);
+		id = einsn->reg2expr[reg];
+		id = transform_expr_once(scev, 0, id, eheader->reg2scev, instantiate_header_scevs);
+		if (id < 0)
+			return id;
+		id = transform_expr(scev, id, NULL, simplify);
 		if (id < 0)
 			return id;
 		einsn->reg2scev[reg] = id;
