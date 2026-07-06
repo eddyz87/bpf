@@ -427,7 +427,20 @@ enum print_env_flags {
 	PRINT_SCEV = BIT(1)
 };
 
-static void print_env(struct bpf_verifier_env *env, struct env *e, u32 flags)
+static bool reg_alive_at(struct bpf_verifier_env *env, u32 reg, u32 insn_idx)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	u64 live_stack = aux[insn_idx].live_stack_before;
+	u16 live_regs = aux[insn_idx].live_regs_before;
+	int spi;
+
+	spi = reg - MAX_BPF_REG;
+	return reg < MAX_BPF_REG
+	       ? (BIT(reg) & live_regs)
+	       : (BIT(spi) & live_stack);
+}
+
+static void print_env(struct bpf_verifier_env *env, struct env *e, u32 insn_idx, u32 flags)
 {
 	struct bpf_verifier_log *log = &env->log;
 	struct scev *scev = env->scev;
@@ -438,17 +451,19 @@ static void print_env(struct bpf_verifier_env *env, struct env *e, u32 flags)
 	int i, r;
 
 	if (e->empty) {
-		bpf_log(log, " <empty>\n");
+		bpf_log(log, "  <empty>\n");
 		return;
 	}
 
 	for (i = 0; i < REGS_NUM; i++) {
+		if (!reg_alive_at(env, i, insn_idx))
+			continue;
 		is_self_reg = is_reg(scev, e->reg2expr[i], &r) && i == r;
 		is_self_scev = is_reg(scev, e->reg2scev[i], &r) && i == r;
 		if (is_self_reg && (!print_scev || is_self_scev))
 			continue;
 		printed_some = true;
-		bpf_log(log, " ");
+		bpf_log(log, "  ");
 		log_reg(env, i);
 		bpf_log(log, "=");
 		log_expr(env, e->reg2expr[i]);
@@ -456,10 +471,10 @@ static void print_env(struct bpf_verifier_env *env, struct env *e, u32 flags)
 			bpf_log(log, " / ");
 			log_expr(env, e->reg2scev[i]);
 		}
+		bpf_log(log, "\n");
 	}
 	if (!printed_some)
-		bpf_log(log, " <all regs unchanged>");
-	bpf_log(log, "\n");
+		bpf_log(log, "  <all regs unchanged>\n");
 }
 static struct env *get_loop_env(struct scev *scev, int insn_idx)
 {
@@ -898,21 +913,15 @@ static bool is_probe_read_helper(u32 func_id)
 static void reset_scevs_at_indirect_writes(struct bpf_verifier_env *env, struct env *cur_env, int idx)
 {
 	struct bpf_insn *insn = &env->prog->insnsi[idx];
-	struct bpf_verifier_log *log = &env->log;
 	struct scev *scev = env->scev;
 	u8 class = BPF_CLASS(insn->code);
-	bool invalidated = false;
-	u64 mask, pos;
 	u32 spi, reg;
 	bool opaque;
+	u64 mask;
 
 	/* Direct fp stores are fine. */
 	if ((class == BPF_ST || class == BPF_STX) && insn->dst_reg == BPF_REG_FP)
 		return;
-
-	pos = log->end_pos;
-	if (log->level & BPF_LOG_LEVEL2)
-		bpf_log(log, "at %d invalidating SCEVs for ", idx);
 
 	mask = bpf_may_write_mask(env, idx);
 	opaque = bpf_helper_call(insn) && is_probe_read_helper(insn->imm);
@@ -922,19 +931,7 @@ static void reset_scevs_at_indirect_writes(struct bpf_verifier_env *env, struct 
 		reg = MAX_BPF_REG + spi;
 		if (cur_env->reg2expr[reg] == UNKNOWN_EXPR_ID)
 			continue;
-		if (log->level & BPF_LOG_LEVEL2) {
-			bpf_log(log, invalidated ? "," : "");
-			log_reg(env, reg);
-		}
 		replace_reg(scev, cur_env, reg, opaque ? OPAQUE_EXPR_ID : UNKNOWN_EXPR_ID);
-		invalidated = true;
-	}
-
-	if (log->level & BPF_LOG_LEVEL2) {
-		if (invalidated)
-			bpf_log(log, " because of indirect write\n");
-		else
-			bpf_vlog_reset(log, pos);
 	}
 }
 
@@ -998,33 +995,76 @@ static void collect_store_base_regs(struct bpf_verifier_env *env,
 			or_expr_regs(env, cur_env->reg2expr[r], mask);
 }
 
+static void log_env_changes(struct bpf_verifier_env *env, const char *prefix,
+			    struct env *old, struct env *new, int insn_idx)
+{
+	struct bpf_verifier_log *log = &env->log;
+	struct scev *scev = env->scev;
+	u64 null_pos = log->end_pos;
+	bool any_changes = false;
+	u32 old_id, new_id;
+	u64 len;
+	int r;
+
+	bpf_log(log, "%s %4d: ", prefix, insn_idx);
+	bpf_verbose_insn(env, &env->prog->insnsi[insn_idx]);
+	if (log->end_pos)
+		log->end_pos--;
+	len = log->end_pos - null_pos;
+	bpf_log(log, "%*s", max(37 - (int)len, 1), " ");
+	bpf_log(log, " ; ");
+	for (r = 0; r < REGS_NUM; r++) {
+		old_id = old->reg2expr[r];
+		new_id = new->reg2expr[r];
+		if (!reg_alive_at(env, r, insn_idx))
+			continue;
+		if (same_exprs(scev, old_id, new_id))
+			continue;
+		if (any_changes)
+			bpf_log(log, ", ");
+		log_reg(env, r);
+		bpf_log(log, " ");
+		log_expr(env, old_id);
+		bpf_log(log, " -> ");
+		log_expr(env, new_id);
+		any_changes = true;
+	}
+	bpf_log(log, "\n");
+	if (!any_changes)
+		bpf_vlog_reset(log, null_pos);
+}
+
 static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 {
-	struct env *cur_env, *succ_env, *before_env, *to_env, *nested_header_env;
+	struct env *succ_env, *header_env, *to_env, *nested_header_env;
 	struct bpf_min_heap *worklist = &env->scev->worklist;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_loop *cur_loop = aux[cur_header].loop;
-	struct bpf_verifier_log *log = &env->log;
 	struct scev *scev = env->scev;
 	struct bpf_loop_exit *exit;
 	struct bpf_loop *nested_loop;
+	struct env *cur_env = NULL;
+	struct env *old_env = NULL;
 	struct bpf_iarray *succ;
+	bool log_level2 = env->log.level & BPF_LOG_LEVEL2;
 	int s, e, err, idx, succ_idx;
 	bool first;
 	u32 r;
 
+	if (log_level2)
+		bpf_log(&env->log, "Computing SCEV for loop at %d:\n", cur_header);
 	cur_env = kzalloc(sizeof(*cur_env), GFP_KERNEL_ACCOUNT);
-	if (!cur_env) {
-		err = -ENOMEM;
-		goto out;
+	if (!cur_env)
+		goto nomem;
+	if (log_level2) {
+		old_env = kzalloc(sizeof(*old_env), GFP_KERNEL_ACCOUNT);
+		if (!old_env)
+			goto nomem;
 	}
-
-	before_env = get_loop_env(scev, cur_header);
-	if (!before_env) {
-		err = -ENOMEM;
-		goto out;
-	}
-	setup_initial_loop_env(env, before_env, cur_header);
+	header_env = get_loop_env(scev, cur_header);
+	if (!header_env)
+		goto nomem;
+	setup_initial_loop_env(env, header_env, cur_header);
 	err = worklist_push(scev, cur_header);
 	if (err)
 		goto out;
@@ -1034,25 +1074,18 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 		if (!bpf_min_heap_pop(worklist, &idx))
 			break;
 
-		before_env = get_loop_env(scev, idx);
-		if (!before_env) {
-			err = -ENOMEM;
-			goto out;
-		}
-
-		if (log->level & BPF_LOG_LEVEL2) {
-			bpf_log(log, "scev expr %d:", idx);
-			print_env(env, before_env, 0);
-		}
-
 		/* Iterate instructions within a single basic block starting at 'idx' mutating 'cur_env'. */
 		memcpy(cur_env, scev->envs[idx], sizeof(*cur_env));
 		for (;;) {
 			collect_store_base_regs(env, cur_env, idx, cur_loop->store_base_regs);
+			if (log_level2)
+				memcpy(old_env, cur_env, sizeof(*old_env));
 			err = transfer(env, cur_env, idx);
 			if (err)
 				goto out;
 			reset_scevs_at_indirect_writes(env, cur_env, idx);
+			if (log_level2)
+				log_env_changes(env, "t", old_env, cur_env, idx);
 			succ = bpf_insn_successors(env, idx);
 			if (succ->cnt != 1)
 				break;
@@ -1074,12 +1107,16 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 			 * and schedule furhter traversal.
 			 */
 			if (bpf_loop_at_index(env, succ_idx) == cur_header) {
+				if (log_level2)
+					memcpy(old_env, succ_env, sizeof(*old_env));
 				err = join(scev, succ_env, cur_env);
 				if (err)
 					goto out;
 				err = worklist_push(scev, succ_idx);
 				if (err)
 					goto out;
+				if (log_level2)
+					log_env_changes(env, "j", old_env, succ_env, succ_idx);
 				continue;
 			}
 			/*
@@ -1107,6 +1144,8 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 					to_env = get_loop_env(scev, exit->to);
 					if (!to_env)
 						goto nomem;
+					if (log_level2)
+						memcpy(old_env, to_env, sizeof(*old_env));
 					err = join(scev, to_env, cur_env);
 					if (err)
 						goto out;
@@ -1114,6 +1153,8 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 					err = worklist_push(scev, exit->to);
 					if (err)
 						goto out;
+					if (log_level2)
+						log_env_changes(env, "j", old_env, to_env, exit->to);
 				}
 				/* Pull the nested loop's stack-store base dependencies up. */
 				for_each_set_bit(r, nested_loop->store_base_regs, BPF_SCEV_REGS_NUM)
@@ -1126,6 +1167,7 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header)
 	err = 0;
 out:
 	kfree(cur_env);
+	kfree(old_env);
 	return err;
 nomem:
 	err = -ENOMEM;
@@ -1319,16 +1361,14 @@ static void log_scevs(struct bpf_verifier_env *env)
 		loop = aux[i].loop;
 		if (!loop)
 			continue;
-		bpf_log(log, "scev at header %d:", i);
-		print_env(env, scev->envs[i], PRINT_SCEV);
+		bpf_log(log, "scev at header %d:\n", i);
+		print_env(env, scev->envs[i], i, PRINT_SCEV);
 		for (j = 0; j < loop->backedges_cnt; j++) {
 			latch = loop->backedges[j].latch;
 			if (latch < 0)
 				continue;
-			bpf_log(log, " scev at latch %d:", latch);
-			print_env(env, scev->envs[latch], PRINT_SCEV);
-			bpf_log(log, "      latch at %d: ", latch);
-			bpf_verbose_insn(env, &env->prog->insnsi[latch]);
+			bpf_log(log, " scev at latch %d:\n", latch);
+			print_env(env, scev->envs[latch], latch, PRINT_SCEV);
 		}
 	}
 }
