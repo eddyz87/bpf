@@ -15257,6 +15257,15 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 	return reg_bounds_sanity_check(env, &regs[insn->dst_reg], "alu");
 }
 
+static struct loop_stack_entry *cur_loop(struct bpf_verifier_env *env)
+{
+	struct bpf_func_state *frame = cur_func(env);
+
+	if (frame->loop_stack_cnt == 0)
+		return NULL;
+	return &frame->loop_stack[frame->loop_stack_cnt - 1];
+}
+
 static void find_good_pkt_pointers(struct bpf_verifier_state *vstate,
 				   struct bpf_reg_state *dst_reg,
 				   enum bpf_reg_type type,
@@ -16198,7 +16207,11 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	struct bpf_reg_state *regs = this_branch->frame[this_branch->curframe]->regs;
 	struct bpf_reg_state *dst_reg, *src_reg = NULL;
 	struct linked_regs linked_regs = {};
+	struct loop_stack_entry *loop_entry;
 	u8 opcode = BPF_OP(insn->code);
+	bool false_branch_first;
+	u32 false_branch_tgt;
+	u32 true_branch_tgt;
 	int insn_flags = 0;
 	bool is_jmp32;
 	int pred = -1;
@@ -16332,17 +16345,48 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			return err;
 	}
 
-	other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx, false);
-	if (IS_ERR(other_branch))
-		return PTR_ERR(other_branch);
-
 	err = regs_bounds_sanity_check_branches(env);
 	if (err)
 		return err;
 
-	err = setup_cond_jmp_states(env, this_branch, other_branch, insn, &linked_regs);
-	if (err)
-		return err;
+	false_branch_tgt = *insn_idx + 1;
+	true_branch_tgt = *insn_idx + insn->off + 1;
+	loop_entry = cur_loop(env);
+	false_branch_first = true;
+	if (loop_entry && loop_entry->terminates) {
+		struct bpf_loop *loop = env->insn_aux_data[loop_entry->loop_id].loop;
+
+		for (int i = 0; i < loop->backedges_cnt; i++) {
+			/* If current instruction is a latch */
+			if (loop->backedges[i].latch != *insn_idx)
+				continue;
+			/* And true branch is a backedge */
+			if (bpf_loop_at_index(env, true_branch_tgt) == loop_entry->loop_id)
+				/* Keep DFS exploration within the loop */
+				false_branch_first = false;
+			break;
+		}
+	}
+
+	if (false_branch_first) {
+		other_branch = push_stack(env, true_branch_tgt, *insn_idx, false);
+		if (IS_ERR(other_branch))
+			return PTR_ERR(other_branch);
+
+		err = setup_cond_jmp_states(env, this_branch, other_branch, insn, &linked_regs);
+		if (err)
+			return err;
+	} else {
+		other_branch = push_stack(env, false_branch_tgt, *insn_idx, false);
+		if (IS_ERR(other_branch))
+			return PTR_ERR(other_branch);
+
+		err = setup_cond_jmp_states(env, other_branch, this_branch, insn, &linked_regs);
+		if (err)
+			return err;
+
+		*insn_idx = true_branch_tgt - 1;
+	}
 
 	if (env->log.level & BPF_LOG_LEVEL)
 		print_insn_state(env, this_branch, this_branch->curframe);
