@@ -15344,27 +15344,27 @@ static void regs_refine_cond_op(struct bpf_reg_state *reg1, struct bpf_reg_state
 static int simulate_both_branches_taken(struct bpf_verifier_env *env, u8 opcode, bool is_jmp32)
 {
 	/* Fallthrough (FALSE) branch */
-	regs_refine_cond_op(&env->false_reg1, &env->false_reg2, bpf_rev_opcode(opcode), is_jmp32);
-	reg_bounds_sync(&env->false_reg1);
-	reg_bounds_sync(&env->false_reg2);
+	regs_refine_cond_op(&env->false_dst_reg, &env->false_src_reg, bpf_rev_opcode(opcode), is_jmp32);
+	reg_bounds_sync(&env->false_dst_reg);
+	reg_bounds_sync(&env->false_src_reg);
 	/*
 	 * If there is a range bounds violation in *any* of the abstract values in either
 	 * reg_states in the FALSE branch (i.e. reg1, reg2), the FALSE branch must be dead. Only
 	 * TRUE branch will be taken.
 	 */
-	if (range_bounds_violation(&env->false_reg1) || range_bounds_violation(&env->false_reg2))
+	if (range_bounds_violation(&env->false_dst_reg) || range_bounds_violation(&env->false_src_reg))
 		return 1;
 
 	/* Jump (TRUE) branch */
-	regs_refine_cond_op(&env->true_reg1, &env->true_reg2, opcode, is_jmp32);
-	reg_bounds_sync(&env->true_reg1);
-	reg_bounds_sync(&env->true_reg2);
+	regs_refine_cond_op(&env->true_dst_reg, &env->true_src_reg, opcode, is_jmp32);
+	reg_bounds_sync(&env->true_dst_reg);
+	reg_bounds_sync(&env->true_src_reg);
 	/*
 	 * If there is a range bounds violation in *any* of the abstract values in either
 	 * reg_states in the TRUE branch (i.e. true_reg1, true_reg2), the TRUE branch must be dead.
 	 * Only FALSE branch will be taken.
 	 */
-	if (range_bounds_violation(&env->true_reg1) || range_bounds_violation(&env->true_reg2))
+	if (range_bounds_violation(&env->true_dst_reg) || range_bounds_violation(&env->true_src_reg))
 		return 0;
 
 	/* Both branches are possible, we can't determine which one will be taken. */
@@ -15809,10 +15809,10 @@ static int regs_bounds_sanity_check_branches(struct bpf_verifier_env *env)
 {
 	int err;
 
-	err = reg_bounds_sanity_check(env, &env->true_reg1, "true_reg1");
-	err = err ?: reg_bounds_sanity_check(env, &env->true_reg2, "true_reg2");
-	err = err ?: reg_bounds_sanity_check(env, &env->false_reg1, "false_reg1");
-	err = err ?: reg_bounds_sanity_check(env, &env->false_reg2, "false_reg2");
+	err = reg_bounds_sanity_check(env, &env->true_dst_reg, "true_reg1");
+	err = err ?: reg_bounds_sanity_check(env, &env->true_src_reg, "true_reg2");
+	err = err ?: reg_bounds_sanity_check(env, &env->false_dst_reg, "false_reg1");
+	err = err ?: reg_bounds_sanity_check(env, &env->false_src_reg, "false_reg2");
 	return err;
 }
 
@@ -16095,14 +16095,108 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 	}
 }
 
+static int setup_cond_jmp_states(struct bpf_verifier_env *env,
+				 struct bpf_verifier_state *false_branch,
+				 struct bpf_verifier_state *true_branch,
+				 struct bpf_insn *insn,
+				 struct linked_regs *linked_regs)
+{
+	struct bpf_reg_state *false_regs = false_branch->frame[false_branch->curframe]->regs;
+	struct bpf_reg_state *true_regs = true_branch->frame[true_branch->curframe]->regs;
+	struct bpf_reg_state *src_reg = &false_regs[insn->src_reg];
+	struct bpf_reg_state *dst_reg = &false_regs[insn->dst_reg];
+	struct bpf_reg_state *eq_branch_regs;
+	bool is_jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
+	u8 opcode = BPF_OP(insn->code);
+
+	false_regs[insn->dst_reg] = env->false_dst_reg;
+	true_regs[insn->dst_reg] = env->true_dst_reg;
+	if (BPF_SRC(insn->code) == BPF_X) {
+		false_regs[insn->src_reg] = env->false_src_reg;
+		true_regs[insn->src_reg] = env->true_src_reg;
+	}
+
+	if (BPF_SRC(insn->code) == BPF_X &&
+	    src_reg->type == SCALAR_VALUE && src_reg->id &&
+	    !WARN_ON_ONCE(src_reg->id != true_regs[insn->src_reg].id)) {
+		sync_linked_regs(env, false_branch, &false_regs[insn->src_reg], linked_regs);
+		sync_linked_regs(env, true_branch, &true_regs[insn->src_reg], linked_regs);
+	}
+	if (dst_reg->type == SCALAR_VALUE &&  dst_reg->id &&
+	     !WARN_ON_ONCE(dst_reg->id != true_regs[insn->dst_reg].id)) {
+		 sync_linked_regs(env, false_branch, dst_reg, linked_regs);
+		 sync_linked_regs(env, true_branch, &true_regs[insn->dst_reg], linked_regs);
+	}
+
+	/* if one pointer register is compared to another pointer
+	 * register check if PTR_MAYBE_NULL could be lifted.
+	 * E.g. register A - maybe null
+	 *	register B - not null
+	 * for JNE A, B, ... - A is not null in the false branch;
+	 * for JEQ A, B, ... - A is not null in the true branch.
+	 *
+	 * Since PTR_TO_BTF_ID points to a kernel struct that does
+	 * not need to be null checked by the BPF program, i.e.,
+	 * could be null even without PTR_MAYBE_NULL marking, so
+	 * only propagate nullness when neither reg is that type.
+	 */
+	if (!is_jmp32 && BPF_SRC(insn->code) == BPF_X &&
+	    __is_pointer_value(false, src_reg) && __is_pointer_value(false, dst_reg) &&
+	    type_may_be_null(src_reg->type) != type_may_be_null(dst_reg->type) &&
+	    base_type(src_reg->type) != PTR_TO_BTF_ID &&
+	    base_type(dst_reg->type) != PTR_TO_BTF_ID) {
+		eq_branch_regs = NULL;
+		switch (opcode) {
+		case BPF_JEQ:
+			eq_branch_regs = true_regs;
+			break;
+		case BPF_JNE:
+			eq_branch_regs = false_regs;
+			break;
+		default:
+			/* do nothing */
+			break;
+		}
+		if (eq_branch_regs) {
+			if (type_may_be_null(src_reg->type))
+				mark_ptr_not_null_reg(&eq_branch_regs[insn->src_reg]);
+			else
+				mark_ptr_not_null_reg(&eq_branch_regs[insn->dst_reg]);
+		}
+	}
+
+	/* detect if R == 0 where R is returned from bpf_map_lookup_elem().
+	 * Also does the same detection for a register whose the value is
+	 * known to be 0.
+	 * NOTE: these optimizations below are related with pointer comparison
+	 *	 which will never be JMP32.
+	 */
+	if (!is_jmp32 && (opcode == BPF_JEQ || opcode == BPF_JNE) &&
+	    type_may_be_null(dst_reg->type) &&
+	    ((BPF_SRC(insn->code) == BPF_K && insn->imm == 0) ||
+	     (BPF_SRC(insn->code) == BPF_X && bpf_register_is_null(src_reg)))) {
+		/* Mark all identical registers in each branch as either
+		 * safe or unknown depending R == 0 or R != 0 conditional.
+		 */
+		mark_ptr_or_null_regs(false_branch, insn->dst_reg, opcode == BPF_JNE);
+		mark_ptr_or_null_regs(true_branch, insn->dst_reg, opcode == BPF_JEQ);
+	} else if (!try_match_pkt_pointers(insn, dst_reg, src_reg, false_branch, true_branch) &&
+		   is_pointer_value(env, insn->dst_reg)) {
+		verbose(env, "R%d pointer comparison prohibited\n",
+			insn->dst_reg);
+		return -EACCES;
+	}
+
+	return 0;
+}
+
 static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			     struct bpf_insn *insn, int *insn_idx)
 {
 	struct bpf_verifier_state *this_branch = env->cur_state;
 	struct bpf_verifier_state *other_branch;
 	struct bpf_reg_state *regs = this_branch->frame[this_branch->curframe]->regs;
-	struct bpf_reg_state *dst_reg, *other_branch_regs, *src_reg = NULL;
-	struct bpf_reg_state *eq_branch_regs;
+	struct bpf_reg_state *dst_reg, *src_reg = NULL;
 	struct linked_regs linked_regs = {};
 	u8 opcode = BPF_OP(insn->code);
 	int insn_flags = 0;
@@ -16175,10 +16269,10 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	}
 
 	is_jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
-	env->false_reg1 = *dst_reg;
-	env->false_reg2 = *src_reg;
-	env->true_reg1 = *dst_reg;
-	env->true_reg2 = *src_reg;
+	env->false_dst_reg = *dst_reg;
+	env->false_src_reg = *src_reg;
+	env->true_dst_reg = *dst_reg;
+	env->true_src_reg = *src_reg;
 	pred = is_branch_taken(env, dst_reg, src_reg, opcode, is_jmp32);
 	if (pred >= 0) {
 		/* If we get here with a dst_reg pointer type it is because
@@ -16241,93 +16335,15 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx, false);
 	if (IS_ERR(other_branch))
 		return PTR_ERR(other_branch);
-	other_branch_regs = other_branch->frame[other_branch->curframe]->regs;
 
 	err = regs_bounds_sanity_check_branches(env);
 	if (err)
 		return err;
 
-	*dst_reg = env->false_reg1;
-	*src_reg = env->false_reg2;
-	other_branch_regs[insn->dst_reg] = env->true_reg1;
-	if (BPF_SRC(insn->code) == BPF_X)
-		other_branch_regs[insn->src_reg] = env->true_reg2;
+	err = setup_cond_jmp_states(env, this_branch, other_branch, insn, &linked_regs);
+	if (err)
+		return err;
 
-	if (BPF_SRC(insn->code) == BPF_X &&
-	    src_reg->type == SCALAR_VALUE && src_reg->id &&
-	    !WARN_ON_ONCE(src_reg->id != other_branch_regs[insn->src_reg].id)) {
-		sync_linked_regs(env, this_branch, src_reg, &linked_regs);
-		sync_linked_regs(env, other_branch, &other_branch_regs[insn->src_reg],
-				 &linked_regs);
-	}
-	if (dst_reg->type == SCALAR_VALUE && dst_reg->id &&
-	    !WARN_ON_ONCE(dst_reg->id != other_branch_regs[insn->dst_reg].id)) {
-		sync_linked_regs(env, this_branch, dst_reg, &linked_regs);
-		sync_linked_regs(env, other_branch, &other_branch_regs[insn->dst_reg],
-				 &linked_regs);
-	}
-
-	/* if one pointer register is compared to another pointer
-	 * register check if PTR_MAYBE_NULL could be lifted.
-	 * E.g. register A - maybe null
-	 *      register B - not null
-	 * for JNE A, B, ... - A is not null in the false branch;
-	 * for JEQ A, B, ... - A is not null in the true branch.
-	 *
-	 * Since PTR_TO_BTF_ID points to a kernel struct that does
-	 * not need to be null checked by the BPF program, i.e.,
-	 * could be null even without PTR_MAYBE_NULL marking, so
-	 * only propagate nullness when neither reg is that type.
-	 */
-	if (!is_jmp32 && BPF_SRC(insn->code) == BPF_X &&
-	    __is_pointer_value(false, src_reg) && __is_pointer_value(false, dst_reg) &&
-	    type_may_be_null(src_reg->type) != type_may_be_null(dst_reg->type) &&
-	    base_type(src_reg->type) != PTR_TO_BTF_ID &&
-	    base_type(dst_reg->type) != PTR_TO_BTF_ID) {
-		eq_branch_regs = NULL;
-		switch (opcode) {
-		case BPF_JEQ:
-			eq_branch_regs = other_branch_regs;
-			break;
-		case BPF_JNE:
-			eq_branch_regs = regs;
-			break;
-		default:
-			/* do nothing */
-			break;
-		}
-		if (eq_branch_regs) {
-			if (type_may_be_null(src_reg->type))
-				mark_ptr_not_null_reg(&eq_branch_regs[insn->src_reg]);
-			else
-				mark_ptr_not_null_reg(&eq_branch_regs[insn->dst_reg]);
-		}
-	}
-
-	/* detect if R == 0 where R is returned from bpf_map_lookup_elem().
-	 * Also does the same detection for a register whose the value is
-	 * known to be 0.
-	 * NOTE: these optimizations below are related with pointer comparison
-	 *       which will never be JMP32.
-	 */
-	if (!is_jmp32 && (opcode == BPF_JEQ || opcode == BPF_JNE) &&
-	    type_may_be_null(dst_reg->type) &&
-	    ((BPF_SRC(insn->code) == BPF_K && insn->imm == 0) ||
-	     (BPF_SRC(insn->code) == BPF_X && bpf_register_is_null(src_reg)))) {
-		/* Mark all identical registers in each branch as either
-		 * safe or unknown depending R == 0 or R != 0 conditional.
-		 */
-		mark_ptr_or_null_regs(this_branch, insn->dst_reg,
-				      opcode == BPF_JNE);
-		mark_ptr_or_null_regs(other_branch, insn->dst_reg,
-				      opcode == BPF_JEQ);
-	} else if (!try_match_pkt_pointers(insn, dst_reg, &regs[insn->src_reg],
-					   this_branch, other_branch) &&
-		   is_pointer_value(env, insn->dst_reg)) {
-		verbose(env, "R%d pointer comparison prohibited\n",
-			insn->dst_reg);
-		return -EACCES;
-	}
 	if (env->log.level & BPF_LOG_LEVEL)
 		print_insn_state(env, this_branch, this_branch->curframe);
 	return 0;
