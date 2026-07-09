@@ -45,7 +45,7 @@ enum expr_op {
 struct expr {
 	u32 op;
 	union {
-		u32 params[2]; // TODO: make these s32, needed for linear_scev coef param
+		u32 params[2];
 		s64 imm;
 	};
 };
@@ -59,7 +59,7 @@ struct expr_bucket {
 struct env {
 	bool empty;
 	u32 reg2expr[REGS_NUM];
-	u32 reg2scev[REGS_NUM]; // TODO: tracking up to 2 registers here should be sufficient
+	u32 reg2scev[REGS_NUM];
 };
 
 #define NUM_BUCKETS 256
@@ -121,8 +121,8 @@ static int add_expr(struct scev *scev, struct expr e)
 	}
 
 	if (!bucket || bucket->cap == bucket->cnt) {
-		new_cap = bucket ? bucket->cap * 2 : 32; // TODO: small step? kvrealloc?
-		bucket = krealloc(bucket, sizeof(*bucket) + sizeof(u32) * new_cap, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+		new_cap = bucket ? bucket->cap * 2 : 32;
+		bucket = kvrealloc(bucket, sizeof(*bucket) + sizeof(u32) * new_cap, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 		if (!bucket)
 			return -ENOMEM;
 		scev->exprs_ht[hash] = bucket;
@@ -492,12 +492,6 @@ static struct env *get_loop_env(struct scev *scev, int insn_idx)
 	return e;
 }
 
-/*
- * TODO: in theory, only need to track live registers and stack slots here.
- *       For live stack slots, can use liveness DFA operating on an approximation,
- *	 taking into account only is_spill_ldx/is_spill_st{,x} instructions.
- *       Should be enough, given that main pass will check assumptions.
- */
 static void setup_initial_loop_env(struct bpf_verifier_env *env, struct env *e, int insn_idx)
 {
 	struct scev *scev = env->scev;
@@ -627,7 +621,7 @@ static int transfer(struct bpf_verifier_env *env, struct env *e, int idx)
 			case 16: sext = SEXT16; break;
 			case 32: sext = SEXT32; break;
 			default:
-				goto mark_dst_unknown; // TODO: this should nuke state instead.
+				goto mark_dst_unknown;
 			}
 
 			if (mode == BPF_X && insn->imm == 0)
@@ -774,14 +768,14 @@ static int transfer(struct bpf_verifier_env *env, struct env *e, int idx)
 			goto mark_dst_unknown;
 		case BPF_LD | BPF_ABS:
 		case BPF_LD | BPF_IND:
-			forget_call_regs(e); // TODO: double check
+			forget_call_regs(e);
 			break;
 		default:
 			goto mark_dst_unknown;
 		}
 		break;
 	default:
-		// unknown instruction, nuke state
+		/* unknown instruction, nuke state */
 		for (i = 0; i < REGS_NUM; i++)
 			reg2expr[i] = UNKNOWN_EXPR_ID;
 		break;
@@ -1468,7 +1462,7 @@ void bpf_free_scev(struct bpf_verifier_env *env)
 	for (i = 0; i < scev->envs_cnt; i++)
 		kfree(scev->envs[i]);
 	for (i = 0; i < ARRAY_SIZE(scev->exprs_ht); i++)
-		kfree(scev->exprs_ht[i]);
+		kvfree(scev->exprs_ht[i]);
 	bpf_min_heap_free(&scev->worklist);
 	kvfree(scev->envs);
 	kvfree(scev->exprs);
@@ -1558,7 +1552,6 @@ static bool loop_invariant(struct scev *scev, u32 id)
 	s64 imm;
 	u32 reg;
 
-	// TODO: recursively traverse expressions
 	return is_reg(scev, id, &reg) || is_imm(scev, id, &imm);
 }
 
@@ -1575,7 +1568,7 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 	u32 dst_reg_scev;
 	int id;
 
-	// TODO: 32-bit variant
+	/* 32-bit arithmetic is not handled yet */
 	if (BPF_CLASS(insn->code) != BPF_JMP)
 		return false;
 	op = BPF_OP(insn->code);
@@ -1583,7 +1576,6 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 	true_branch_tgt = latch_idx + bpf_jmp_offset(insn) + 1;
 	if (bpf_loop_at_index(env, true_branch_tgt) != bpf_loop_at_index(env, latch_idx))
 		op = bpf_rev_opcode(op);
-	// TODO: signed variants
 	switch (op) {
 	case BPF_JSLT:
 	case BPF_JSLE:
@@ -1624,7 +1616,7 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 			return id;
 		latch->base_expr = id;
 		latch->reg_expr = base;
-	} else if (is_add(scev, base, &l, &r) && // TODO: is_sub
+	} else if (is_add(scev, base, &l, &r) &&
 		   is_reg(scev, l, &latch->reg)) {
 		latch->base_expr = r;
 		latch->reg_expr = l;
@@ -1640,14 +1632,6 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 	return true;
 }
 
-/*
- * TODO: consider evaluating expressions to a cnum64 range instead of an exact
- * u64 (returning false on anything non-constant). A range-valued evaluator
- * would let several code paths share one value domain and shed special cases:
- * non-constant operands, multi-term and select expressions, and overflow would
- * all fold into the saturating cnum64 ops (wrap -> top), so is_simple_linear()
- * / linear_bounds() and compute_max_iters() could be expressed more simply.
- */
 static bool eval_expr(struct bpf_verifier_env *env, struct scev *scev, struct bpf_func_state *st, u32 id, u64 *result)
 {
 	struct bpf_reg_state *reg;
@@ -1714,8 +1698,6 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 	struct scev *scev = env->scev;
 	u8 op = latch->op;
 
-	// TODO: group base_expr and reg_expr as a one thing: (+ reg base)
-	//       in eval_expr() support the addition op.
 	if (!eval_expr(env, scev, st, latch->base_expr, &base) ||
 	    !eval_expr(env, scev, st, latch->step_expr, &step) ||
 	    !eval_expr(env, scev, st, latch->bound_expr, &bound) ||
