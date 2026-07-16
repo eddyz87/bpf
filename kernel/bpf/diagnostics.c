@@ -391,7 +391,7 @@ void bpf_diag_free(struct bpf_verifier_env *env)
 		return;
 
 	diag_fmt_free(env);
-	kfree(diag->log.events);
+	kvfree(diag->log.events);
 	kfree(diag->scratch.history_bitmap);
 	kfree(diag);
 	env->diag = NULL;
@@ -427,7 +427,13 @@ static int diag_append_history(struct bpf_verifier_env *env,
 		return log->error;
 	}
 
-	events = krealloc_array(log->events, cap, sizeof(*events), GFP_KERNEL_ACCOUNT);
+	/*
+	 * The log can grow large for programs that record many events on a
+	 * single DFS path, so use kvrealloc() to avoid requiring a huge
+	 * physically contiguous allocation (and the resulting page allocator
+	 * order-limit warning).
+	 */
+	events = kvrealloc(log->events, size_mul(cap, sizeof(*events)), GFP_KERNEL_ACCOUNT);
 	if (!events) {
 		log->error = -ENOMEM;
 		return log->error;
