@@ -16,7 +16,7 @@ struct bpf_verifier_state;
 struct btf;
 
 void bpf_diag_format_btf_type(char *buf, size_t size, const struct btf *btf, u32 type_id);
-void bpf_diag_format_s64_sum(char *buf, size_t size, s64 value, int addend);
+const char *bpf_diag_fmt_s64_sum(struct bpf_verifier_env *env, s64 value, int addend);
 
 enum bpf_diag_mod_reason {
 	BPF_DIAG_MOD_WRITE,
@@ -118,18 +118,11 @@ enum bpf_diag_invalid_deref_kind {
 
 bool bpf_diag_enabled(const struct bpf_verifier_env *env);
 int bpf_diag_init(struct bpf_verifier_env *env);
-char *bpf_diag_scratch_buf(struct bpf_verifier_env *env, unsigned int slot, size_t *size);
 struct bpf_reg_state *bpf_diag_reg_scratch(struct bpf_verifier_env *env, unsigned int slot);
 char *bpf_diag_fmt_buf(struct bpf_verifier_env *env, size_t size);
 const char *bpf_diag_vfmt(struct bpf_verifier_env *env, const char *fmt, va_list args);
 const char *bpf_diag_fmt(struct bpf_verifier_env *env, const char *fmt, ...) __printf(2, 3);
 const char *bpf_diag_fmt_btf_type(struct bpf_verifier_env *env, const struct btf *btf, u32 type_id);
-const char *bpf_diag_scratch_strcpy(struct bpf_verifier_env *env, unsigned int slot,
-				    const char *str);
-const char *bpf_diag_scratch_printf(struct bpf_verifier_env *env, unsigned int slot,
-				    const char *fmt, ...) __printf(3, 4);
-const char *bpf_diag_format_btf_type_scratch(struct bpf_verifier_env *env, unsigned int slot,
-					     const struct btf *btf, u32 type_id);
 const char *bpf_diag_reg_type_plain(struct bpf_verifier_env *env, enum bpf_reg_type type);
 u32 bpf_diag_event_log_pos(struct bpf_verifier_env *env);
 void bpf_diag_event_log_reset(struct bpf_verifier_env *env, u32 pos);

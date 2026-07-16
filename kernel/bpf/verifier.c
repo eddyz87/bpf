@@ -1141,7 +1141,7 @@ static int unmark_stack_slot_irq_flag(struct bpf_verifier_env *env, struct bpf_r
 
 		verbose(env, "irq flag acquired by %s kfuncs cannot be restored with %s kfuncs\n",
 			flag_kfunc, used_kfunc);
-		reason = bpf_diag_scratch_printf(env, 0, fmt, flag_kfunc, used_kfunc);
+		reason = bpf_diag_fmt(env, fmt, flag_kfunc, used_kfunc);
 		bpf_diag_irq(env, env->insn_idx, "IRQ flag restore mismatch", reason,
 			     "Restore the flag with the matching IRQ restore kfunc for the save "
 			     "operation that created it.",
@@ -3685,7 +3685,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		const char *reason;
 
 		verbose(env, "attempt to corrupt spilled pointer on stack\n");
-		reason = bpf_diag_scratch_printf(env, 0, fmt, size, off);
+		reason = bpf_diag_fmt(env, fmt, size, off);
 		bpf_diag_report_memory(env, insn_idx, "stack spill corruption", reason,
 				       "Write the full 8-byte spilled pointer slot, or use a "
 				       "separate stack slot for scalar data before overwriting "
@@ -3997,7 +3997,7 @@ static void bpf_diag_report_stack_read_uninit(struct bpf_verifier_env *env, int 
 			  "program is being rejected without that allowance.";
 	const char *reason;
 
-	reason = bpf_diag_scratch_printf(env, 0, fmt, size, off, i);
+	reason = bpf_diag_fmt(env, fmt, size, off, i);
 	bpf_diag_report_memory(env, env->insn_idx, "uninitialized stack read", reason,
 			       "Initialize every byte in the stack range before reading it, adjust "
 			       "the offset and size so the read covers only initialized bytes, or "
@@ -4256,7 +4256,7 @@ static int check_stack_read(struct bpf_verifier_env *env,
 		tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
 		verbose(env, "variable offset stack pointer cannot be passed into helper function; var_off=%s off=%d size=%d\n",
 			tn_buf, off, size);
-		reason = bpf_diag_scratch_printf(env, 0, fmt, tn_buf, off, size);
+		reason = bpf_diag_fmt(env, fmt, tn_buf, off, size);
 		bpf_diag_report_memory(env, env->insn_idx, "variable stack access", reason,
 				       "Use a fixed stack offset for helper memory arguments, or "
 				       "copy the needed bytes into a fixed stack slot first.");
@@ -4513,8 +4513,7 @@ static int check_mem_region_access(struct bpf_verifier_env *env, struct bpf_reg_
 				   bool zero_size_allowed)
 {
 	const char *proof = "";
-	char *start;
-	size_t start_size;
+	const char *start;
 	s64 max_start, max_end;
 	int err;
 
@@ -4535,12 +4534,11 @@ static int check_mem_region_access(struct bpf_verifier_env *env, struct bpf_reg_
 			reg_arg_name(env, argno));
 		err = -EACCES;
 		if (bpf_diag_enabled(env)) {
-			start = bpf_diag_scratch_buf(env, 2, &start_size);
-			bpf_diag_format_s64_sum(start, start_size, reg_smin(reg), off);
-			proof = bpf_diag_scratch_printf(env, 1,
-							"the minimal bound for a memory access is "
-							"a negative value: %s",
-							start);
+			start = bpf_diag_fmt_s64_sum(env, reg_smin(reg), off);
+			proof = bpf_diag_fmt(env,
+					     "the minimal bound for a memory access is "
+					     "a negative value: %s",
+					     start);
 		}
 		goto report_error;
 	}
@@ -4551,13 +4549,12 @@ static int check_mem_region_access(struct bpf_verifier_env *env, struct bpf_reg_
 		verbose(env, "%s min value is outside of the allowed memory range\n",
 			reg_arg_name(env, argno));
 		if (bpf_diag_enabled(env)) {
-			start = bpf_diag_scratch_buf(env, 2, &start_size);
-			bpf_diag_format_s64_sum(start, start_size, reg_smin(reg), off);
-			proof = bpf_diag_scratch_printf(env, 1,
-							"the minimal bound for a memory access is "
-							"%s and is outside of the object of size "
-							"%u",
-							start, mem_size);
+			start = bpf_diag_fmt_s64_sum(env, reg_smin(reg), off);
+			proof = bpf_diag_fmt(env,
+					     "the minimal bound for a memory access is "
+					     "%s and is outside of the object of size "
+					     "%u",
+					     start, mem_size);
 		}
 		goto report_error;
 	}
@@ -4571,11 +4568,11 @@ static int check_mem_region_access(struct bpf_verifier_env *env, struct bpf_reg_
 			reg_arg_name(env, argno));
 		err = -EACCES;
 		if (bpf_diag_enabled(env))
-			proof = bpf_diag_scratch_printf(env, 1,
-							"the maximal bound for a memory access is "
-							"%llu and exceeds maximum allowed offset "
-							"of %u",
-							reg_umax(reg), BPF_MAX_VAR_OFF);
+			proof = bpf_diag_fmt(env,
+					     "the maximal bound for a memory access is "
+					     "%llu and exceeds maximum allowed offset "
+					     "of %u",
+					     reg_umax(reg), BPF_MAX_VAR_OFF);
 		goto report_error;
 	}
 
@@ -4587,11 +4584,11 @@ static int check_mem_region_access(struct bpf_verifier_env *env, struct bpf_reg_
 		if (bpf_diag_enabled(env)) {
 			max_start = (s64)reg_umax(reg) + off;
 			max_end = max_start + size;
-			proof = bpf_diag_scratch_printf(env, 1,
-							"the maximal bound for a memory access is "
-							"%lld: start %lld + access_size %d, beyond "
-							"object_size %u",
-							max_end, max_start, size, mem_size);
+			proof = bpf_diag_fmt(env,
+					     "the maximal bound for a memory access is "
+					     "%lld: start %lld + access_size %d, beyond "
+					     "object_size %u",
+					     max_end, max_start, size, mem_size);
 		}
 		goto report_error;
 	}
@@ -7832,8 +7829,8 @@ static int process_dynptr_func(struct bpf_verifier_env *env, struct bpf_reg_stat
 		verbose(env,
 			"%s expected pointer to stack or const struct bpf_dynptr\n",
 			reg_arg_name(env, argno));
-		reason = bpf_diag_scratch_printf(env, 0, fmt, reg_arg_name(env, argno),
-						 bpf_diag_reg_type_plain(env, reg->type));
+		reason = bpf_diag_fmt(env, fmt, reg_arg_name(env, argno),
+				      bpf_diag_reg_type_plain(env, reg->type));
 		bpf_diag_res(env, insn_idx, "invalid dynptr argument", reason,
 			     "Pass the address of a stack dynptr object, or use a const dynptr "
 			     "pointer returned by the verifier-supported path.");
@@ -7911,8 +7908,8 @@ static int process_dynptr_func(struct bpf_verifier_env *env, struct bpf_reg_stat
 
 			verbose(env, "Expected a dynptr of type %s as %s\n",
 				dynptr_type_str(expected_type), reg_arg_name(env, argno));
-			reason = bpf_diag_scratch_printf(env, 0, fmt, dynptr_type_str(actual_type),
-							 dynptr_type_str(expected_type));
+			reason = bpf_diag_fmt(env, fmt, dynptr_type_str(actual_type),
+					      dynptr_type_str(expected_type));
 			bpf_diag_res(env, insn_idx, "wrong dynptr type", reason,
 				     "Use a dynptr constructor that matches this operation, or "
 				     "call an operation that accepts the dynptr's current type.");
@@ -7988,8 +7985,8 @@ static int process_iter_arg(struct bpf_verifier_env *env, struct bpf_reg_state *
 
 		verbose(env, "%s expected pointer to an iterator on stack\n",
 			reg_arg_name(env, argno));
-		reason = bpf_diag_scratch_printf(env, 0, fmt, reg_arg_name(env, argno),
-						 bpf_diag_reg_type_plain(env, reg->type));
+		reason = bpf_diag_fmt(env, fmt, reg_arg_name(env, argno),
+				      bpf_diag_reg_type_plain(env, reg->type));
 		bpf_diag_res(env, insn_idx, "invalid iterator argument", reason,
 			     "Pass the address of a stack iterator object for iterator new, next, "
 			     "and destroy calls.");
@@ -10273,7 +10270,7 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "global function calls are not allowed while holding a lock,\n"
 				     "use static function instead\n");
 			operation =
-				bpf_diag_scratch_printf(env, 1, "global function %s()", sub_name);
+				bpf_diag_fmt(env, "global function %s()", sub_name);
 			bpf_diag_ctx(env, BPF_DIAG_CTX_FORBIDDEN, *insn_idx, operation,
 				     BPF_DIAG_CONTEXT_LOCK, "lock region",
 				     "Release the lock before calling the global function, or use "
@@ -10285,8 +10282,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			verbose(env, "sleepable global function %s() called in %s\n",
 				sub_name, non_sleepable_context_description(env));
 			context = non_sleepable_context_diag_description(env);
-			operation = bpf_diag_scratch_printf(
-				env, 1, "sleepable global function %s()", sub_name);
+			operation = bpf_diag_fmt(
+				env, "sleepable global function %s()", sub_name);
 			bpf_diag_ctx(env, BPF_DIAG_CTX_FORBIDDEN, *insn_idx, operation,
 				     non_sleepable_context_kind(env), context,
 				     "Move the call outside the critical section, or use a "
@@ -11152,8 +11149,8 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	if (err) {
 		verbose(env, "program of this type cannot use helper %s#%d\n",
 			func_id_name(func_id), func_id);
-		operation = bpf_diag_scratch_printf(env, 1, "helper %s#%d", func_id_name(func_id),
-						    func_id);
+		operation = bpf_diag_fmt(env, "helper %s#%d", func_id_name(func_id),
+					 func_id);
 		bpf_diag_report_policy(env, insn_idx, operation,
 				       "this program type does not allow the helper",
 				       "Use a helper allowed for this program type, or move the "
@@ -11164,8 +11161,8 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	/* eBPF programs must be GPL compatible to use GPL-ed functions */
 	if (!env->prog->gpl_compatible && fn->gpl_only) {
 		verbose(env, "cannot call GPL-restricted function from non-GPL compatible program\n");
-		operation = bpf_diag_scratch_printf(env, 1, "helper %s#%d", func_id_name(func_id),
-						    func_id);
+		operation = bpf_diag_fmt(env, "helper %s#%d", func_id_name(func_id),
+					 func_id);
 		bpf_diag_report_policy(env, insn_idx, operation,
 				       "this helper is restricted to GPL-compatible programs",
 				       "Use a GPL-compatible license, or replace the helper with "
@@ -11175,8 +11172,8 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 
 	if (fn->allowed && !fn->allowed(env->prog)) {
 		verbose(env, "helper call is not allowed in probe\n");
-		operation = bpf_diag_scratch_printf(env, 1, "helper %s#%d", func_id_name(func_id),
-						    func_id);
+		operation = bpf_diag_fmt(env, "helper %s#%d", func_id_name(func_id),
+					 func_id);
 		bpf_diag_report_policy(env, insn_idx, operation,
 				       "the helper-specific policy callback rejected this program",
 				       "Use the helper only from an allowed attach point or "
@@ -11203,8 +11200,8 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	if (fn->might_sleep && !in_sleepable_context(env)) {
 		verbose(env, "sleepable helper %s#%d in %s\n", func_id_name(func_id), func_id,
 			non_sleepable_context_description(env));
-		operation = bpf_diag_scratch_printf(env, 1, "sleepable helper %s#%d",
-						    func_id_name(func_id), func_id);
+		operation = bpf_diag_fmt(env, "sleepable helper %s#%d",
+					 func_id_name(func_id), func_id);
 		bpf_diag_ctx(env, BPF_DIAG_CTX_FORBIDDEN, insn_idx, operation,
 			     non_sleepable_context_kind(env),
 			     non_sleepable_context_diag_description(env),
@@ -14103,7 +14100,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	err = bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta);
 	if (err == -EACCES && meta.func_name) {
 		verbose(env, "calling kernel function %s is not allowed\n", meta.func_name);
-		operation = bpf_diag_scratch_printf(env, 1, "kfunc %s", meta.func_name);
+		operation = bpf_diag_fmt(env, "kfunc %s", meta.func_name);
 		bpf_diag_report_policy(env, insn_idx, operation,
 				       "this program cannot call the kfunc",
 				       "Use a kfunc allowed for this program type and attach "
@@ -14149,7 +14146,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	if (is_kfunc_destructive(&meta) && !capable(CAP_SYS_BOOT)) {
 		verbose(env, "destructive kfunc calls require CAP_SYS_BOOT capability\n");
-		operation = bpf_diag_scratch_printf(env, 1, "destructive kfunc %s", meta.func_name);
+		operation = bpf_diag_fmt(env, "destructive kfunc %s", meta.func_name);
 		bpf_diag_report_policy(env, insn_idx, operation,
 				       "destructive kfuncs require CAP_SYS_BOOT",
 				       "Load the program with CAP_SYS_BOOT, or avoid destructive "
@@ -14160,7 +14157,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	sleepable = bpf_is_kfunc_sleepable(&meta);
 	if (sleepable && !in_sleepable(env)) {
 		verbose(env, "program must be sleepable to call sleepable kfunc %s\n", func_name);
-		operation = bpf_diag_scratch_printf(env, 1, "sleepable kfunc %s", func_name);
+		operation = bpf_diag_fmt(env, "sleepable kfunc %s", func_name);
 		bpf_diag_ctx(env, BPF_DIAG_CTX_FORBIDDEN, insn_idx, operation,
 			     BPF_DIAG_CONTEXT_NONE, "non-sleepable program",
 			     "Mark the program sleepable if the program type allows it, or use a "
@@ -14272,7 +14269,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (sleepable && !in_sleepable_context(env)) {
 		verbose(env, "kernel func %s is sleepable within %s\n",
 			func_name, non_sleepable_context_description(env));
-		operation = bpf_diag_scratch_printf(env, 1, "sleepable kfunc %s", func_name);
+		operation = bpf_diag_fmt(env, "sleepable kfunc %s", func_name);
 		bpf_diag_ctx(env, BPF_DIAG_CTX_FORBIDDEN, insn_idx, operation,
 			     non_sleepable_context_kind(env),
 			     non_sleepable_context_diag_description(env),
@@ -14913,12 +14910,12 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 		verbose(env,
 			"R%d 32-bit pointer arithmetic prohibited\n",
 			dst);
-		reason = bpf_diag_scratch_printf(env, 0,
-						 "R%d holds %s. 32-bit ALU operations on pointers "
-						 "discard pointer tracking, so the verifier cannot "
-						 "keep the result as a safe pointer.",
-						 ptr_regno,
-						 bpf_diag_reg_type_plain(env, ptr_reg->type));
+		reason = bpf_diag_fmt(env,
+				      "R%d holds %s. 32-bit ALU operations on pointers "
+				      "discard pointer tracking, so the verifier cannot "
+				      "keep the result as a safe pointer.",
+				      ptr_regno,
+				      bpf_diag_reg_type_plain(env, ptr_reg->type));
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "32-bit pointer arithmetic", reason,
 					      "Use a 64-bit ALU instruction with an allowed, "
@@ -14929,11 +14926,11 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 	if (ptr_reg->type & PTR_MAYBE_NULL) {
 		verbose(env, "R%d pointer arithmetic on %s prohibited, null-check it first\n",
 			dst, reg_type_str(env, ptr_reg->type));
-		reason = bpf_diag_scratch_printf(env, 0,
-						 "R%d may be NULL (%s). Pointer arithmetic is "
-						 "allowed only after the program proves the "
-						 "pointer is non-NULL on this path.",
-						 ptr_regno, reg_type_str(env, ptr_reg->type));
+		reason = bpf_diag_fmt(env,
+				      "R%d may be NULL (%s). Pointer arithmetic is "
+				      "allowed only after the program proves the "
+				      "pointer is non-NULL on this path.",
+				      ptr_regno, reg_type_str(env, ptr_reg->type));
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "pointer arithmetic before NULL check", reason,
 					      "Make sure that a NULL check precedes any arithmetic "
@@ -14974,8 +14971,8 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 	default:
 		verbose(env, "R%d pointer arithmetic on %s prohibited\n",
 			dst, reg_type_str(env, ptr_reg->type));
-		reason = bpf_diag_scratch_printf(
-			env, 0, "R%d holds %s. This pointer kind does not allow offset arithmetic.",
+		reason = bpf_diag_fmt(
+			env, "R%d holds %s. This pointer kind does not allow offset arithmetic.",
 			ptr_regno, bpf_diag_reg_type_plain(env, ptr_reg->type));
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "pointer arithmetic is not allowed", reason,
@@ -14991,11 +14988,11 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 	dst_reg->id = ptr_reg->id;
 
 	if (!check_reg_sane_offset_scalar(env, off_reg, ptr_reg->type)) {
-		reason = bpf_diag_scratch_printf(env, 0,
-						 "The scalar offset used with R%d is unbounded or "
-						 "outside the verifier's safe pointer-offset range "
-						 "[-%u, %u].",
-						 ptr_regno, BPF_MAX_VAR_OFF, BPF_MAX_VAR_OFF);
+		reason = bpf_diag_fmt(env,
+				      "The scalar offset used with R%d is unbounded or "
+				      "outside the verifier's safe pointer-offset range "
+				      "[-%u, %u].",
+				      ptr_regno, BPF_MAX_VAR_OFF, BPF_MAX_VAR_OFF);
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "pointer offset is not safe", reason,
 					      "Clamp or bounds-check the scalar offset before "
@@ -15003,11 +15000,11 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 		return -EINVAL;
 	}
 	if (!check_reg_sane_offset_ptr(env, ptr_reg, ptr_reg->type)) {
-		reason = bpf_diag_scratch_printf(env, 0,
-						 "R%d already has an offset outside the verifier's "
-						 "safe range [-%u, %u] for %s.",
-						 ptr_regno, BPF_MAX_VAR_OFF, BPF_MAX_VAR_OFF,
-						 bpf_diag_reg_type_plain(env, ptr_reg->type));
+		reason = bpf_diag_fmt(env,
+				      "R%d already has an offset outside the verifier's "
+				      "safe range [-%u, %u] for %s.",
+				      ptr_regno, BPF_MAX_VAR_OFF, BPF_MAX_VAR_OFF,
+				      bpf_diag_reg_type_plain(env, ptr_reg->type));
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "pointer offset is not safe", reason,
 					      "Keep the base pointer within the verifier's allowed "
@@ -15056,13 +15053,13 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 			/* scalar -= pointer.  Creates an unknown scalar */
 			verbose(env, "R%d tried to subtract pointer from scalar\n",
 				dst);
-			reason = bpf_diag_scratch_printf(env, 0,
-							 "This operation subtracts pointer "
-							 "register R%d from scalar register R%d. "
-							 "The verifier only tracks "
-							 "pointer-minus-scalar arithmetic for "
-							 "allowed pointer types.",
-							 ptr_regno, dst);
+			reason = bpf_diag_fmt(env,
+					      "This operation subtracts pointer "
+					      "register R%d from scalar register R%d. "
+					      "The verifier only tracks "
+					      "pointer-minus-scalar arithmetic for "
+					      "allowed pointer types.",
+					      ptr_regno, dst);
 			bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 						      "pointer subtracted from scalar", reason,
 						      "Keep the pointer as the base; only add or "
@@ -15076,11 +15073,11 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 		if (ptr_reg->type == PTR_TO_STACK) {
 			verbose(env, "R%d subtraction from stack pointer prohibited\n",
 				dst);
-			reason = bpf_diag_scratch_printf(env, 0,
-							 "R%d is a stack pointer. The verifier "
-							 "does not allow BPF_SUB to move stack "
-							 "pointers.",
-							 ptr_regno);
+			reason = bpf_diag_fmt(env,
+					      "R%d is a stack pointer. The verifier "
+					      "does not allow BPF_SUB to move stack "
+					      "pointers.",
+					      ptr_regno);
 			bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 						      "subtraction from stack pointer", reason,
 						      "Use addition from R10 to form stack "
@@ -15110,12 +15107,12 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 		/* bitwise ops on pointers are troublesome, prohibit. */
 		verbose(env, "R%d bitwise operator %s on pointer prohibited\n",
 			dst, bpf_alu_string[opcode >> 4]);
-		reason = bpf_diag_scratch_printf(env, 0,
-						 "R%d holds %s. Bitwise operator %s would destroy "
-						 "the pointer value the verifier is tracking.",
-						 ptr_regno,
-						 bpf_diag_reg_type_plain(env, ptr_reg->type),
-						 bpf_alu_string[opcode >> 4]);
+		reason = bpf_diag_fmt(env,
+				      "R%d holds %s. Bitwise operator %s would destroy "
+				      "the pointer value the verifier is tracking.",
+				      ptr_regno,
+				      bpf_diag_reg_type_plain(env, ptr_reg->type),
+				      bpf_alu_string[opcode >> 4]);
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "bitwise operation on pointer", reason,
 					      "Do bitwise operations on scalar values, not on "
@@ -15125,13 +15122,13 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 		/* other operators (e.g. MUL,LSH) produce non-pointer results */
 		verbose(env, "R%d pointer arithmetic with %s operator prohibited\n",
 			dst, bpf_alu_string[opcode >> 4]);
-		reason = bpf_diag_scratch_printf(env, 0,
-						 "R%d holds %s. Operator %s is not one of the "
-						 "limited pointer arithmetic operations the "
-						 "verifier can track.",
-						 ptr_regno,
-						 bpf_diag_reg_type_plain(env, ptr_reg->type),
-						 bpf_alu_string[opcode >> 4]);
+		reason = bpf_diag_fmt(env,
+				      "R%d holds %s. Operator %s is not one of the "
+				      "limited pointer arithmetic operations the "
+				      "verifier can track.",
+				      ptr_regno,
+				      bpf_diag_reg_type_plain(env, ptr_reg->type),
+				      bpf_alu_string[opcode >> 4]);
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "invalid pointer arithmetic operator", reason,
 					      "Use only verifier-supported addition or subtraction "
@@ -15141,11 +15138,11 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env, struct bpf_insn
 	}
 
 	if (!check_reg_sane_offset_ptr(env, dst_reg, ptr_reg->type)) {
-		reason = bpf_diag_scratch_printf(env, 0,
-						 "After this arithmetic, R%d would be outside the "
-						 "verifier's safe offset range [-%u, %u] for %s.",
-						 dst, BPF_MAX_VAR_OFF, BPF_MAX_VAR_OFF,
-						 bpf_diag_reg_type_plain(env, ptr_reg->type));
+		reason = bpf_diag_fmt(env,
+				      "After this arithmetic, R%d would be outside the "
+				      "verifier's safe offset range [-%u, %u] for %s.",
+				      dst, BPF_MAX_VAR_OFF, BPF_MAX_VAR_OFF,
+				      bpf_diag_reg_type_plain(env, ptr_reg->type));
 		bpf_diag_report_register_type(env, env->insn_idx, ptr_regno,
 					      "pointer offset is not safe", reason,
 					      "Tighten the scalar bounds before the arithmetic so "

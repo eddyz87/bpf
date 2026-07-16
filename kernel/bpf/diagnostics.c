@@ -33,12 +33,9 @@
 #define BPF_DIAG_CONTEXT_CNT (1 + BPF_DIAG_CONTEXT * 2)
 #define BPF_DIAG_SOURCE_LANE_WIDTH 88
 #define BPF_DIAG_TAB_WIDTH 8
-#define BPF_DIAG_REG_DESC_LEN 512
-#define BPF_DIAG_REG_TMP_LEN 192
-#define BPF_DIAG_SCRATCH_STR_CNT 3
-#define BPF_DIAG_SCRATCH_STR_LEN 256
 #define BPF_DIAG_SCRATCH_REG_CNT CALLER_SAVED_REGS
 #define BPF_DIAG_TEXT_LEN 160
+#define BPF_DIAG_BTF_NAME_LEN 256
 
 struct bpf_diag_reg_snapshot {
 	u32 type;
@@ -143,32 +140,23 @@ struct bpf_diag_log {
 	int error;
 };
 
-struct bpf_diag_reg_fmt {
-	char old_buf[BPF_DIAG_REG_DESC_LEN];
-	char new_buf[BPF_DIAG_REG_DESC_LEN];
-	char offset_desc[BPF_DIAG_REG_DESC_LEN];
-	char btf_type[BPF_DIAG_REG_TMP_LEN];
-	char range[BPF_DIAG_REG_TMP_LEN];
-	char smin_buf[32];
-	char smax_buf[32];
-	char umin_buf[32];
-	char umax_buf[32];
-};
-
+/*
+ * Diagnostic text is built with one allocation per string, tracked on a list
+ * and freed wholesale when verification ends. diag_fmt_mark()/diag_fmt_rewind()
+ * free a bounded scope on demand (used by the causal-history loop).
+ */
 struct bpf_diag_fmt_buf {
 	struct list_head node;
 	char data[];
 };
 
 struct bpf_diag_scratch {
-	char str[BPF_DIAG_SCRATCH_STR_CNT][BPF_DIAG_SCRATCH_STR_LEN];
 	struct bpf_reg_state regs[BPF_DIAG_SCRATCH_REG_CNT];
 	struct bpf_linfo_source source;
 	struct bpf_diag_source_line source_lines[BPF_DIAG_CONTEXT_CNT];
 	struct bpf_diag_insn insns[BPF_DIAG_CONTEXT_CNT];
 	unsigned long *history_bitmap;
 	u32 history_bitmap_nbits;
-	struct bpf_diag_reg_fmt reg_fmt;
 };
 
 struct bpf_diag {
@@ -207,27 +195,6 @@ static struct bpf_diag_scratch *diag_scratch(struct bpf_verifier_env *env)
 	return diag ? &diag->scratch : NULL;
 }
 
-char *bpf_diag_scratch_buf(struct bpf_verifier_env *env, unsigned int slot, size_t *size)
-{
-	struct bpf_diag_scratch *scratch = diag_scratch(env);
-	char *buf = NULL;
-	size_t buf_size = 0;
-
-	if (!scratch)
-		goto out;
-
-	if ((unsigned int)slot >= BPF_DIAG_SCRATCH_STR_CNT)
-		goto out;
-
-	buf = scratch->str[slot];
-	buf_size = sizeof(scratch->str[slot]);
-
-out:
-	if (size)
-		*size = buf_size;
-	return buf;
-}
-
 static void diag_fmt_set_error(struct bpf_diag *diag, int error)
 {
 	if (!diag->log.error)
@@ -249,6 +216,33 @@ static char *diag_fmt_alloc(struct bpf_verifier_env *env, size_t size)
 	}
 	list_add_tail(&buf->node, &diag->fmt_bufs);
 	return buf->data;
+}
+
+/*
+ * Snapshot the tail of the allocation list. diag_fmt_rewind() later frees
+ * everything allocated after the mark, recycling a bounded scope without
+ * touching strings allocated before it.
+ */
+static struct list_head *diag_fmt_mark(struct bpf_verifier_env *env)
+{
+	struct bpf_diag *diag = diag_env(env);
+
+	return diag ? diag->fmt_bufs.prev : NULL;
+}
+
+static void diag_fmt_rewind(struct bpf_verifier_env *env, struct list_head *mark)
+{
+	struct bpf_diag *diag = diag_env(env);
+	struct list_head *pos, *tmp;
+
+	if (!diag || !mark)
+		return;
+
+	for (pos = mark->next; pos != &diag->fmt_bufs; pos = tmp) {
+		tmp = pos->next;
+		list_del(pos);
+		kfree(list_entry(pos, struct bpf_diag_fmt_buf, node));
+	}
 }
 
 char *bpf_diag_fmt_buf(struct bpf_verifier_env *env, size_t size)
@@ -299,12 +293,12 @@ const char *bpf_diag_fmt(struct bpf_verifier_env *env, const char *fmt, ...)
 
 const char *bpf_diag_fmt_btf_type(struct bpf_verifier_env *env, const struct btf *btf, u32 type_id)
 {
-	char *buf = bpf_diag_fmt_buf(env, BPF_DIAG_SCRATCH_STR_LEN);
+	char *buf = bpf_diag_fmt_buf(env, BPF_DIAG_BTF_NAME_LEN);
 
 	if (!buf)
 		return "";
 
-	bpf_diag_format_btf_type(buf, BPF_DIAG_SCRATCH_STR_LEN, btf, type_id);
+	bpf_diag_format_btf_type(buf, BPF_DIAG_BTF_NAME_LEN, btf, type_id);
 	return buf;
 }
 
@@ -320,34 +314,6 @@ static void diag_fmt_free(struct bpf_verifier_env *env)
 		list_del(&buf->node);
 		kfree(buf);
 	}
-}
-
-const char *bpf_diag_scratch_strcpy(struct bpf_verifier_env *env, unsigned int slot,
-				    const char *str)
-{
-	size_t size;
-	char *buf = bpf_diag_scratch_buf(env, slot, &size);
-
-	if (!buf)
-		return "";
-	strscpy(buf, str ?: "", size);
-	return buf;
-}
-
-const char *bpf_diag_scratch_printf(struct bpf_verifier_env *env, unsigned int slot,
-				    const char *fmt, ...)
-{
-	size_t size;
-	va_list args;
-	char *buf = bpf_diag_scratch_buf(env, slot, &size);
-
-	if (!buf)
-		return "";
-
-	va_start(args, fmt);
-	vscnprintf(buf, size, fmt, args);
-	va_end(args);
-	return buf;
 }
 
 struct bpf_reg_state *bpf_diag_reg_scratch(struct bpf_verifier_env *env, unsigned int slot)
@@ -532,19 +498,6 @@ void bpf_diag_format_btf_type(char *buf, size_t size, const struct btf *btf, u32
 	len = strlen(buf);
 	if (len && buf[len - 1] == '{')
 		buf[len - 1] = '\0';
-}
-
-const char *bpf_diag_format_btf_type_scratch(struct bpf_verifier_env *env, unsigned int slot,
-					     const struct btf *btf, u32 type_id)
-{
-	size_t size;
-	char *buf = bpf_diag_scratch_buf(env, slot, &size);
-
-	if (!buf)
-		return "";
-
-	bpf_diag_format_btf_type(buf, size, btf, type_id);
-	return buf;
 }
 
 static void diag_vprint_indented(struct bpf_verifier_env *env, const char *fmt, va_list args)
@@ -777,12 +730,12 @@ static void diag_format_source_lane(char *buf, size_t size, const char *source_p
 static void diag_print_source_line(struct bpf_verifier_env *env, const char *source_prefix,
 				   int source_line_width, const struct bpf_diag_source_line *line)
 {
-	size_t source_lane_size;
-	char *source_lane;
+	char *source_lane = bpf_diag_fmt_buf(env, BPF_DIAG_SOURCE_LANE_WIDTH + 8);
 
-	source_lane = bpf_diag_scratch_buf(env, 0, &source_lane_size);
-	diag_format_source_lane(source_lane, source_lane_size, source_prefix, source_line_width,
-				line->line_num, line->line);
+	if (!source_lane)
+		return;
+	diag_format_source_lane(source_lane, BPF_DIAG_SOURCE_LANE_WIDTH + 8, source_prefix,
+				source_line_width, line->line_num, line->line);
 	diag_write(env, "  %s\n", source_lane);
 }
 
@@ -859,12 +812,9 @@ static void diag_report_suggestion(struct bpf_verifier_env *env, const char *fmt
 static void diag_print_source_annotation(struct bpf_verifier_env *env, int line_width, int indent,
 					 const char *label, const char *msg)
 {
-	size_t first_prefix_size, next_prefix_size;
-	char *first_prefix, *next_prefix;
+	const char *first_prefix, *next_prefix;
 	char *text;
 
-	first_prefix = bpf_diag_scratch_buf(env, 0, &first_prefix_size);
-	next_prefix = bpf_diag_scratch_buf(env, 1, &next_prefix_size);
 	indent = min_t(int, indent, max_t(int, 0, BPF_DIAG_SOURCE_LANE_WIDTH - line_width - 8));
 	text = kasprintf(GFP_KERNEL_ACCOUNT, "%s: %s", label, msg);
 	if (!text) {
@@ -873,9 +823,8 @@ static void diag_print_source_annotation(struct bpf_verifier_env *env, int line_
 		return;
 	}
 
-	scnprintf(first_prefix, first_prefix_size, "  %*s | %*s^-- ", line_width + 4, "", indent,
-		  "");
-	scnprintf(next_prefix, next_prefix_size, "  %*s | %*s    ", line_width + 4, "", indent, "");
+	first_prefix = bpf_diag_fmt(env, "  %*s | %*s^-- ", line_width + 4, "", indent, "");
+	next_prefix = bpf_diag_fmt(env, "  %*s | %*s    ", line_width + 4, "", indent, "");
 
 	diag_print_wrapped_prefixed(env, first_prefix, next_prefix, text);
 	kfree(text);
@@ -1110,7 +1059,6 @@ void bpf_diag_report_call_type(struct bpf_verifier_env *env, u32 insn_idx, int a
 		diag_print_history(env, &opts);
 
 	diag_report_suggestion(env, "%s", suggestion);
-	diag_fmt_free(env);
 }
 
 static const char *diag_context_constraint(enum bpf_diag_context_kind kind)
@@ -1130,12 +1078,11 @@ static const char *diag_context_constraint(enum bpf_diag_context_kind kind)
 	}
 }
 
-static void diag_format_active_context(char *buf, size_t size, u32 depth, const char *context)
+static const char *diag_active_context(struct bpf_verifier_env *env, u32 depth, const char *context)
 {
 	if (depth == 1)
-		scnprintf(buf, size, "an active %s (depth 1)", context);
-	else
-		scnprintf(buf, size, "%u active %ss (depth %u)", depth, context, depth);
+		return bpf_diag_fmt(env, "an active %s (depth 1)", context);
+	return bpf_diag_fmt(env, "%u active %ss (depth %u)", depth, context, depth);
 }
 
 static u32 diag_context_depth(struct bpf_verifier_env *env, enum bpf_diag_context_kind kind)
@@ -1165,24 +1112,16 @@ static void diag_ctx_forbidden(struct bpf_verifier_env *env, u32 insn_idx, const
 		.ctx_kind = ctx_kind,
 		.ctx_depth = depth,
 	};
-	const char *depth_buf;
 
 	bpf_diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY,
 			       "operation is not allowed in this context");
 	if (diag_context_constraint(ctx_kind)) {
 		if (depth) {
-			depth_buf = bpf_diag_scratch_buf(env, 2, NULL);
-			if (depth_buf)
-				diag_format_active_context((char *)depth_buf,
-							   BPF_DIAG_SCRATCH_STR_LEN, depth,
-							   context);
-			else
-				depth_buf = "";
 			diag_report_reason(env,
 					   "The operation %s cannot be used in %s because %s. This "
 					   "path is still inside %s.",
 					   operation, context, diag_context_constraint(ctx_kind),
-					   depth_buf);
+					   diag_active_context(env, depth, context));
 		} else {
 			diag_report_reason(env, "The operation %s cannot be used in %s because %s.",
 					   operation, context, diag_context_constraint(ctx_kind));
@@ -1212,21 +1151,13 @@ static void diag_ctx_active(struct bpf_verifier_env *env, u32 insn_idx, const ch
 		.ctx_kind = ctx_kind,
 		.ctx_depth = depth,
 	};
-	const char *depth_buf;
-
-	depth_buf = bpf_diag_scratch_buf(env, 2, NULL);
-	if (depth_buf)
-		diag_format_active_context((char *)depth_buf, BPF_DIAG_SCRATCH_STR_LEN, depth,
-					   context);
-	else
-		depth_buf = "";
 
 	bpf_diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY,
 			       "operation is not allowed in this context");
 	diag_report_reason(env,
 			   "The operation %s cannot be used while this path is still inside %s. "
 			   "Leave the region before this operation.",
-			   operation, depth_buf);
+			   operation, diag_active_context(env, depth, context));
 
 	diag_report_section(env, "At");
 	bpf_diag_report_source(env, insn_idx, "error", "%s is not allowed before leaving %s",
@@ -1497,20 +1428,20 @@ static int diag_stack_argno(u8 slot)
 	return MAX_BPF_FUNC_REG_ARGS + slot + 1;
 }
 
-static void diag_format_stack_arg(char *buf, size_t size, u8 slot, const char *arg_name)
+static const char *diag_stack_arg(struct bpf_verifier_env *env, u8 slot, const char *arg_name)
 {
 	int argno = diag_stack_argno(slot);
 	const char *ordinal = diag_arg_ordinal(argno);
 
 	if (ordinal && arg_name)
-		scnprintf(buf, size, "outgoing stack argument %u (%s argument, %s)", slot + 1,
-			  ordinal, arg_name);
-	else if (ordinal)
-		scnprintf(buf, size, "outgoing stack argument %u (%s argument)", slot + 1, ordinal);
-	else if (arg_name)
-		scnprintf(buf, size, "outgoing stack argument %u (%s)", slot + 1, arg_name);
-	else
-		scnprintf(buf, size, "outgoing stack argument %u", slot + 1);
+		return bpf_diag_fmt(env, "outgoing stack argument %u (%s argument, %s)", slot + 1,
+				    ordinal, arg_name);
+	if (ordinal)
+		return bpf_diag_fmt(env, "outgoing stack argument %u (%s argument)", slot + 1,
+				    ordinal);
+	if (arg_name)
+		return bpf_diag_fmt(env, "outgoing stack argument %u (%s)", slot + 1, arg_name);
+	return bpf_diag_fmt(env, "outgoing stack argument %u", slot + 1);
 }
 
 void bpf_diag_report_stack_arg_uninit(struct bpf_verifier_env *env, u32 insn_idx, int nargs,
@@ -1522,14 +1453,8 @@ void bpf_diag_report_stack_arg_uninit(struct bpf_verifier_env *env, u32 insn_idx
 		.frameno = diag_current_frameno(env),
 		.stack_arg_slot = stack_arg_slot,
 	};
-	const char *arg_buf;
+	const char *arg_buf = diag_stack_arg(env, stack_arg_slot, arg_name);
 
-	arg_buf = bpf_diag_scratch_buf(env, 1, NULL);
-	if (arg_buf)
-		diag_format_stack_arg((char *)arg_buf, BPF_DIAG_SCRATCH_STR_LEN, stack_arg_slot,
-				      arg_name);
-	else
-		arg_buf = "";
 	bpf_diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, "missing stack argument");
 	if (callee_name && *callee_name)
 		diag_report_reason(env,
@@ -1954,24 +1879,14 @@ static const char *diag_u64_bound_name(u64 value)
 	return NULL;
 }
 
-static void diag_format_s64_value(char *buf, size_t size, s64 value)
+static const char *diag_s64_str(struct bpf_verifier_env *env, s64 value)
 {
-	const char *name = diag_s64_bound_name(value);
-
-	if (name)
-		strscpy(buf, name, size);
-	else
-		scnprintf(buf, size, "%lld", value);
+	return diag_s64_bound_name(value) ?: bpf_diag_fmt(env, "%lld", value);
 }
 
-static void diag_format_u64_value(char *buf, size_t size, u64 value)
+static const char *diag_u64_str(struct bpf_verifier_env *env, u64 value)
 {
-	const char *name = diag_u64_bound_name(value);
-
-	if (name)
-		strscpy(buf, name, size);
-	else
-		scnprintf(buf, size, "%llu", value);
+	return diag_u64_bound_name(value) ?: bpf_diag_fmt(env, "%llu", value);
 }
 
 static bool diag_range_unknown(s64 smin, s64 smax, u64 umin, u64 umax)
@@ -1990,74 +1905,44 @@ static bool diag_snapshot_unknown(const struct bpf_diag_reg_snapshot *snapshot)
 	return tnum_is_unknown(snapshot->var_off) && diag_cnum64_unknown(snapshot->r64);
 }
 
-static void diag_format_scalar_range(struct bpf_diag_reg_fmt *fmt, char *buf, size_t size,
-				     struct cnum64 range)
+static const char *diag_scalar_range(struct bpf_verifier_env *env, struct cnum64 range)
 {
-	s64 smin = cnum64_smin(range);
-	s64 smax = cnum64_smax(range);
-	u64 umin = cnum64_umin(range);
-	u64 umax = cnum64_umax(range);
-
-	diag_format_s64_value(fmt->smin_buf, sizeof(fmt->smin_buf), smin);
-	diag_format_s64_value(fmt->smax_buf, sizeof(fmt->smax_buf), smax);
-	diag_format_u64_value(fmt->umin_buf, sizeof(fmt->umin_buf), umin);
-	diag_format_u64_value(fmt->umax_buf, sizeof(fmt->umax_buf), umax);
-
-	scnprintf(buf, size, "signed range [%s, %s], unsigned range [%s, %s]", fmt->smin_buf,
-		  fmt->smax_buf, fmt->umin_buf, fmt->umax_buf);
+	return bpf_diag_fmt(env, "signed range [%s, %s], unsigned range [%s, %s]",
+			    diag_s64_str(env, cnum64_smin(range)),
+			    diag_s64_str(env, cnum64_smax(range)),
+			    diag_u64_str(env, cnum64_umin(range)),
+			    diag_u64_str(env, cnum64_umax(range)));
 }
 
-void bpf_diag_format_s64_sum(char *buf, size_t size, s64 value, int addend)
+const char *bpf_diag_fmt_s64_sum(struct bpf_verifier_env *env, s64 value, int addend)
 {
 	s64 sum;
 
-	if (check_add_overflow(value, (s64)addend, &sum)) {
-		if (addend < 0)
-			scnprintf(buf, size, "%lld plus %d (below S64_MIN)", value, addend);
-		else
-			scnprintf(buf, size, "%lld plus %d (above S64_MAX)", value, addend);
-		return;
-	}
+	if (check_add_overflow(value, (s64)addend, &sum))
+		return bpf_diag_fmt(env, "%lld plus %d (%s)", value, addend,
+				    addend < 0 ? "below S64_MIN" : "above S64_MAX");
 
-	scnprintf(buf, size, "%lld", sum);
+	return bpf_diag_fmt(env, "%lld", sum);
 }
 
-static void diag_format_access_offset(struct bpf_verifier_env *env, char *buf, size_t size, int off,
+static const char *diag_access_offset(struct bpf_verifier_env *env, int off,
 				      const struct bpf_reg_state *reg)
 {
-	struct bpf_diag_scratch *scratch = diag_scratch(env);
-	struct bpf_diag_reg_fmt *fmt;
-	char *start;
+	if (tnum_is_const(reg->var_off))
+		return bpf_diag_fmt(env, "constant %s",
+				    bpf_diag_fmt_s64_sum(env, (s64)reg->var_off.value, off));
 
-	if (tnum_is_const(reg->var_off)) {
-		start = bpf_diag_scratch_buf(env, 2, NULL);
-		if (!start) {
-			scnprintf(buf, size, "constant");
-			return;
-		}
-		bpf_diag_format_s64_sum(start, BPF_DIAG_SCRATCH_STR_LEN, (s64)reg->var_off.value,
-					off);
-		scnprintf(buf, size, "constant %s", start);
-		return;
-	}
+	if (tnum_is_unknown(reg->var_off) && diag_cnum64_unknown(reg->r64))
+		return bpf_diag_fmt(env, "unbounded");
 
-	if (tnum_is_unknown(reg->var_off) && diag_cnum64_unknown(reg->r64)) {
-		scnprintf(buf, size, "unbounded");
-		return;
-	}
-
-	fmt = &scratch->reg_fmt;
-	memset(fmt, 0, sizeof(*fmt));
-
-	diag_format_scalar_range(fmt, fmt->range, sizeof(fmt->range), reg->r64);
 	if (off)
-		scnprintf(buf, size,
-			  "variable: known bits %#llx, unknown mask %#llx, plus fixed offset %d; "
-			  "%s",
-			  (u64)reg->var_off.value, reg->var_off.mask, off, fmt->range);
-	else
-		scnprintf(buf, size, "variable: known bits %#llx, unknown mask %#llx; %s",
-			  (u64)reg->var_off.value, reg->var_off.mask, fmt->range);
+		return bpf_diag_fmt(env,
+			"variable: known bits %#llx, unknown mask %#llx, plus fixed offset %d; %s",
+			(u64)reg->var_off.value, reg->var_off.mask, off,
+			diag_scalar_range(env, reg->r64));
+	return bpf_diag_fmt(env, "variable: known bits %#llx, unknown mask %#llx; %s",
+			    (u64)reg->var_off.value, reg->var_off.mask,
+			    diag_scalar_range(env, reg->r64));
 }
 
 void bpf_diag_report_mem_bounds(struct bpf_verifier_env *env, u32 insn_idx, int regno,
@@ -2069,14 +1954,12 @@ void bpf_diag_report_mem_bounds(struct bpf_verifier_env *env, u32 insn_idx, int 
 		.frameno = diag_current_frameno(env),
 		.regno = regno,
 	};
-	char *offset_desc;
+	const char *offset_desc;
 
 	if (!bpf_diag_enabled(env))
 		return;
 
-	offset_desc = bpf_diag_scratch_buf(env, 0, NULL);
-
-	diag_format_access_offset(env, offset_desc, BPF_DIAG_SCRATCH_STR_LEN, off, reg);
+	offset_desc = diag_access_offset(env, off, reg);
 
 	bpf_diag_report_header(env, CATEGORY_MEMORY_SAFETY, "access outside bounds");
 	diag_report_reason(env,
@@ -2185,32 +2068,27 @@ void bpf_diag_leak(struct bpf_verifier_env *env, u32 ref_id, u32 alloc_insn, u32
 				    "every path before the program exits.");
 }
 
-static void diag_format_var_offset(struct bpf_diag_reg_fmt *fmt, char *buf, size_t size,
+static const char *diag_var_offset(struct bpf_verifier_env *env,
 				   const struct bpf_diag_reg_snapshot *snapshot)
 {
-	if (tnum_is_const(snapshot->var_off)) {
-		scnprintf(buf, size, "at offset %lld", (s64)snapshot->var_off.value);
-		return;
-	}
+	if (tnum_is_const(snapshot->var_off))
+		return bpf_diag_fmt(env, "at offset %lld", (s64)snapshot->var_off.value);
 
-	if (diag_snapshot_unknown(snapshot)) {
-		scnprintf(buf, size, "with unknown offset");
-		return;
-	}
+	if (diag_snapshot_unknown(snapshot))
+		return bpf_diag_fmt(env, "with unknown offset");
 
-	diag_format_scalar_range(fmt, fmt->range, sizeof(fmt->range), snapshot->r64);
-	scnprintf(buf, size, "with variable offset: known bits %#llx, unknown mask %#llx, %s",
-		  snapshot->var_off.value, snapshot->var_off.mask, fmt->range);
+	return bpf_diag_fmt(env, "with variable offset: known bits %#llx, unknown mask %#llx, %s",
+			    snapshot->var_off.value, snapshot->var_off.mask,
+			    diag_scalar_range(env, snapshot->r64));
 }
 
-static bool diag_format_snapshot_btf_type(char *buf, size_t size,
+static const char *diag_snapshot_btf_type(struct bpf_verifier_env *env,
 					  const struct bpf_diag_reg_snapshot *snapshot)
 {
 	if (!snapshot->btf || !snapshot->btf_id)
-		return false;
+		return NULL;
 
-	bpf_diag_format_btf_type(buf, size, snapshot->btf, snapshot->btf_id);
-	return true;
+	return bpf_diag_fmt_btf_type(env, snapshot->btf, snapshot->btf_id);
 }
 
 static const char *diag_reg_map_name(const struct bpf_map *map)
@@ -2221,104 +2099,69 @@ static const char *diag_reg_map_name(const struct bpf_map *map)
 	return map->name;
 }
 
-static void diag_format_reg_snapshot(struct bpf_verifier_env *env, struct bpf_diag_reg_fmt *fmt,
-				     char *buf, size_t size,
+static const char *diag_reg_snapshot(struct bpf_verifier_env *env,
 				     const struct bpf_diag_reg_snapshot *snapshot)
 {
 	const char *type_name = reg_type_str(env, snapshot->type);
+	const char *offset = diag_var_offset(env, snapshot);
+	const char *btf = diag_snapshot_btf_type(env, snapshot);
 	const char *map_name;
-	bool has_btf_type;
-
-	diag_format_var_offset(fmt, fmt->offset_desc, sizeof(fmt->offset_desc), snapshot);
-	has_btf_type =
-		diag_format_snapshot_btf_type(fmt->btf_type, sizeof(fmt->btf_type), snapshot);
 
 	if (snapshot->type == SCALAR_VALUE) {
-		if (tnum_is_const(snapshot->var_off)) {
-			scnprintf(buf, size, "integer scalar value %lld",
-				  (s64)snapshot->var_off.value);
-			return;
-		}
-
-		if (diag_snapshot_unknown(snapshot)) {
-			scnprintf(buf, size, "integer scalar with unknown value");
-			return;
-		}
-
-		if (cnum64_is_const(snapshot->r64)) {
-			scnprintf(buf, size, "integer scalar value %lld",
-				  cnum64_smin(snapshot->r64));
-			return;
-		}
-
-		diag_format_scalar_range(fmt, fmt->range, sizeof(fmt->range), snapshot->r64);
-		scnprintf(buf, size, "integer scalar with %s", fmt->range);
-		return;
+		if (tnum_is_const(snapshot->var_off))
+			return bpf_diag_fmt(env, "integer scalar value %lld",
+					    (s64)snapshot->var_off.value);
+		if (diag_snapshot_unknown(snapshot))
+			return bpf_diag_fmt(env, "integer scalar with unknown value");
+		if (cnum64_is_const(snapshot->r64))
+			return bpf_diag_fmt(env, "integer scalar value %lld",
+					    cnum64_smin(snapshot->r64));
+		return bpf_diag_fmt(env, "integer scalar with %s",
+				    diag_scalar_range(env, snapshot->r64));
 	}
 
-	if (snapshot->type == NOT_INIT) {
-		scnprintf(buf, size, "uninitialized value");
-		return;
-	}
+	if (snapshot->type == NOT_INIT)
+		return bpf_diag_fmt(env, "uninitialized value");
 
-	if (base_type(snapshot->type) == PTR_TO_CTX) {
-		scnprintf(buf, size, "context pointer %s", fmt->offset_desc);
-		return;
-	}
+	if (base_type(snapshot->type) == PTR_TO_CTX)
+		return bpf_diag_fmt(env, "context pointer %s", offset);
 
-	if (base_type(snapshot->type) == PTR_TO_STACK) {
-		scnprintf(buf, size, "stack pointer %s", fmt->offset_desc);
-		return;
-	}
+	if (base_type(snapshot->type) == PTR_TO_STACK)
+		return bpf_diag_fmt(env, "stack pointer %s", offset);
 
 	if (base_type(snapshot->type) == PTR_TO_MAP_VALUE) {
+		const char *kind = type_may_be_null(snapshot->type) ? "nullable map value" :
+								      "map value";
+
 		map_name = diag_reg_map_name(snapshot->map_ptr);
-		if (map_name) {
-			scnprintf(buf, size, "%s from %s %s",
-				  type_may_be_null(snapshot->type) ? "nullable map value" :
-								     "map value",
-				  map_name, fmt->offset_desc);
-			return;
-		}
-		scnprintf(buf, size, "%s %s",
-			  type_may_be_null(snapshot->type) ? "nullable map value" : "map value",
-			  fmt->offset_desc);
-		return;
+		if (map_name)
+			return bpf_diag_fmt(env, "%s from %s %s", kind, map_name, offset);
+		return bpf_diag_fmt(env, "%s %s", kind, offset);
 	}
 
 	if (base_type(snapshot->type) == CONST_PTR_TO_MAP) {
 		map_name = diag_reg_map_name(snapshot->map_ptr);
 		if (map_name)
-			scnprintf(buf, size, "map pointer for map %s", map_name);
-		else
-			scnprintf(buf, size, "map pointer");
-		return;
+			return bpf_diag_fmt(env, "map pointer for map %s", map_name);
+		return bpf_diag_fmt(env, "map pointer");
 	}
 
 	if (type_is_non_owning_ref(snapshot->type)) {
-		if (has_btf_type)
-			scnprintf(buf, size, "borrowed allocated object pointer type=%s",
-				  fmt->btf_type);
-		else
-			scnprintf(buf, size, "borrowed allocated object pointer");
-		return;
+		if (btf)
+			return bpf_diag_fmt(env, "borrowed allocated object pointer type=%s", btf);
+		return bpf_diag_fmt(env, "borrowed allocated object pointer");
 	}
 
 	if (type_is_ptr_alloc_obj(snapshot->type)) {
-		if (has_btf_type)
-			scnprintf(buf, size, "owned allocated object pointer type=%s",
-				  fmt->btf_type);
-		else
-			scnprintf(buf, size, "owned allocated object pointer");
-		return;
+		if (btf)
+			return bpf_diag_fmt(env, "owned allocated object pointer type=%s", btf);
+		return bpf_diag_fmt(env, "owned allocated object pointer");
 	}
 
-	if (base_type(snapshot->type) == PTR_TO_BTF_ID && has_btf_type) {
-		scnprintf(buf, size, "%s type=%s %s", type_name, fmt->btf_type, fmt->offset_desc);
-		return;
-	}
+	if (base_type(snapshot->type) == PTR_TO_BTF_ID && btf)
+		return bpf_diag_fmt(env, "%s type=%s %s", type_name, btf, offset);
 
-	scnprintf(buf, size, "%s %s", type_name, fmt->offset_desc);
+	return bpf_diag_fmt(env, "%s %s", type_name, offset);
 }
 
 static const char *diag_mod_target_desc(struct bpf_verifier_env *env,
@@ -2326,13 +2169,11 @@ static const char *diag_mod_target_desc(struct bpf_verifier_env *env,
 {
 	switch (target->kind) {
 	case BPF_DIAG_MOD_TARGET_REG:
-		return bpf_diag_scratch_printf(env, 0, "R%u", target->regno);
+		return bpf_diag_fmt(env, "R%u", target->regno);
 	case BPF_DIAG_MOD_TARGET_STACK_ARG:
-		return bpf_diag_scratch_printf(env, 0, "stack arg%d",
-					       diag_stack_argno(target->stack_arg));
+		return bpf_diag_fmt(env, "stack arg%d", diag_stack_argno(target->stack_arg));
 	case BPF_DIAG_MOD_TARGET_STACK_SLOT:
-		return bpf_diag_scratch_printf(env, 0, "stack slot fp%d",
-					       -(target->spi + 1) * BPF_REG_SIZE);
+		return bpf_diag_fmt(env, "stack slot fp%d", -(target->spi + 1) * BPF_REG_SIZE);
 	default:
 		return "value";
 	}
@@ -2340,10 +2181,8 @@ static const char *diag_mod_target_desc(struct bpf_verifier_env *env,
 
 static void diag_print_mod(struct bpf_verifier_env *env, const struct bpf_diag_history_event *event)
 {
-	struct bpf_diag_scratch *scratch = diag_scratch(env);
-	struct bpf_diag_reg_fmt *fmt = &scratch->reg_fmt;
 	const struct bpf_diag_mod_target *target = &event->mod.target;
-	const char *target_desc, *reason = NULL;
+	const char *target_desc, *reason = NULL, *old, *new;
 	const char *label = "update";
 
 	if (target->kind == BPF_DIAG_MOD_TARGET_STACK_RANGE) {
@@ -2354,9 +2193,8 @@ static void diag_print_mod(struct bpf_verifier_env *env, const struct bpf_diag_h
 		return;
 	}
 
-	memset(fmt, 0, sizeof(*fmt));
-	diag_format_reg_snapshot(env, fmt, fmt->old_buf, sizeof(fmt->old_buf), &event->mod.old);
-	diag_format_reg_snapshot(env, fmt, fmt->new_buf, sizeof(fmt->new_buf), &event->mod.new);
+	old = diag_reg_snapshot(env, &event->mod.old);
+	new = diag_reg_snapshot(env, &event->mod.new);
 	target_desc = diag_mod_target_desc(env, target);
 
 	switch (event->mod.reason) {
@@ -2389,13 +2227,12 @@ static void diag_print_mod(struct bpf_verifier_env *env, const struct bpf_diag_h
 
 	if (reason) {
 		bpf_diag_report_source(env, event->insn_idx, "invalidated",
-				       "%s: %s; previous value was %s", target_desc, reason,
-				       fmt->old_buf);
+				       "%s: %s; previous value was %s", target_desc, reason, old);
 		return;
 	}
 
 	bpf_diag_report_source(env, event->insn_idx, label, "%s changed from %s to %s", target_desc,
-			       fmt->old_buf, fmt->new_buf);
+			       old, new);
 }
 
 static void diag_print_ref_event(struct bpf_verifier_env *env,
@@ -2424,6 +2261,7 @@ static void diag_print_history(struct bpf_verifier_env *env,
 		.opts = opts,
 	};
 	const struct bpf_diag_log *log;
+	struct list_head *mark;
 	bool first = true;
 	bool visible = false;
 	int start_idx, err;
@@ -2456,10 +2294,14 @@ static void diag_print_history(struct bpf_verifier_env *env,
 		return;
 
 	diag_report_section(env, "Causal path");
+	mark = diag_fmt_mark(env);
 	for (i = start_idx; i < log->cnt; i++) {
 		event = diag_history_event(log, i);
 		if (!diag_history_event_visible(event, i, &filter))
 			continue;
+
+		/* Reclaim the previous event's formatting scratch. */
+		diag_fmt_rewind(env, mark);
 
 		if (!first)
 			diag_write(env, "\n");
