@@ -168,6 +168,7 @@ void bpf_diag_report_policy(struct bpf_verifier_env *env, u32 insn_idx, const ch
 			    const char *reason, const char *suggestion);
 void bpf_diag_report_limit(struct bpf_verifier_env *env, u32 insn_idx, const char *limit,
 			   const char *suggestion, const char *reason_fmt, ...) __printf(5, 6);
+void bpf_diag_report_jmp_seq(struct bpf_verifier_env *env, u32 insn_idx, u32 n_jumps);
 int bpf_diag_record_branch(struct bpf_verifier_env *env, u32 insn_idx, bool cond_true);
 void bpf_diag_record_mod(struct bpf_verifier_env *env, u32 insn_idx,
 			 struct bpf_diag_mod_target target, enum bpf_diag_mod_reason reason,

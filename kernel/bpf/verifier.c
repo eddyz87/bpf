@@ -1821,6 +1821,7 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
 		verbose(env, "The sequence of %d jumps is too complex.\n",
 			env->stack_size);
+		bpf_diag_report_jmp_seq(env, env->insn_idx, env->stack_size);
 		return ERR_PTR(-E2BIG);
 	}
 	if (elem->st.parent) {

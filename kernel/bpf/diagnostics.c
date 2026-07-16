@@ -1283,6 +1283,30 @@ source:
 	diag_report_suggestion(env, "%s", suggestion);
 }
 
+void bpf_diag_report_jmp_seq(struct bpf_verifier_env *env, u32 insn_idx, u32 n_jumps)
+{
+	struct bpf_diag_history_opts opts = {
+		.scope = BPF_DIAG_HISTORY_SCOPE_ALL,
+	};
+
+	if (!bpf_diag_enabled(env))
+		return;
+
+	bpf_diag_report_header(env, CATEGORY_VERIFIER_LIMIT, "jump sequence too complex");
+	diag_report_reason(env,
+			   "The sequence of %u jumps on this path is too complex to verify. The "
+			   "full branch history recorded for this path is shown below.",
+			   n_jumps);
+
+	diag_report_section(env, "At");
+	bpf_diag_report_source(env, insn_idx, "error", "jump sequence limit exceeded");
+
+	diag_print_history(env, &opts);
+
+	diag_report_suggestion(env, "Simplify the control flow on this path, or add earlier checks "
+				    "so the verifier can prune equivalent states sooner.");
+}
+
 static void diag_internal_error(struct bpf_verifier_env *env, u32 insn_idx, const char *problem,
 				const char *reason)
 {
