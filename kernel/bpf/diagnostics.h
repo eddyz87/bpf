@@ -118,7 +118,6 @@ enum bpf_diag_invalid_deref_kind {
 
 bool bpf_diag_enabled(const struct bpf_verifier_env *env);
 int bpf_diag_init(struct bpf_verifier_env *env);
-struct bpf_reg_state *bpf_diag_reg_scratch(struct bpf_verifier_env *env, unsigned int slot);
 char *bpf_diag_fmt_buf(struct bpf_verifier_env *env, size_t size);
 const char *bpf_diag_vfmt(struct bpf_verifier_env *env, const char *fmt, va_list args);
 const char *bpf_diag_fmt(struct bpf_verifier_env *env, const char *fmt, ...) __printf(2, 3);
@@ -170,10 +169,13 @@ void bpf_diag_report_limit(struct bpf_verifier_env *env, u32 insn_idx, const cha
 			   const char *suggestion, const char *reason_fmt, ...) __printf(5, 6);
 void bpf_diag_report_jmp_seq(struct bpf_verifier_env *env, u32 insn_idx, u32 n_jumps);
 int bpf_diag_record_branch(struct bpf_verifier_env *env, u32 insn_idx, bool cond_true);
-void bpf_diag_record_mod(struct bpf_verifier_env *env, u32 insn_idx,
-			 struct bpf_diag_mod_target target, enum bpf_diag_mod_reason reason,
-			 const struct bpf_reg_state *old_reg, const struct bpf_reg_state *new_reg,
-			 const struct bpf_diag_mod_target *origin);
+void bpf_diag_mod_begin(struct bpf_verifier_env *env, const struct bpf_reg_state *reg,
+			const struct bpf_reg_state *origin, enum bpf_diag_mod_reason reason);
+void bpf_diag_mod_end(struct bpf_verifier_env *env);
+void bpf_diag_record_scrub(struct bpf_verifier_env *env, const struct bpf_reg_state *reg,
+			   enum bpf_diag_mod_reason reason);
+void bpf_diag_record_scrub_stack(struct bpf_verifier_env *env, u32 frameno, s16 min_off,
+				 s16 max_off, enum bpf_diag_mod_reason reason);
 void bpf_diag_record_ref_acquire(struct bpf_verifier_env *env, u32 insn_idx, u32 ref_id);
 void bpf_diag_record_ref_release(struct bpf_verifier_env *env, u32 insn_idx, u32 ref_id);
 void bpf_diag_record_context(struct bpf_verifier_env *env, u32 insn_idx,
