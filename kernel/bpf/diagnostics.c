@@ -9,6 +9,7 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/overflow.h>
+#include <linux/seq_buf.h>
 #include <linux/slab.h>
 #include <linux/stdarg.h>
 #include <linux/string.h>
@@ -121,15 +122,9 @@ struct bpf_diag_insn {
 	bool valid;
 };
 
-struct bpf_diag_insn_buf {
-	char *buf;
-	size_t size;
-	size_t len;
-};
-
 struct bpf_diag_insn_ctx {
 	struct bpf_verifier_env *env;
-	struct bpf_diag_insn_buf buf;
+	struct seq_buf sb;
 };
 
 struct bpf_diag_log {
@@ -304,11 +299,21 @@ const char *bpf_diag_fmt(struct bpf_verifier_env *env, const char *fmt, ...)
 const char *bpf_diag_fmt_btf_type(struct bpf_verifier_env *env, const struct btf *btf, u32 type_id)
 {
 	char *buf = bpf_diag_fmt_buf(env, BPF_DIAG_BTF_NAME_LEN);
+	size_t len;
+	int ret;
 
 	if (!buf)
 		return "";
 
-	bpf_diag_format_btf_type(buf, BPF_DIAG_BTF_NAME_LEN, btf, type_id);
+	ret = btf_type_snprintf_show_name(btf, type_id, buf, BPF_DIAG_BTF_NAME_LEN);
+	if (ret < 0 || !buf[0]) {
+		scnprintf(buf, BPF_DIAG_BTF_NAME_LEN, "BTF type ID %u", type_id);
+		return buf;
+	}
+
+	len = strlen(buf);
+	if (len && buf[len - 1] == '{')
+		buf[len - 1] = '\0';
 	return buf;
 }
 
@@ -490,23 +495,6 @@ static void diag_print_wrapped_text(struct bpf_verifier_env *env, const char *te
 	diag_print_wrapped_prefixed(env, BPF_DIAG_TEXT_INDENT, BPF_DIAG_TEXT_INDENT, text);
 }
 
-void bpf_diag_format_btf_type(char *buf, size_t size, const struct btf *btf, u32 type_id)
-{
-	size_t len;
-	int ret;
-
-	buf[0] = '\0';
-	ret = btf_type_snprintf_show_name(btf, type_id, buf, size);
-	if (ret < 0 || !buf[0]) {
-		scnprintf(buf, size, "BTF type ID %u", type_id);
-		return;
-	}
-
-	len = strlen(buf);
-	if (len && buf[len - 1] == '{')
-		buf[len - 1] = '\0';
-}
-
 static void diag_vprint_indented(struct bpf_verifier_env *env, const char *fmt, va_list args)
 {
 	char *buf;
@@ -524,18 +512,6 @@ static void diag_vprint_indented(struct bpf_verifier_env *env, const char *fmt, 
 	kfree(buf);
 }
 
-static int diag_line_width(unsigned int line)
-{
-	int width = 1;
-
-	while (line >= 10) {
-		line /= 10;
-		width++;
-	}
-
-	return width;
-}
-
 static const char *diag_func_name(struct bpf_verifier_env *env, u32 insn_idx)
 {
 	const struct bpf_subprog_info *subprog;
@@ -549,26 +525,16 @@ static const char *diag_func_name(struct bpf_verifier_env *env, u32 insn_idx)
 	return bpf_verifier_subprog_name(env, subprogno);
 }
 
-static bool diag_fill_source(struct bpf_verifier_env *env, const struct bpf_line_info *linfo,
-			     struct bpf_linfo_source *src)
+static bool diag_get_source(struct bpf_verifier_env *env, u32 insn_idx,
+			    struct bpf_linfo_source *src)
 {
-	if (!env->prog->aux->btf)
+	const struct bpf_line_info *linfo = bpf_find_linfo(env->prog, insn_idx);
+
+	if (!linfo || !env->prog->aux->btf)
 		return false;
 
 	bpf_get_linfo_source(env->prog->aux->btf, linfo, src, 0);
 	return src->file && *src->file && src->line && *src->line;
-}
-
-static bool diag_get_source(struct bpf_verifier_env *env, u32 insn_idx,
-			    struct bpf_linfo_source *src)
-{
-	const struct bpf_line_info *linfo;
-
-	linfo = bpf_find_linfo(env->prog, insn_idx);
-	if (!linfo)
-		return false;
-
-	return diag_fill_source(env, linfo, src);
 }
 
 static void diag_fill_source_lines(struct bpf_verifier_env *env, const struct bpf_linfo_source *src,
@@ -618,14 +584,10 @@ static int diag_line_indent(const char *line)
 static void diag_insn_print(void *private_data, const char *fmt, ...)
 {
 	struct bpf_diag_insn_ctx *ctx = private_data;
-	struct bpf_diag_insn_buf *buf = &ctx->buf;
 	va_list args;
 
-	if (buf->len >= buf->size)
-		return;
-
 	va_start(args, fmt);
-	buf->len += vscnprintf(buf->buf + buf->len, buf->size - buf->len, fmt, args);
+	seq_buf_vprintf(&ctx->sb, fmt, args);
 	va_end(args);
 }
 
@@ -640,19 +602,15 @@ static void diag_format_insn(struct bpf_verifier_env *env, int insn_idx,
 			     struct bpf_diag_insn *diag_insn)
 {
 	struct bpf_insn *insn;
-	struct bpf_diag_insn_ctx ctx = {
-		.env = env,
-		.buf = {
-			.buf = diag_insn->text,
-			.size = sizeof(diag_insn->text),
-		},
-	};
+	struct bpf_diag_insn_ctx ctx = { .env = env };
 	const struct bpf_insn_cbs cbs = {
 		.cb_call = diag_disasm_kfunc_name,
 		.cb_print = diag_insn_print,
 		.private_data = &ctx,
 	};
+	size_t len;
 
+	seq_buf_init(&ctx.sb, diag_insn->text, sizeof(diag_insn->text));
 	diag_insn->idx = insn_idx;
 	diag_insn->valid = false;
 	diag_insn->text[0] = '\0';
@@ -668,8 +626,9 @@ static void diag_format_insn(struct bpf_verifier_env *env, int insn_idx,
 		return;
 
 	print_bpf_insn(&cbs, insn, env->allow_ptr_leaks);
-	while (ctx.buf.len && diag_insn->text[ctx.buf.len - 1] == '\n')
-		diag_insn->text[--ctx.buf.len] = '\0';
+	len = seq_buf_used(&ctx.sb);
+	while (len && diag_insn->text[len - 1] == '\n')
+		diag_insn->text[--len] = '\0';
 
 	diag_insn->valid = true;
 }
@@ -716,47 +675,28 @@ static void diag_format_source_text(char *buf, size_t size, const char *line, in
 	buf[len] = '\0';
 }
 
-static void diag_format_source_lane(char *buf, size_t size, const char *source_prefix,
-				    int source_line_width, int line_num, const char *line)
-{
-	int len, text_width;
-
-	if (line_num <= 0) {
-		buf[0] = '\0';
-		return;
-	}
-
-	len = scnprintf(buf, size, "%s%*d | ", source_prefix, source_line_width, line_num);
-	if (len >= (int)size)
-		return;
-
-	text_width = BPF_DIAG_SOURCE_LANE_WIDTH - len;
-	diag_format_source_text(buf + len, size - len, line, text_width);
-}
-
 static void diag_print_source_line(struct bpf_verifier_env *env, const char *source_prefix,
 				   int source_line_width, const struct bpf_diag_source_line *line)
 {
-	char *source_lane = bpf_diag_fmt_buf(env, BPF_DIAG_SOURCE_LANE_WIDTH + 8);
+	const size_t size = BPF_DIAG_SOURCE_LANE_WIDTH + 8;
+	char *buf = bpf_diag_fmt_buf(env, size);
+	int len;
 
-	if (!source_lane)
+	if (!buf)
 		return;
-	diag_format_source_lane(source_lane, BPF_DIAG_SOURCE_LANE_WIDTH + 8, source_prefix,
-				source_line_width, line->line_num, line->line);
-	diag_write(env, "  %s\n", source_lane);
+
+	if (line->line_num > 0) {
+		len = scnprintf(buf, size, "%s%*d | ", source_prefix, source_line_width,
+				line->line_num);
+		if (len < (int)size)
+			diag_format_source_text(buf + len, size - len, line->line,
+						BPF_DIAG_SOURCE_LANE_WIDTH - len);
+	}
+	diag_write(env, "  %s\n", buf);
 }
 
-static void diag_print_insn_line(struct bpf_verifier_env *env,
-				 const struct bpf_diag_insn *diag_insn, int focus_insn_idx,
-				 int insn_width)
-{
-	if (!diag_insn->valid)
-		return;
-	diag_write(env, "  %s%*d | %s\n", diag_insn->idx == focus_insn_idx ? ">>> " : "    ",
-		   insn_width, diag_insn->idx, diag_insn->text);
-}
-
-void bpf_diag_report_header(struct bpf_verifier_env *env, const char *category, const char *problem)
+static void diag_report_header(struct bpf_verifier_env *env, const char *category,
+			       const char *problem)
 {
 	char first;
 
@@ -837,8 +777,8 @@ static void diag_print_source_annotation(struct bpf_verifier_env *env, int line_
 	kfree(text);
 }
 
-void bpf_diag_report_source(struct bpf_verifier_env *env, u32 insn_idx, const char *label,
-			    const char *fmt, ...)
+static __printf(4, 5) void diag_report_source(struct bpf_verifier_env *env, u32 insn_idx,
+					      const char *label, const char *fmt, ...)
 {
 	struct bpf_diag_scratch *scratch;
 	struct bpf_diag_source_line *source_lines;
@@ -883,9 +823,9 @@ void bpf_diag_report_source(struct bpf_verifier_env *env, u32 insn_idx, const ch
 
 	start_line = src->line_num - BPF_DIAG_CONTEXT;
 	end_line = src->line_num + BPF_DIAG_CONTEXT;
-	width = diag_line_width(end_line);
+	width = snprintf(NULL, 0, "%u", (unsigned int)end_line);
 	indent = diag_line_indent(src->line);
-	insn_width = diag_line_width(env->prog->len ? env->prog->len - 1 : 0);
+	insn_width = snprintf(NULL, 0, "%u", env->prog->len ? env->prog->len - 1 : 0);
 	diag_fill_source_lines(env, src, start_line, end_line, source_lines);
 
 	for (i = 0; i < BPF_DIAG_CONTEXT_CNT; i++) {
@@ -909,8 +849,14 @@ void bpf_diag_report_source(struct bpf_verifier_env *env, u32 insn_idx, const ch
 			diag_print_source_annotation(env, width, indent, label, msg);
 	}
 	diag_write(env, "  Instruction context:\n");
-	for (i = 0; i < BPF_DIAG_CONTEXT_CNT; i++)
-		diag_print_insn_line(env, &diag_insn[i], insn_idx, insn_width);
+	for (i = 0; i < BPF_DIAG_CONTEXT_CNT; i++) {
+		const struct bpf_diag_insn *di = &diag_insn[i];
+
+		if (!di->valid)
+			continue;
+		diag_write(env, "  %s%*d | %s\n", di->idx == insn_idx ? ">>> " : "    ",
+			   insn_width, di->idx, di->text);
+	}
 
 out_free_msg:
 	kfree(msg);
@@ -947,11 +893,11 @@ void bpf_diag_report_register_type(struct bpf_verifier_env *env, u32 insn_idx, i
 		.regno = regno,
 	};
 
-	bpf_diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, problem);
+	diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, problem);
 	diag_report_reason(env, "%s", reason);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s", problem);
+	diag_report_source(env, insn_idx, "error", "%s", problem);
 
 	if (regno >= 0)
 		diag_print_history(env, &opts);
@@ -1055,12 +1001,12 @@ void bpf_diag_report_call_type(struct bpf_verifier_env *env, u32 insn_idx, int a
 	else
 		arg_desc = "argument";
 
-	bpf_diag_report_header(env, CATEGORY_CALL_TYPE_SAFETY, "invalid call argument");
+	diag_report_header(env, CATEGORY_CALL_TYPE_SAFETY, "invalid call argument");
 	diag_report_reason(env, "The %s to %s does not satisfy the verifier contract: %s.",
 			   arg_desc, call_name, reason);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "invalid %s for %s", arg_desc, call_name);
+	diag_report_source(env, insn_idx, "error", "invalid %s for %s", arg_desc, call_name);
 
 	if (print_history)
 		diag_print_history(env, &opts);
@@ -1120,8 +1066,8 @@ static void diag_ctx_forbidden(struct bpf_verifier_env *env, u32 insn_idx, const
 		.ctx_depth = depth,
 	};
 
-	bpf_diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY,
-			       "operation is not allowed in this context");
+	diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY,
+			   "operation is not allowed in this context");
 	if (diag_context_constraint(ctx_kind)) {
 		if (depth) {
 			diag_report_reason(env,
@@ -1139,8 +1085,8 @@ static void diag_ctx_forbidden(struct bpf_verifier_env *env, u32 insn_idx, const
 	}
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s is not allowed in %s", operation,
-			       context);
+	diag_report_source(env, insn_idx, "error", "%s is not allowed in %s", operation,
+			   context);
 
 	if (ctx_kind != BPF_DIAG_CONTEXT_NONE)
 		diag_print_history(env, &opts);
@@ -1159,16 +1105,16 @@ static void diag_ctx_active(struct bpf_verifier_env *env, u32 insn_idx, const ch
 		.ctx_depth = depth,
 	};
 
-	bpf_diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY,
-			       "operation is not allowed in this context");
+	diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY,
+			   "operation is not allowed in this context");
 	diag_report_reason(env,
 			   "The operation %s cannot be used while this path is still inside %s. "
 			   "Leave the region before this operation.",
 			   operation, diag_active_context(env, depth, context));
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s is not allowed before leaving %s",
-			       operation, context);
+	diag_report_source(env, insn_idx, "error", "%s is not allowed before leaving %s",
+			   operation, context);
 
 	diag_print_history(env, &opts);
 
@@ -1184,15 +1130,15 @@ static void diag_ctx_underflow(struct bpf_verifier_env *env, u32 insn_idx, const
 	};
 	const char *context = diag_context_name(ctx_kind);
 
-	bpf_diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY, "unmatched context exit");
+	diag_report_header(env, CATEGORY_EXECUTION_CONTEXT_SAFETY, "unmatched context exit");
 	diag_report_reason(env,
 			   "The operation %s tries to leave %s, but this path has no active %s to "
 			   "leave. The current depth is 0.",
 			   operation, context, context);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s has no matching enter on this path",
-			       operation);
+	diag_report_source(env, insn_idx, "error", "%s has no matching enter on this path",
+			   operation);
 
 	diag_print_history(env, &opts);
 
@@ -1222,7 +1168,7 @@ void bpf_diag_report_program_structure(struct bpf_verifier_env *env, u32 insn_id
 {
 	va_list args;
 
-	bpf_diag_report_header(env, CATEGORY_PROGRAM_STRUCTURE, problem);
+	diag_report_header(env, CATEGORY_PROGRAM_STRUCTURE, problem);
 	diag_report_section(env, "Reason");
 
 	va_start(args, reason_fmt);
@@ -1230,7 +1176,7 @@ void bpf_diag_report_program_structure(struct bpf_verifier_env *env, u32 insn_id
 	va_end(args);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s", problem);
+	diag_report_source(env, insn_idx, "error", "%s", problem);
 
 	diag_report_suggestion(env, "%s", suggestion);
 }
@@ -1238,11 +1184,11 @@ void bpf_diag_report_program_structure(struct bpf_verifier_env *env, u32 insn_id
 void bpf_diag_report_policy(struct bpf_verifier_env *env, u32 insn_idx, const char *operation,
 			    const char *reason, const char *suggestion)
 {
-	bpf_diag_report_header(env, CATEGORY_POLICY, "operation is not allowed");
+	diag_report_header(env, CATEGORY_POLICY, "operation is not allowed");
 	diag_report_reason(env, "The operation %s is not allowed: %s.", operation, reason);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "policy check failed for %s", operation);
+	diag_report_source(env, insn_idx, "error", "policy check failed for %s", operation);
 
 	diag_report_suggestion(env, "%s", suggestion);
 }
@@ -1256,7 +1202,7 @@ void bpf_diag_report_limit(struct bpf_verifier_env *env, u32 insn_idx, const cha
 	if (!bpf_diag_enabled(env))
 		return;
 
-	bpf_diag_report_header(env, CATEGORY_VERIFIER_LIMIT, "limit exceeded");
+	diag_report_header(env, CATEGORY_VERIFIER_LIMIT, "limit exceeded");
 	diag_report_section(env, "Reason");
 
 	va_start(args, reason_fmt);
@@ -1279,7 +1225,7 @@ void bpf_diag_report_limit(struct bpf_verifier_env *env, u32 insn_idx, const cha
 
 source:
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "limit exceeded: %s", limit);
+	diag_report_source(env, insn_idx, "error", "limit exceeded: %s", limit);
 
 	diag_report_suggestion(env, "%s", suggestion);
 }
@@ -1293,14 +1239,14 @@ void bpf_diag_report_jmp_seq(struct bpf_verifier_env *env, u32 insn_idx, u32 n_j
 	if (!bpf_diag_enabled(env))
 		return;
 
-	bpf_diag_report_header(env, CATEGORY_VERIFIER_LIMIT, "jump sequence too complex");
+	diag_report_header(env, CATEGORY_VERIFIER_LIMIT, "jump sequence too complex");
 	diag_report_reason(env,
 			   "The sequence of %u jumps on this path is too complex to verify. The "
 			   "full branch history recorded for this path is shown below.",
 			   n_jumps);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "jump sequence limit exceeded");
+	diag_report_source(env, insn_idx, "error", "jump sequence limit exceeded");
 
 	diag_print_history(env, &opts);
 
@@ -1311,11 +1257,11 @@ void bpf_diag_report_jmp_seq(struct bpf_verifier_env *env, u32 insn_idx, u32 n_j
 static void diag_internal_error(struct bpf_verifier_env *env, u32 insn_idx, const char *problem,
 				const char *reason)
 {
-	bpf_diag_report_header(env, CATEGORY_VERIFIER_INTERNAL_ERROR, problem);
+	diag_report_header(env, CATEGORY_VERIFIER_INTERNAL_ERROR, problem);
 	diag_report_reason(env, "The verifier hit an internal error: %s", reason);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s", problem);
+	diag_report_source(env, insn_idx, "error", "%s", problem);
 
 	diag_report_suggestion(env, "Report this problem to bpf@vger.kernel.org with the full "
 				    "verifier log and program.");
@@ -1369,7 +1315,7 @@ void bpf_diag_report_invalid_deref(struct bpf_verifier_env *env, u32 insn_idx, i
 	};
 	const char *type_name = bpf_diag_reg_type_plain(env, reg->type);
 
-	bpf_diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, "invalid dereference");
+	diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, "invalid dereference");
 
 	switch (kind) {
 	case BPF_DIAG_DEREF_SCALAR:
@@ -1400,11 +1346,11 @@ void bpf_diag_report_invalid_deref(struct bpf_verifier_env *env, u32 insn_idx, i
 
 	diag_report_section(env, "At");
 	if (kind == BPF_DIAG_DEREF_MODIFIED_PTR)
-		bpf_diag_report_source(env, insn_idx, "error",
-				       "dereference requires the original %s pointer", type_name);
+		diag_report_source(env, insn_idx, "error",
+				   "dereference requires the original %s pointer", type_name);
 	else
-		bpf_diag_report_source(env, insn_idx, "error", "invalid dereference of %s (%s)",
-				       reg_name, type_name);
+		diag_report_source(env, insn_idx, "error", "invalid dereference of %s (%s)",
+				   reg_name, type_name);
 
 	if (regno >= 0)
 		diag_print_history(env, &opts);
@@ -1438,14 +1384,14 @@ void bpf_diag_report_unreadable_reg(struct bpf_verifier_env *env, u32 insn_idx, 
 		.regno = regno,
 	};
 
-	bpf_diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, "unreadable register");
+	diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, "unreadable register");
 	diag_report_reason(env,
 			   "R%d is not readable here. A previous operation may have invalidated "
 			   "this register, so the verifier cannot use it as an input.",
 			   regno);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "R%d is not readable", regno);
+	diag_report_source(env, insn_idx, "error", "R%d is not readable", regno);
 
 	if (regno >= 0)
 		diag_print_history(env, &opts);
@@ -1486,7 +1432,7 @@ void bpf_diag_report_stack_arg_uninit(struct bpf_verifier_env *env, u32 insn_idx
 	};
 	const char *arg_buf = diag_stack_arg(env, stack_arg_slot, arg_name);
 
-	bpf_diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, "missing stack argument");
+	diag_report_header(env, CATEGORY_REGISTER_TYPE_SAFETY, "missing stack argument");
 	if (callee_name && *callee_name)
 		diag_report_reason(env,
 				   "Function %s expects %d arguments, but %s is not initialized at "
@@ -1499,7 +1445,7 @@ void bpf_diag_report_stack_arg_uninit(struct bpf_verifier_env *env, u32 insn_idx
 				   nargs, arg_buf);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s is not initialized", arg_buf);
+	diag_report_source(env, insn_idx, "error", "%s is not initialized", arg_buf);
 
 	if (stack_arg_slot >= 0)
 		diag_print_history(env, &opts);
@@ -1512,11 +1458,11 @@ void bpf_diag_report_stack_arg_uninit(struct bpf_verifier_env *env, u32 insn_idx
 void bpf_diag_report_memory(struct bpf_verifier_env *env, u32 insn_idx, const char *problem,
 			    const char *reason, const char *suggestion)
 {
-	bpf_diag_report_header(env, CATEGORY_MEMORY_SAFETY, problem);
+	diag_report_header(env, CATEGORY_MEMORY_SAFETY, problem);
 	diag_report_reason(env, "%s", reason);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s", problem);
+	diag_report_source(env, insn_idx, "error", "%s", problem);
 
 	diag_report_suggestion(env, "%s", suggestion);
 }
@@ -2110,14 +2056,14 @@ void bpf_diag_report_mem_bounds(struct bpf_verifier_env *env, u32 insn_idx, int 
 
 	offset_desc = diag_access_offset(env, off, reg);
 
-	bpf_diag_report_header(env, CATEGORY_MEMORY_SAFETY, "access outside bounds");
+	diag_report_header(env, CATEGORY_MEMORY_SAFETY, "access outside bounds");
 	diag_report_reason(env,
 			   "The verifier cannot prove offset + access_size <= object_size. Here, "
 			   "%s. %s is %s; offset is %s; access_size is %d; object_size is %u.",
 			   proof, reg_name, type_name, offset_desc, size, mem_size);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "access may be outside object bounds");
+	diag_report_source(env, insn_idx, "error", "access may be outside object bounds");
 
 	if (regno >= 0)
 		diag_print_history(env, &opts);
@@ -2143,11 +2089,11 @@ static const char *diag_lock_name(const struct bpf_reference_state *lock)
 static void diag_res_report(struct bpf_verifier_env *env, u32 insn_idx, const char *problem,
 			    const char *reason)
 {
-	bpf_diag_report_header(env, CATEGORY_RESOURCE_LIFETIME_SAFETY, problem);
+	diag_report_header(env, CATEGORY_RESOURCE_LIFETIME_SAFETY, problem);
 	diag_report_reason(env, "%s", reason);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s", problem);
+	diag_report_source(env, insn_idx, "error", "%s", problem);
 }
 
 void bpf_diag_res(struct bpf_verifier_env *env, u32 insn_idx, const char *problem,
@@ -2165,9 +2111,9 @@ void bpf_diag_lock(struct bpf_verifier_env *env, u32 insn_idx, const char *probl
 
 	if (active_lock) {
 		diag_report_section(env, "Active lock");
-		bpf_diag_report_source(env, active_lock->insn_idx, "acquired",
-				       "active %s has verifier identity %d",
-				       diag_lock_name(active_lock), active_lock->id);
+		diag_report_source(env, active_lock->insn_idx, "acquired",
+				   "active %s has verifier identity %d",
+				   diag_lock_name(active_lock), active_lock->id);
 	}
 
 	diag_report_suggestion(env, "%s", suggestion);
@@ -2182,11 +2128,11 @@ void bpf_diag_irq(struct bpf_verifier_env *env, u32 insn_idx, const char *proble
 		.ctx_depth = depth,
 	};
 
-	bpf_diag_report_header(env, CATEGORY_RESOURCE_LIFETIME_SAFETY, problem);
+	diag_report_header(env, CATEGORY_RESOURCE_LIFETIME_SAFETY, problem);
 	diag_report_reason(env, "%s", reason);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, insn_idx, "error", "%s", problem);
+	diag_report_source(env, insn_idx, "error", "%s", problem);
 
 	if (depth)
 		diag_print_history(env, &opts);
@@ -2201,15 +2147,15 @@ void bpf_diag_leak(struct bpf_verifier_env *env, u32 ref_id, u32 alloc_insn, u32
 		.ref_id = ref_id,
 	};
 
-	bpf_diag_report_header(env, CATEGORY_RESOURCE_LIFETIME_SAFETY, "unreleased resource");
+	diag_report_header(env, CATEGORY_RESOURCE_LIFETIME_SAFETY, "unreleased resource");
 	diag_report_reason(env,
 			   "Owned resource (id=%u) was acquired at instruction %u and still needs "
 			   "to be released before this exit path.",
 			   ref_id, alloc_insn);
 
 	diag_report_section(env, "At");
-	bpf_diag_report_source(env, fail_insn, "error",
-			       "owned resource (id=%u) still needs release", ref_id);
+	diag_report_source(env, fail_insn, "error",
+			   "owned resource (id=%u) still needs release", ref_id);
 
 	diag_print_history(env, &opts);
 
@@ -2335,10 +2281,9 @@ static void diag_print_mod(struct bpf_verifier_env *env, const struct bpf_diag_h
 	const char *label = "update";
 
 	if (target->kind == BPF_DIAG_MOD_TARGET_STACK_RANGE) {
-		bpf_diag_report_source(env, event->insn_idx, "invalidated",
-				       "variable-offset stack write may affect bytes fp%d through "
-				       "fp%d",
-				       target->range.min_off, target->range.max_off - 1);
+		diag_report_source(env, event->insn_idx, "invalidated",
+				   "variable-offset stack write may affect bytes fp%d through fp%d",
+				   target->range.min_off, target->range.max_off - 1);
 		return;
 	}
 
@@ -2375,13 +2320,13 @@ static void diag_print_mod(struct bpf_verifier_env *env, const struct bpf_diag_h
 	}
 
 	if (reason) {
-		bpf_diag_report_source(env, event->insn_idx, "invalidated",
-				       "%s: %s; previous value was %s", target_desc, reason, old);
+		diag_report_source(env, event->insn_idx, "invalidated",
+				   "%s: %s; previous value was %s", target_desc, reason, old);
 		return;
 	}
 
-	bpf_diag_report_source(env, event->insn_idx, label, "%s changed from %s to %s", target_desc,
-			       old, new);
+	diag_report_source(env, event->insn_idx, label, "%s changed from %s to %s", target_desc,
+			   old, new);
 }
 
 static void diag_print_ref_event(struct bpf_verifier_env *env,
@@ -2390,16 +2335,16 @@ static void diag_print_ref_event(struct bpf_verifier_env *env,
 	const char *label;
 
 	label = event->kind == BPF_DIAG_HISTORY_REF_ACQUIRE ? "acquired" : "released";
-	bpf_diag_report_source(env, event->insn_idx, label, "owned resource (id=%u)",
-			       event->ref.ref_id);
+	diag_report_source(env, event->insn_idx, label, "owned resource (id=%u)",
+			   event->ref.ref_id);
 }
 
 static void diag_print_context_event(struct bpf_verifier_env *env,
 				     const struct bpf_diag_history_event *event)
 {
-	bpf_diag_report_source(env, event->insn_idx, "context", "%s %s; depth is now %u",
-			       event->ctx.enter ? "entered" : "left",
-			       diag_context_name(event->ctx.kind), event->ctx.depth);
+	diag_report_source(env, event->insn_idx, "context", "%s %s; depth is now %u",
+			   event->ctx.enter ? "entered" : "left",
+			   diag_context_name(event->ctx.kind), event->ctx.depth);
 }
 
 static void diag_print_history(struct bpf_verifier_env *env,
@@ -2458,10 +2403,10 @@ static void diag_print_history(struct bpf_verifier_env *env,
 
 		switch (event->kind) {
 		case BPF_DIAG_HISTORY_BRANCH:
-			bpf_diag_report_source(env, event->insn_idx, "branch",
-					       "took the %s branch of this conditional, goto %s",
-					       event->branch.cond_true ? "true" : "false",
-					       event->branch.cond_true ? "followed" : "not followed");
+			diag_report_source(env, event->insn_idx, "branch",
+					   "took the %s branch of this conditional, goto %s",
+					   event->branch.cond_true ? "true" : "false",
+					   event->branch.cond_true ? "followed" : "not followed");
 			break;
 		case BPF_DIAG_HISTORY_MOD:
 			diag_print_mod(env, event);

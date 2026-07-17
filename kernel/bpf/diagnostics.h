@@ -15,7 +15,6 @@ struct bpf_verifier_env;
 struct bpf_verifier_state;
 struct btf;
 
-void bpf_diag_format_btf_type(char *buf, size_t size, const struct btf *btf, u32 type_id);
 const char *bpf_diag_fmt_s64_sum(struct bpf_verifier_env *env, s64 value, int addend);
 
 enum bpf_diag_mod_reason {
@@ -128,10 +127,6 @@ void bpf_diag_event_log_reset(struct bpf_verifier_env *env, u32 pos);
 int bpf_diag_error(const struct bpf_verifier_env *env);
 u32 bpf_diag_irq_depth(const struct bpf_verifier_state *state);
 void bpf_diag_free(struct bpf_verifier_env *env);
-void bpf_diag_report_header(struct bpf_verifier_env *env, const char *category,
-			    const char *problem);
-void bpf_diag_report_source(struct bpf_verifier_env *env, u32 insn_idx, const char *label,
-			    const char *fmt, ...) __printf(4, 5);
 void bpf_diag_report_register_type(struct bpf_verifier_env *env, u32 insn_idx, int regno,
 				   const char *problem, const char *reason, const char *suggestion);
 void bpf_diag_report_invalid_deref(struct bpf_verifier_env *env, u32 insn_idx, int regno,
