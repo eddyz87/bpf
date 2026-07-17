@@ -201,6 +201,27 @@ __naked void nested_loop1(void)
 SEC("xdp")
 __success
 __log_level(2)
+__naked void nested_loop_hdr_backedge1(void)
+{
+	asm volatile ("					\
+	r6 = 0;						\
+1:							\
+	if r6 == 2 goto 3f;				\
+	r6 += 1;					\
+	  r7 = 0;					\
+2:							\
+	  if r7 == 2 goto 1b;				\
+	  r7 += 1;					\
+	  goto 2b;					\
+3:							\
+	r0 = r7;					\
+	exit;						\
+"	::: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
 __msg("loop header at 1, header_count is 10 post-cond")
 __msg("loop header at 1, widening r0 to 0..9 step 1")
