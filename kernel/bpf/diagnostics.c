@@ -7,7 +7,6 @@
 #include <linux/btf.h>
 #include <linux/ctype.h>
 #include <linux/kernel.h>
-#include <linux/list.h>
 #include <linux/overflow.h>
 #include <linux/seq_buf.h>
 #include <linux/slab.h>
@@ -36,6 +35,7 @@
 #define BPF_DIAG_TAB_WIDTH 8
 #define BPF_DIAG_TEXT_LEN 160
 #define BPF_DIAG_BTF_NAME_LEN 256
+#define BPF_DIAG_FMT_BUF_SIZE 16384
 
 struct bpf_diag_reg_snapshot {
 	u32 type;
@@ -134,16 +134,6 @@ struct bpf_diag_log {
 	int error;
 };
 
-/*
- * Diagnostic text is built with one allocation per string, tracked on a list
- * and freed wholesale when verification ends. diag_fmt_mark()/diag_fmt_rewind()
- * free a bounded scope on demand (used by the causal-history loop).
- */
-struct bpf_diag_fmt_buf {
-	struct list_head node;
-	char data[];
-};
-
 struct bpf_diag_scratch {
 	struct bpf_linfo_source source;
 	struct bpf_diag_source_line source_lines[BPF_DIAG_CONTEXT_CNT];
@@ -166,7 +156,7 @@ struct bpf_diag_mod_scope {
 struct bpf_diag {
 	struct bpf_diag_log log;
 	struct bpf_diag_scratch scratch;
-	struct list_head fmt_bufs;
+	struct seq_buf fmt_sb;
 	struct bpf_diag_mod_scope mod;
 };
 
@@ -182,6 +172,8 @@ static struct bpf_diag *diag_env(struct bpf_verifier_env *env)
 
 int bpf_diag_init(struct bpf_verifier_env *env)
 {
+	char *fmt_buf;
+
 	if (!bpf_diag_enabled(env))
 		return 0;
 
@@ -189,7 +181,13 @@ int bpf_diag_init(struct bpf_verifier_env *env)
 	if (!env->diag)
 		return -ENOMEM;
 
-	INIT_LIST_HEAD(&env->diag->fmt_bufs);
+	fmt_buf = kvmalloc(BPF_DIAG_FMT_BUF_SIZE, GFP_KERNEL_ACCOUNT);
+	if (!fmt_buf) {
+		kfree(env->diag);
+		env->diag = NULL;
+		return -ENOMEM;
+	}
+	seq_buf_init(&env->diag->fmt_sb, fmt_buf, BPF_DIAG_FMT_BUF_SIZE);
 	return 0;
 }
 
@@ -209,45 +207,34 @@ static void diag_fmt_set_error(struct bpf_diag *diag, int error)
 static char *diag_fmt_alloc(struct bpf_verifier_env *env, size_t size)
 {
 	struct bpf_diag *diag = diag_env(env);
-	struct bpf_diag_fmt_buf *buf;
+	char *slice;
 
 	if (!diag)
 		return NULL;
 
-	buf = kmalloc(struct_size(buf, data, size), GFP_KERNEL_ACCOUNT);
-	if (!buf) {
-		diag_fmt_set_error(diag, -ENOMEM);
+	if (seq_buf_get_buf(&diag->fmt_sb, &slice) < size)
 		return NULL;
-	}
-	list_add_tail(&buf->node, &diag->fmt_bufs);
-	return buf->data;
+	seq_buf_commit(&diag->fmt_sb, size);
+	return slice;
 }
 
 /*
- * Snapshot the tail of the allocation list. diag_fmt_rewind() later frees
- * everything allocated after the mark, recycling a bounded scope without
- * touching strings allocated before it.
+ * Snapshot the current buffer offset. diag_fmt_rewind() later restores it,
+ * recycling a bounded scope without touching strings allocated before it.
  */
-static struct list_head *diag_fmt_mark(struct bpf_verifier_env *env)
+static size_t diag_fmt_mark(struct bpf_verifier_env *env)
 {
 	struct bpf_diag *diag = diag_env(env);
 
-	return diag ? diag->fmt_bufs.prev : NULL;
+	return diag ? diag->fmt_sb.len : 0;
 }
 
-static void diag_fmt_rewind(struct bpf_verifier_env *env, struct list_head *mark)
+static void diag_fmt_rewind(struct bpf_verifier_env *env, size_t mark)
 {
 	struct bpf_diag *diag = diag_env(env);
-	struct list_head *pos, *tmp;
 
-	if (!diag || !mark)
-		return;
-
-	for (pos = mark->next; pos != &diag->fmt_bufs; pos = tmp) {
-		tmp = pos->next;
-		list_del(pos);
-		kfree(list_entry(pos, struct bpf_diag_fmt_buf, node));
-	}
+	if (diag)
+		diag->fmt_sb.len = mark;
 }
 
 char *bpf_diag_fmt_buf(struct bpf_verifier_env *env, size_t size)
@@ -317,20 +304,6 @@ const char *bpf_diag_fmt_btf_type(struct bpf_verifier_env *env, const struct btf
 	return buf;
 }
 
-static void diag_fmt_free(struct bpf_verifier_env *env)
-{
-	struct bpf_diag *diag = diag_env(env);
-	struct bpf_diag_fmt_buf *buf, *tmp;
-
-	if (!diag)
-		return;
-
-	list_for_each_entry_safe(buf, tmp, &diag->fmt_bufs, node) {
-		list_del(&buf->node);
-		kfree(buf);
-	}
-}
-
 static void diag_write(struct bpf_verifier_env *env, const char *fmt, ...)
 {
 	va_list args;
@@ -396,7 +369,7 @@ void bpf_diag_free(struct bpf_verifier_env *env)
 	if (!diag)
 		return;
 
-	diag_fmt_free(env);
+	kvfree(diag->fmt_sb.buffer);
 	kvfree(diag->log.events);
 	kfree(diag->scratch.history_bitmap);
 	kfree(diag);
@@ -2355,7 +2328,7 @@ static void diag_print_history(struct bpf_verifier_env *env,
 		.opts = opts,
 	};
 	const struct bpf_diag_log *log;
-	struct list_head *mark;
+	size_t mark;
 	bool first = true;
 	bool visible = false;
 	int start_idx, err;
