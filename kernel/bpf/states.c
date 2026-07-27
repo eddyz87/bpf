@@ -551,6 +551,12 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		if (rold->id &&
 		    (rold->id & BPF_SUBREG_EQ) != (rcur->id & BPF_SUBREG_EQ))
 			return false;
+		/*
+		 * Sign-extension tracking encompasses the general low 32-bits same
+		 * check above and the additional high bits check.
+		 */
+		if (rold->sext_width != rcur->sext_width)
+			return false;
 
 		if (env->explore_alu_limits) {
 			/* explore_alu_limits disables tnum_in() and range_within()

@@ -149,8 +149,9 @@ struct bpf_reg_state {
 	/*
 	 * Low-32-bit-only equality link (as opposed to the full/ADD_CONST
 	 * equality above): the destination shares only the source's low 32
-	 * bits: its high bits are zero (from a 32-bit zero-extending
-	 * mov, w0 = w1)
+	 * bits. Its high bits are either zero (from a 32-bit zero-extending
+	 * mov, w0 = w1) or the sign-extension of the low field (from a 32-bit
+	 * sign extension, r0 = (s32)r0, flagged by ->sext_width below).
 	 * sync_linked_regs() propagates only the low 32-bit subrange and
 	 * rebuilds the high half accordingly, so this is sound even when the
 	 * source has unknown high bits.
@@ -181,6 +182,15 @@ struct bpf_reg_state {
 	s32 subreg_def;
 	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
 	bool precise;
+	/*
+	 * Sign-extension self-property: if non-zero (1/2/4), this register's
+	 * high bits are the sign-extension of its own low sext_width-byte
+	 * field. Paired with BPF_SUBREG_EQ above: a later narrowing of the low
+	 * bits propagates through the link and reconstruct_sext32() rebuilds
+	 * the high half. 0 means no such relationship. Placed here to reuse
+	 * existing tail padding (no struct size growth).
+	 */
+	u8 sext_width;
 };
 
 /*
