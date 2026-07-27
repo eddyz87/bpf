@@ -541,6 +541,17 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 
 	switch (base_type(rold->type)) {
 	case SCALAR_VALUE:
+		/*
+		 * BPF_SUBREG_EQ marks a low-32-bit-only link, with different
+		 * sync_linked_regs() semantics than a full/ADD_CONST equality, and
+		 * check_scalar_ids() masks it off, so a mismatch must be rejected
+		 * explicitly. Check it here first, before the explore_alu_limits
+		 * and !precise short-circuits below (neither of which tests it).
+		 */
+		if (rold->id &&
+		    (rold->id & BPF_SUBREG_EQ) != (rcur->id & BPF_SUBREG_EQ))
+			return false;
+
 		if (env->explore_alu_limits) {
 			/* explore_alu_limits disables tnum_in() and range_within()
 			 * logic and requires everything to be strict

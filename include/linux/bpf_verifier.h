@@ -146,8 +146,18 @@ struct bpf_reg_state {
 #define BPF_ADD_CONST64 (1U << 31)
 #define BPF_ADD_CONST32 (1U << 30)
 #define BPF_ADD_CONST (BPF_ADD_CONST64 | BPF_ADD_CONST32)
+	/*
+	 * Low-32-bit-only equality link (as opposed to the full/ADD_CONST
+	 * equality above): the destination shares only the source's low 32
+	 * bits: its high bits are zero (from a 32-bit zero-extending
+	 * mov, w0 = w1)
+	 * sync_linked_regs() propagates only the low 32-bit subrange and
+	 * rebuilds the high half accordingly, so this is sound even when the
+	 * source has unknown high bits.
+	 */
+#define BPF_SUBREG_EQ (1U << 29)
 	/* All linked-register relationship flags carried in reg->id. */
-#define REG_ID_LINK_FLAGS (BPF_ADD_CONST)
+#define REG_ID_LINK_FLAGS (BPF_ADD_CONST | BPF_SUBREG_EQ)
 	u32 id;
 	/*
 	 * Tracks the parent object this register was derived from.

@@ -15070,15 +15070,42 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 					if (insn->off == 0) {
 						bool is_src_reg_u32 = get_reg_width(src_reg) <= 32;
 
-						if (is_src_reg_u32)
+						/*
+						 * *dst_reg = *src_reg below copies src's id into dst, a
+						 * full 64-bit equality link. That is only sound when src
+						 * fits in u32: a 32-bit mov zero-extends dst, so for a
+						 * wider src the link would let sync_linked_regs()
+						 * propagate dst's [0, U32_MAX] range back onto src's
+						 * unknown high bits. For a wide src drop the full link
+						 * and form a low-32-only BPF_SUBREG_EQ link instead, so a
+						 * later narrowing of src's low 32 bits still reaches dst.
+						 *
+						 * wide_subreg_link gates that low-32 link and excludes:
+						 *  - a self-mov (w6 = w6): src == dst, nothing to link;
+						 *    forming one would only mint an id and a spurious
+						 *    self-link (inert in sync_linked_regs()).
+						 *  - an ADD_CONST-linked src (rX = base + K):
+						 *    assign_scalar_id_before_mov() would clear its
+						 *    base+delta link, and a combined subreg+delta link
+						 *    isn't modeled anyway (sync_linked_regs() skips it).
+						 * In both cases src is left untouched and dst is cleared,
+						 * as before this feature.
+						 */
+						bool wide_subreg_link = !is_src_reg_u32 &&
+							src_reg != dst_reg &&
+							!(src_reg->id & BPF_ADD_CONST);
+
+						if (is_src_reg_u32 || wide_subreg_link)
 							assign_scalar_id_before_mov(env, src_reg);
 						*dst_reg = *src_reg;
-						/* Make sure ID is cleared if src_reg is not in u32
-						 * range otherwise dst_reg min/max could be incorrectly
-						 * propagated into src_reg by sync_linked_regs()
-						 */
-						if (!is_src_reg_u32)
-							clear_scalar_id(dst_reg);
+						if (!is_src_reg_u32) {
+							if (wide_subreg_link &&
+							    reg_id_scalar_id(src_reg->id)) {
+								dst_reg->id = src_reg->id | BPF_SUBREG_EQ;
+							} else {
+								clear_scalar_id(dst_reg);
+							}
+						}
 						dst_reg->subreg_def = env->insn_idx + 1;
 					} else {
 						/* case: W1 = (s8, s16)W2 */
@@ -15949,6 +15976,52 @@ static void sync_linked_regs(struct bpf_verifier_env *env, struct bpf_verifier_s
 		if (reg->type != SCALAR_VALUE || reg == known_reg)
 			continue;
 		if (reg_id_scalar_id(reg->id) != reg_id_scalar_id(known_reg->id))
+			continue;
+		/*
+		 * A BPF_SUBREG_EQ linked register shares only the base's low 32
+		 * bits; its high bits are zero (from a 32-bit zero-extending mov).
+		 * Rebuild it from known_reg's low 32 bits, but only when neither
+		 * side carries an ADD_CONST delta -- with a delta the low bits
+		 * differ from the base by that delta and the combined
+		 * subreg+ADD_CONST reconstruction isn't modeled here, so leave reg
+		 * unchanged (sound, just less precise).
+		 */
+		if (reg->id & BPF_SUBREG_EQ) {
+			if (!((reg->id | known_reg->id) & BPF_ADD_CONST)) {
+				s32 saved_subreg_def = reg->subreg_def;
+
+				{
+					u32 saved_id = reg->id;
+
+					/*
+					 * reg = zext32(known_reg): its low 32 bits come from
+					 * the base and its high 32 are zero. Rather than
+					 * rebuild the value by hand, copy the base (keeping
+					 * its precise low-32 tnum) and re-clear the high half
+					 * with the same zext_32_to_64() the 32-bit
+					 * zero-extending mov used -- the zero high half is a
+					 * fallout of it, so no dedicated reconstruction is
+					 * needed.
+					 */
+					*reg = *known_reg;
+					reg->id = saved_id;
+					reg->subreg_def = saved_subreg_def;
+					zext_32_to_64(reg);
+					reg_bounds_sync(reg);
+				}
+				if (e->is_reg)
+					mark_reg_scratched(env, e->regno);
+				else
+					mark_stack_slot_scratched(env, e->spi);
+			}
+			continue;
+		}
+		/*
+		 * Dest-driven direction (known_reg is subreg-linked, reg is not):
+		 * copying known_reg's low-32-only state into a full register would
+		 * be unsound, so leave reg unchanged.
+		 */
+		if (known_reg->id & BPF_SUBREG_EQ)
 			continue;
 		/*
 		 * Skip mixed 32/64-bit links: the delta relationship doesn't
