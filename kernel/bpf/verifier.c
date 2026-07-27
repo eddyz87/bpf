@@ -14965,6 +14965,33 @@ clear_id:
 	return 0;
 }
 
+/*
+ * Record the loop header (lowest instruction index) for each SCC. For the
+ * verifier's structured loops the header is the loop entry, so a register that
+ * is live before the header is carried across the back-edge. Must run after
+ * bpf_compute_scc() (fills insn_aux_data[].scc) and before do_check().
+ */
+static int compute_scc_headers(struct bpf_verifier_env *env)
+{
+	u32 i, scc;
+
+	if (!env->scc_cnt)
+		return 0;
+	env->scc_header = kvcalloc(env->scc_cnt, sizeof(*env->scc_header),
+				   GFP_KERNEL_ACCOUNT);
+	if (!env->scc_header)
+		return -ENOMEM;
+	for (i = 0; i < env->scc_cnt; i++)
+		env->scc_header[i] = U32_MAX;
+	/* Increasing i => first insn seen for an SCC is its lowest index. */
+	for (i = 0; i < env->prog->len; i++) {
+		scc = env->insn_aux_data[i].scc;
+		if (scc && env->scc_header[scc] == U32_MAX)
+			env->scc_header[scc] = i;
+	}
+	return 0;
+}
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
@@ -20293,6 +20320,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
+	ret = compute_scc_headers(env);
+	if (ret < 0)
+		goto skip_full_check;
+
 	ret = bpf_compute_live_registers(env);
 	if (ret < 0)
 		goto skip_full_check;
@@ -20444,6 +20475,7 @@ err_free_env:
 	bpf_stack_liveness_free(env);
 	kvfree(env->cfg.insn_postorder);
 	kvfree(env->scc_info);
+	kvfree(env->scc_header);
 	kvfree(env->succ);
 	kvfree(env->gotox_tmp_buf);
 	kvfree(env);

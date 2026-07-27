@@ -1058,6 +1058,13 @@ struct bpf_verifier_env {
 	/* array of pointers to bpf_scc_info indexed by SCC id */
 	struct bpf_scc_info **scc_info;
 	u32 scc_cnt;
+	/*
+	 * Per-SCC loop header: lowest instruction index belonging to each SCC
+	 * (the loop entry for the verifier's structured loops). Indexed by SCC
+	 * id; entry 0 is unused (scc id 0 means "not in a loop"). Used to test
+	 * whether a register is live across the loop back-edge (loop-carried).
+	 */
+	u32 *scc_header;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
 };
