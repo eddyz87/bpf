@@ -784,4 +784,195 @@ l_out_%=:							\
 	: __clobber_all, "r5", "r6", "r7");
 }
 
+/*
+ * Sign-extension linked-register tracking, in-place narrow-to-zero.
+ *
+ * r1 = r0 ties r0,r1 with a shared id. r0 = (s32)r0 sign-extends r0's low 32
+ * bits; the sign bit isn't provably 0 (umax = 0xffffffff) so r0 keeps a
+ * BPF_SUBREG_EQ link to r1 plus a sext-self marker. On the w1 == 0
+ * fall-through, r1's low 32 bits are 0; r0's low 32 bits equal r1's and r0's
+ * upper bits are the sign-extension of that (0) -- so r0 == 0.
+ *
+ * The guarded div-by-zero is unreachable iff the verifier deduces r0 == 0.
+ */
+SEC("socket")
+__success
+__naked void sext_linked_low_narrow_to_zero(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r1 = r0;		/* r1 == r0, shared id */	\
+	r0 = (s32)r0;		/* r0 = sext32(r0) */		\
+	if w1 != 0 goto l0_%=;	/* fall-through: w1 == 0 */	\
+	/* want deduced here: r0 == 0 */			\
+	if r0 == 0 goto l0_%=;	/* always taken iff r0==0 known */ \
+	r0 /= 0;		/* unreachable iff r0==0 deduced */ \
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/*
+ * Separate-dest sign-extension: r3 = (s32)r2 (dst != src). r2,r3 share a base
+ * id (r3 with BPF_SUBREG_EQ). On the w2 == 0 fall-through, r2's low 32 bits are
+ * 0, so r3 = sext32(0) = 0 and the guarded div-by-zero is unreachable.
+ *
+ * Runs with BPF_F_TEST_STATE_FREQ to force checkpointing between the sext and
+ * the branch: the sext linkage (BPF_SUBREG_EQ + sext_width) must survive state
+ * cleaning so sync_linked_regs() can still reconstruct r3. bpf_clear_singular_ids()
+ * strips the link flags when counting base ids; otherwise r3's compound id looks
+ * singular and gets cleared, and r3 stays wide.
+ */
+SEC("socket")
+__success
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void sext_linked_separate_dest_narrow_to_zero(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r2 = r0;		/* r2,(r0) linked, id N */	\
+	r3 = (s32)r2;		/* r3 = sext32(r2): SUBREG_EQ base N */	\
+	if w2 != 0 goto l0_%=;	/* fall-through: w2 == 0 */	\
+	/* want deduced here: r3 == 0 */			\
+	if r3 == 0 goto l0_%=;	/* always taken iff r3==0 known */ \
+	r0 /= 0;		/* unreachable iff r3==0 deduced */ \
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/*
+ * Coverage derived from real "R0 ... should have been in [0, 1]" exit
+ * rejections. Each sign-extends a value, then a branch proves its low 32 bits
+ * are 0 so the sext result must be 0. Expressed with the div-by-zero idiom (same
+ * deduced range the return-code check reads): the div is unreachable iff the
+ * verifier deduces the sext register is 0.
+ */
+
+/* 1: branch on the SOURCE reg; separate dest (value stands in for a u32 load). */
+SEC("socket")
+__success
+__naked void sext_narrow_branch_on_source(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r2 = r0;		/* r2 = value (proxy for u32 load) */	\
+	r0 = (s32)r2;		/* r0 = sext32(r2) */		\
+	if w2 != 0 goto l0_%=;	/* w2 != 0: r0 unknown, skip */	\
+	if r0 == 0 goto l0_%=;	/* w2 == 0: r0 must be 0 */	\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* 2: sext into r7, prove via w0, then copy r7 back into r0. */
+SEC("socket")
+__success
+__naked void sext_narrow_copied_back(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r7 = (s32)r0;		/* r7 = sext32(r0) */		\
+	if w0 != 0 goto l0_%=;	/* w0 != 0: skip */		\
+	r0 = r7;		/* w0 == 0: r0 = r7 (must be 0) */ \
+	if r0 == 0 goto l0_%=;					\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all, "r7");
+}
+
+/* 3: in-place sext; branch on the pre-sext copy r1 (== direction). */
+SEC("socket")
+__success
+__naked void sext_narrow_inplace_pre_copy(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r1 = r0;		/* pre-sext copy, linked */	\
+	r0 = (s32)r0;		/* in-place sext32 */		\
+	if w1 == 0 goto l_chk_%=;/* w1 == 0: r0 must be 0 */	\
+	r0 = 0;			/* w1 != 0: make return valid */\
+	goto l0_%=;						\
+l_chk_%=:							\
+	if r0 == 0 goto l0_%=;					\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* 4: sext, prove via w0, spill to stack across a call, reload, use. */
+SEC("socket")
+__success
+__naked void sext_narrow_spill_fill(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r9 = (s32)r0;		/* r9 = sext32(r0) */		\
+	if w0 != 0 goto l0_%=;	/* w0 != 0: skip */		\
+	/* w0 == 0: r9 must be 0 */				\
+	*(u64 *)(r10 - 8) = r9;	/* spill r9 */			\
+	call %[bpf_get_prandom_u32];/* clobbers r0-r5 */	\
+	r5 = *(u64 *)(r10 - 8);	/* reload -> must be 0 */	\
+	if r5 == 0 goto l0_%=;					\
+	r0 /= 0;						\
+l0_%=:								\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all, "r9");
+}
+
+/*
+ * A redundant 32-bit sign-extension of an already-narrowed value must preserve
+ * the range. This is the errno-or-zero return pattern (set_if_not_errno_or_zero()
+ * followed by "return ret" on an int): the value is clamped to [-4095, 0] and
+ * then sign-extended again, e.g. verify_pkcs7_sig / many lsm.s progs under
+ * bpf-gcc. coerce_reg_to_size_sx() bails to the full [S32_MIN, S32_MAX] range
+ * when the range straddles the sign boundary (smin<0, smax>=0), so without the
+ * sext-self reconstruction the final "r0 = (s32)r0" widens [-4095, 0] back to
+ * the full range and the program is rejected. Knowing the high half is the
+ * sign-extension of the low 32 bits lets the verifier rebuild the tight range.
+ */
+SEC("socket")
+__success
+__naked void sext_resext_preserves_range(void)
+{
+	asm volatile ("						\
+	call %[bpf_get_prandom_u32];				\
+	r0 = (s32)r0;		/* r0 = [S32_MIN, S32_MAX] */	\
+	if r0 s> 0 goto l_out_%=;	/* r0 <= 0 */		\
+	if r0 s< -4095 goto l_out_%=;	/* r0 in [-4095, 0] */	\
+	r0 = (s32)r0;		/* redundant re-sext (pkcs7 pattern) */ \
+	if r0 s>= -4095 goto l_lo_ok_%=;/* must hold if range kept */ \
+	r0 /= 0;		/* reached only if lower bound lost */	\
+l_lo_ok_%=:							\
+	if r0 s<= 0 goto l_out_%=;	/* must hold if range kept */ \
+	r0 /= 0;		/* reached only if upper bound lost */	\
+l_out_%=:							\
+	r0 = 0;							\
+	exit;							\
+"	:
+	: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 char _license[] SEC("license") = "GPL";
