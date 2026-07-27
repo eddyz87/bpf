@@ -1516,7 +1516,10 @@ __naked void sub32_full_overflow(void)
 SEC("socket")
 __description("32-bit subtraction, partial overflow, result in unbounded u32 bounds")
 __success __log_level(2)
-__msg("3: (1c) w3 -= w2 {{.*}} R3=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))")
+/* w3 = w0 forms a low-32 BPF_SUBREG_EQ link, so R3 now carries an id here;
+ * the bounds are unchanged, so allow the optional "id=...," annotation.
+ */
+__msg("3: (1c) w3 -= w2 {{.*}} R3=scalar({{(id=[0-9-]+,)?}}smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))")
 __retval(0)
 __naked void sub32_partial_overflow(void)
 {
