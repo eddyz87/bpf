@@ -386,9 +386,9 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 
 	if (!check_ids(old_id, cur_id, idmap))
 		return false;
-	if (old_id & BPF_ADD_CONST) {
-		old_id &= ~BPF_ADD_CONST;
-		cur_id &= ~BPF_ADD_CONST;
+	if (old_id & REG_ID_LINK_FLAGS) {
+		old_id = reg_id_scalar_id(old_id);
+		cur_id = reg_id_scalar_id(cur_id);
 		if (!check_ids(old_id, cur_id, idmap))
 			return false;
 	}

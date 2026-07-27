@@ -146,6 +146,8 @@ struct bpf_reg_state {
 #define BPF_ADD_CONST64 (1U << 31)
 #define BPF_ADD_CONST32 (1U << 30)
 #define BPF_ADD_CONST (BPF_ADD_CONST64 | BPF_ADD_CONST32)
+	/* All linked-register relationship flags carried in reg->id. */
+#define REG_ID_LINK_FLAGS (BPF_ADD_CONST)
 	u32 id;
 	/*
 	 * Tracks the parent object this register was derived from.
@@ -170,6 +172,17 @@ struct bpf_reg_state {
 	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
 	bool precise;
 };
+
+/*
+ * Base scalar id from a register id: the linked-register relationship flags
+ * (REG_ID_LINK_FLAGS) masked off. Two registers are in the same linked-scalar
+ * class iff they share this base id. Takes the raw id so it works for both
+ * reg->id and bare id values (e.g. in check_scalar_ids()).
+ */
+static inline u32 reg_id_scalar_id(u32 id)
+{
+	return id & ~REG_ID_LINK_FLAGS;
+}
 
 static inline s64 reg_smin(const struct bpf_reg_state *reg)
 {

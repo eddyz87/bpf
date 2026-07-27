@@ -662,7 +662,7 @@ static void print_reg_state(struct bpf_verifier_env *env,
 		verbose(env, "%s", btf_type_name(reg->btf, reg->btf_id));
 	verbose(env, "(");
 	if (reg->id)
-		verbose_a("id=%d", reg->id & ~BPF_ADD_CONST);
+		verbose_a("id=%d", reg_id_scalar_id(reg->id));
 	if (reg->id & BPF_ADD_CONST)
 		verbose(env, "%+d", reg->delta);
 	if (reg->parent_id)
