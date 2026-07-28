@@ -124,6 +124,7 @@
 #include "verifier_jit_inline.skel.h"
 #include "irq.skel.h"
 #include "verifier_ctx_ptr_param.skel.h"
+#include "verifier_zext.skel.h"
 
 #define MAX_ENTRIES 11
 
@@ -314,6 +315,7 @@ void test_verifier_array_access(void)
 		      init_array_access_maps);
 }
 void test_verifier_async_cb_context(void)    { RUN(verifier_async_cb_context); }
+void test_verifier_zext(void)                 { RUN(verifier_zext); }
 
 static int init_value_ptr_arith_maps(struct bpf_object *obj)
 {
