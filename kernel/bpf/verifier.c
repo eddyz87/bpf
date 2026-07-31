@@ -14970,33 +14970,6 @@ clear_id:
 }
 
 /*
- * Record the loop header (lowest instruction index) for each SCC. For the
- * verifier's structured loops the header is the loop entry, so a register that
- * is live before the header is carried across the back-edge. Must run after
- * bpf_compute_scc() (fills insn_aux_data[].scc) and before do_check().
- */
-static int compute_scc_headers(struct bpf_verifier_env *env)
-{
-	u32 i, scc;
-
-	if (!env->scc_cnt)
-		return 0;
-	env->scc_header = kvcalloc(env->scc_cnt, sizeof(*env->scc_header),
-				   GFP_KERNEL_ACCOUNT);
-	if (!env->scc_header)
-		return -ENOMEM;
-	for (i = 0; i < env->scc_cnt; i++)
-		env->scc_header[i] = U32_MAX;
-	/* Increasing i => first insn seen for an SCC is its lowest index. */
-	for (i = 0; i < env->prog->len; i++) {
-		scc = env->insn_aux_data[i].scc;
-		if (scc && env->scc_header[scc] == U32_MAX)
-			env->scc_header[scc] = i;
-	}
-	return 0;
-}
-
-/*
  * Is @regno live across the back-edge of the loop containing the current insn?
  * A register that is live before the loop header is read again in a later
  * iteration, i.e. carried across the loop. Forming an in-loop subreg link on
@@ -15004,16 +14977,16 @@ static int compute_scc_headers(struct bpf_verifier_env *env)
  * never converges; callers skip the link for it. A register that is not
  * carried (a fresh in-loop temporary, e.g. a loaded array index) is dead across
  * the back-edge, so its link is safe and worth keeping.
+ *
+ * bpf_loop_at_index() gives the header of the innermost loop containing the
+ * instruction (the instruction itself if it is a header), or -1 outside any
+ * loop. Must run after bpf_compute_loops().
  */
 static bool reg_is_loop_carried(struct bpf_verifier_env *env, u32 regno)
 {
-	u32 scc = env->insn_aux_data[env->insn_idx].scc;
-	u32 header;
+	int header = bpf_loop_at_index(env, env->insn_idx);
 
-	if (!scc || !env->scc_header)		/* not in a loop */
-		return false;
-	header = env->scc_header[scc];
-	if (header == U32_MAX)
+	if (header < 0)			/* not in a loop */
 		return false;
 	return env->insn_aux_data[header].live_regs_before & BIT(regno);
 }
@@ -20449,10 +20422,6 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret < 0)
 		goto skip_full_check;
 
-	ret = compute_scc_headers(env);
-	if (ret < 0)
-		goto skip_full_check;
-
 	ret = bpf_compute_live_registers(env);
 	if (ret < 0)
 		goto skip_full_check;
@@ -20606,7 +20575,6 @@ err_free_env:
 	kvfree(env->cfg.preorder_nums);
 	kvfree(env->cfg.insn_postorder);
 	kvfree(env->scc_info);
-	kvfree(env->scc_header);
 	kvfree(env->succ);
 	kvfree(env->gotox_tmp_buf);
 	kvfree(env->idoms);
