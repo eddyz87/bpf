@@ -3071,12 +3071,12 @@ static void emit_arena_arg_conv(u8 **pprog, u32 src_reg, bool nullable, u32 base
 
 static void save_args(const struct btf_func_model *m, u8 **prog,
 		      int stack_size, bool for_call_origin, u32 flags,
-		      const struct bpf_tramp_arena_args *aargs)
+		      u64 arena_base)
 {
 	int arg_regs, first_off = 0, nr_regs = 0, nr_stack_slots = 0;
 	bool use_jmp = bpf_trampoline_use_jmp(flags);
 	int stack_args_off = (use_jmp || (flags & BPF_TRAMP_F_INDIRECT)) ? 16 : 24;
-	int i, j, slot = 0;
+	int i, j;
 
 	/* Store function arguments to stack.
 	 * For a function that accepts two pointers the sequence will be:
@@ -3084,6 +3084,10 @@ static void save_args(const struct btf_func_model *m, u8 **prog,
 	 * mov QWORD PTR [rbp-0x8],rsi
 	 */
 	for (i = 0; i < min_t(int, m->nr_args, MAX_BPF_FUNC_ARGS); i++) {
+		/* An arena argument is a pointer, so it takes a single slot. */
+		bool arena_arg = arena_base && (m->arg_flags[i] & BTF_FMODEL_ARENA_ARG);
+		bool nullable = m->arg_flags[i] & BTF_FMODEL_NULLABLE_ARG;
+
 		arg_regs = (m->arg_size[i] + 7) / 8;
 
 		/* According to the research of Yonghong, struct members
@@ -3117,10 +3121,9 @@ static void save_args(const struct btf_func_model *m, u8 **prog,
 			for (j = 0; j < arg_regs; j++) {
 				emit_ldx(prog, BPF_DW, BPF_REG_0, BPF_REG_FP,
 					 nr_stack_slots * 8 + stack_args_off);
-				if (aargs && (aargs->slots & BIT(slot)))
-					emit_arena_arg_conv(prog, BPF_REG_0,
-							    aargs->nullable_slots & BIT(slot),
-							    (u32)aargs->kern_vm_start);
+				if (arena_arg)
+					emit_arena_arg_conv(prog, BPF_REG_0, nullable,
+							    (u32)arena_base);
 				emit_stx(prog, BPF_DW, BPF_REG_FP, BPF_REG_0,
 					 -stack_size);
 
@@ -3128,7 +3131,6 @@ static void save_args(const struct btf_func_model *m, u8 **prog,
 					first_off = stack_size;
 				stack_size -= 8;
 				nr_stack_slots++;
-				slot++;
 			}
 		} else {
 			/* Only copy the arguments on-stack to current
@@ -3137,7 +3139,6 @@ static void save_args(const struct btf_func_model *m, u8 **prog,
 			 */
 			if (for_call_origin) {
 				nr_regs += arg_regs;
-				slot += arg_regs;
 				continue;
 			}
 
@@ -3145,16 +3146,14 @@ static void save_args(const struct btf_func_model *m, u8 **prog,
 			for (j = 0; j < arg_regs; j++) {
 				u32 src = nr_regs == 5 ? X86_REG_R9 : BPF_REG_1 + nr_regs;
 
-				if (aargs && (aargs->slots & BIT(slot))) {
-					emit_arena_arg_conv(prog, src,
-							    aargs->nullable_slots & BIT(slot),
-							    (u32)aargs->kern_vm_start);
+				if (arena_arg) {
+					emit_arena_arg_conv(prog, src, nullable,
+							    (u32)arena_base);
 					src = BPF_REG_0;
 				}
 				emit_stx(prog, BPF_DW, BPF_REG_FP, src, -stack_size);
 				stack_size -= 8;
 				nr_regs++;
-				slot++;
 			}
 		}
 	}
@@ -3445,13 +3444,12 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *rw_im
 	struct bpf_tramp_nodes *fentry = &tnodes[BPF_TRAMP_FENTRY];
 	struct bpf_tramp_nodes *fexit = &tnodes[BPF_TRAMP_FEXIT];
 	struct bpf_tramp_nodes *fmod_ret = &tnodes[BPF_TRAMP_MODIFY_RETURN];
-	struct bpf_tramp_arena_args aargs;
 	void *orig_call = func_addr;
 	int cookie_off, cookie_cnt;
 	u8 **branches = NULL;
+	u64 arena_base;
 	u64 func_meta;
 	u8 *prog;
-	bool has_aargs;
 	bool save_ret;
 
 	/*
@@ -3462,7 +3460,7 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *rw_im
 	WARN_ON_ONCE((flags & BPF_TRAMP_F_INDIRECT) &&
 		     (flags & ~(BPF_TRAMP_F_INDIRECT | BPF_TRAMP_F_RET_FENTRY_RET)));
 
-	has_aargs = bpf_tramp_collect_arena_args(tnodes, flags, &aargs);
+	arena_base = bpf_tramp_arena_base(m, tnodes, flags);
 
 	for (i = 0; i < m->nr_args; i++)
 		nr_regs += (m->arg_size[i] + 7) / 8 - 1;
@@ -3598,8 +3596,7 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *rw_im
 		emit_store_stack_imm64(&prog, BPF_REG_0, -ip_off, (long)func_addr);
 	}
 
-	save_args(m, &prog, regs_off, false, flags,
-		  has_aargs ? &aargs : NULL);
+	save_args(m, &prog, regs_off, false, flags, arena_base);
 
 	if (flags & BPF_TRAMP_F_CALL_ORIG) {
 		/* arg1: mov rdi, im */
@@ -3641,7 +3638,8 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *rw_im
 
 	if (flags & BPF_TRAMP_F_CALL_ORIG) {
 		restore_regs(m, &prog, regs_off);
-		save_args(m, &prog, arg_stack_off, true, flags, NULL);
+		/* the origin call takes the arguments as the kernel passed them */
+		save_args(m, &prog, arg_stack_off, true, flags, 0);
 
 		if (flags & BPF_TRAMP_F_TAIL_CALL_CTX) {
 			/* Before calling the original function, load the

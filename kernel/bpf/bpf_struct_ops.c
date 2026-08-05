@@ -174,6 +174,7 @@ static int prepare_arg_info(struct btf *btf,
 			    const char *st_ops_name,
 			    const char *member_name,
 			    const struct btf_type *func_proto, void *stub_func_addr,
+			    struct btf_func_model *model,
 			    struct bpf_struct_ops_arg_info *arg_info)
 {
 	const struct btf_type *stub_func_proto, *pointed_type;
@@ -288,7 +289,16 @@ static int prepare_arg_info(struct btf *btf,
 			 * precision around it, since it has no safety implication.
 			 */
 			info->reg_type = PTR_TO_ARENA;
-			info->arena_nullable = is_arena_nullable;
+			/*
+			 * The suffix lives on the stub function, which the
+			 * func model is not distilled from, so mark the
+			 * argument for the trampoline here. NULL-ness is not
+			 * encoded in the type the program sees, but the JIT
+			 * still needs it to pick the conversion sequence.
+			 */
+			model->arg_flags[arg_no] |= BTF_FMODEL_ARENA_ARG;
+			if (is_arena_nullable)
+				model->arg_flags[arg_no] |= BTF_FMODEL_NULLABLE_ARG;
 		}
 
 		info++;
@@ -476,6 +486,7 @@ int bpf_struct_ops_desc_init(struct bpf_struct_ops_desc *st_ops_desc,
 		stub_func_addr = *(void **)(st_ops->cfi_stubs + moff);
 		err = prepare_arg_info(btf, st_ops->name, mname,
 				       func_proto, stub_func_addr,
+				       &st_ops->func_models[i],
 				       arg_info + i);
 		if (err)
 			goto errout;
