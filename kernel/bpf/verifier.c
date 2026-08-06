@@ -15083,7 +15083,8 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						 * dst is carried across a loop back-edge if it is live
 						 * before the loop header (read in a later iteration).
 						 */
-						dst_carried = reg_is_loop_carried(env, insn->dst_reg);
+						//dst_carried = reg_is_loop_carried(env, insn->dst_reg);
+						dst_carried = false;
 
 						/*
 						 * When no_sext, dst == src exactly, so link them
