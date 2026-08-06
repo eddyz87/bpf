@@ -541,6 +541,10 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 
 	switch (base_type(rold->type)) {
 	case SCALAR_VALUE:
+		verbose(env, "SCALAR_VALUE rold->id=%x rcur->id=%x idmap[old->cur]=[", rold->id, rcur->id);
+		for (int i = 0; i < idmap->cnt; i++)
+			verbose(env, "%s%x->%x", i ? "," : "", idmap->map[i].old, idmap->map[i].cur);
+		verbose(env, "]\n");
 		/*
 		 * BPF_SUBREG_EQ marks a low-32-bit-only link, with different
 		 * sync_linked_regs() semantics than a full/ADD_CONST equality, and
