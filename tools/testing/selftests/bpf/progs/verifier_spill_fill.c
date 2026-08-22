@@ -1403,6 +1403,43 @@ __naked void partial_fill_from_cleaned_pointer_spill(void)
 		      ::: __clobber_all);
 }
 
+SEC("raw_tp")
+__failure
+__msg("access may be outside object bounds")
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked void imprecise_scalar_spill_half_dead(void)
+{
+	asm volatile (
+		/* fork two paths: one spills an imprecise zero, the other an
+		 * imprecise non-zero scalar.
+		 */
+		"call %[bpf_get_prandom_u32];"
+		"if r0 > 42 goto 1f;"
+		"r6 = 0;"
+		"goto 2f;"
+	"1:"
+		"r6 = 100500;"
+	"2:"
+		/* force a checkpoint before the spill */
+		"goto +0;"
+		"*(u64 *)(r10 - 8) = r6;"
+		/* force stack cleanup before the fill; only the low half of the
+		 * spill is live, so the dead high half gets scrubbed and the spill
+		 * is degraded to raw stack bytes.
+		 */
+		"goto +0;"
+		"r7 = *(u32 *)(r10 - 4);"
+		/* use r7 as an offset into a one-byte buffer */
+		"r1 = %[single_byte_buf] ll;"
+		"r1 += r7;"
+		"r0 = *(u8 *)(r1 + 0);"
+		"exit;"
+	:
+	: __imm(bpf_get_prandom_u32),
+	  __imm_addr(single_byte_buf)
+	: __clobber_all);
+}
+
 /* check valid spill/fill, ptr to tp buffer */
 SEC("raw_tracepoint.w")
 __success
