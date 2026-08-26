@@ -335,7 +335,8 @@ static bool is_live_before(struct func_instance *instance, u32 insn_idx, u32 fra
 	return masks && spis_test_bit(masks->live_before, half_spi);
 }
 
-int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_state *st)
+int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			      int insn_idx)
 {
 	struct live_stack_query *q = &env->liveness->live_stack_query;
 	struct func_instance *instance;
@@ -352,7 +353,7 @@ int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_
 			q->callsites[frame] = st->frame[frame + 1]->callsite;
 	}
 	q->curframe = st->curframe;
-	q->insn_idx = st->insn_idx;
+	q->insn_idx = insn_idx;
 	return 0;
 }
 

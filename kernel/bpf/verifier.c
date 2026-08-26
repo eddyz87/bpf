@@ -3570,6 +3570,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	struct bpf_reg_state *reg = NULL;
 	int insn_flags = INSN_F_STACK_ACCESS;
 	int hist_spi = spi, hist_frame = state->frameno;
+	bool hi_live = true, lo_live = true, live = true;
 
 	/* caller checked that off % size == 0 and -MAX_BPF_STACK <= off < 0,
 	 * so it's aligned access and [off, off + size) are within stack limits
@@ -3594,6 +3595,22 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 	cur = env->cur_state->frame[env->cur_state->curframe];
 	if (value_regno >= 0)
 		reg = &cur->regs[value_regno];
+
+	/*
+	 * Convert half-dead and fully dead spills to STACK_{MISC,ZERO},
+	 * to help with states pruning logic. Can't do it in clean_func_state()
+	 * because of the need to call mark_chain_precision() for STACK_ZERO case.
+	 */
+	if (env->bpf_capable) {
+		/* slots alive *after* current instruction, hence 'insn_idx + 1' */
+		err = bpf_live_stack_query_init(env, env->cur_state, env->cur_state->insn_idx + 1);
+		if (err)
+			return err;
+		hi_live = bpf_stack_slot_alive(env, state->frameno, spi * 2 + 1);
+		lo_live = bpf_stack_slot_alive(env, state->frameno, spi * 2);
+		live = hi_live || lo_live;
+	}
+
 	if (!env->bypass_spec_v4) {
 		bool sanitize = reg && is_pointer_regtype(reg->type);
 
@@ -3617,7 +3634,8 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 
 	check_fastcall_stack_contract(env, state, insn_idx, off);
 	mark_stack_slot_scratched(env, spi);
-	if (reg && !(off % BPF_REG_SIZE) && reg->type == SCALAR_VALUE && env->bpf_capable) {
+	if (reg && hi_live && !(off % BPF_REG_SIZE) &&
+	    reg->type == SCALAR_VALUE && env->bpf_capable) {
 		bool reg_value_fits;
 
 		reg_value_fits = get_reg_width(reg) <= BITS_PER_BYTE * size;
@@ -3636,7 +3654,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		__mark_reg_known(tmp_reg, insn->imm);
 		tmp_reg->type = SCALAR_VALUE;
 		save_register_state(env, state, spi, tmp_reg, size);
-	} else if (reg && is_pointer_regtype(reg->type)) {
+	} else if (reg && live && is_pointer_regtype(reg->type)) {
 		/* register containing pointer is being spilled into stack */
 		if (size != BPF_REG_SIZE) {
 			verbose_linfo(env, insn_idx, "; ");

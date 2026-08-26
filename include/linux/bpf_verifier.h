@@ -1632,7 +1632,8 @@ int bpf_compute_subprog_arg_access(struct bpf_verifier_env *env);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);
-int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
+int bpf_live_stack_query_init(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+			      int insn_idx);
 bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 spi);
 int bpf_compute_live_registers(struct bpf_verifier_env *env);
 

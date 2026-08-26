@@ -420,6 +420,7 @@ static void __clean_func_state(struct bpf_verifier_env *env,
 		bool hi_live = bpf_stack_slot_alive(env, frame, i * 2 + 1);
 
 		if (!hi_live || !lo_live) {
+			struct bpf_reg_state *spill = &st->stack[i].spilled_ptr;
 			int start = !lo_live ? 0 : BPF_REG_SIZE / 2;
 			int end = !hi_live ? BPF_REG_SIZE : BPF_REG_SIZE / 2;
 			u8 stype = st->stack[i].slot_type[7];
@@ -435,36 +436,10 @@ static void __clean_func_state(struct bpf_verifier_env *env,
 			    stype == STACK_IRQ_FLAG)
 				continue;
 
-			/*
-			 * Only scalar spills can be degraded to raw stack bytes
-			 * when their high half is dead. Pointer spills need the
-			 * saved spilled_ptr metadata so partial fills keep
-			 * rejecting as non-scalar register fills.
-			 */
-			if (!hi_live) {
-				struct bpf_reg_state *spill = &st->stack[i].spilled_ptr;
+			/* Don't clear half dead pointers to report an error when reading them */
+			if (!hi_live && stype == STACK_SPILL && spill->type != SCALAR_VALUE)
+				continue;
 
-				if (lo_live && stype == STACK_SPILL) {
-					u8 val = STACK_MISC;
-
-					if (spill->type != SCALAR_VALUE)
-						continue;
-
-					/*
-					 * 8 byte spill of scalar 0 where half slot is dead
-					 * should become STACK_ZERO in lo 4 bytes.
-					 */
-					if (bpf_register_is_null(spill))
-						val = STACK_ZERO;
-					for (j = 0; j < 4; j++) {
-						u8 *t = &st->stack[i].slot_type[j];
-
-						if (*t == STACK_SPILL)
-							*t = val;
-					}
-				}
-				bpf_mark_reg_not_init(env, spill);
-			}
 			for (j = start; j < end; j++)
 				st->stack[i].slot_type[j] = STACK_POISON;
 		}
@@ -476,7 +451,7 @@ static int clean_verifier_state(struct bpf_verifier_env *env,
 {
 	int i, err;
 
-	err = bpf_live_stack_query_init(env, st);
+	err = bpf_live_stack_query_init(env, st, st->insn_idx);
 	if (err)
 		return err;
 	for (i = 0; i <= st->curframe; i++) {
