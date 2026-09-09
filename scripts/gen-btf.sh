@@ -76,7 +76,6 @@ gen_btf_data()
 
 	${RESOLVE_BTFIDS} ${RESOLVE_BTFIDS_FLAGS}	\
 		${BTF_BASE:+--btf_base ${BTF_BASE}}	\
-		${BTF_INLINE:+--inline}		\
 		--btf ${btf1} "${ELF_FILE}"
 }
 
