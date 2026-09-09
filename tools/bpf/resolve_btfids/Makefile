@@ -89,6 +89,19 @@ $(BINARY): $(BPFOBJ) $(SUBCMDOBJ) $(BINARY_IN)
 	$(call msg,LINK,$@)
 	$(Q)$(HOSTCC) $(BINARY_IN) $(KBUILD_HOSTLDFLAGS) $(EXTRA_LDFLAGS) -o $@ $(BPFOBJ) $(SUBCMDOBJ) $(LIBS)
 
+$(OUTPUT)/btf_rebuild_test: tests/btf_rebuild.c btf_colors.h $(BINARY)
+	$(call msg,HOSTCC,$@)
+	$(Q)$(HOSTCC) $(HOSTCFLAGS_resolve_btfids) $(HOSTCFLAGS) $< $(OUTPUT)/btf_colors.o \
+		$(KBUILD_HOSTLDFLAGS) $(EXTRA_LDFLAGS) -o $@ $(BPFOBJ) $(LIBS)
+
+$(OUTPUT)/inline_fixture.o: tests/fixture.c | $(OUTPUT)
+	$(call msg,HOSTCC,$@)
+	$(Q)$(HOSTCC) $(HOSTCFLAGS) -c $< -o $@
+
+# These tests operate on ELF/BTF files and do not require a running BPF kernel.
+test: $(BINARY) $(OUTPUT)/btf_rebuild_test $(OUTPUT)/inline_fixture.o
+	$(Q)$(OUTPUT)/btf_rebuild_test $(BINARY) $(OUTPUT)/inline_fixture.o $(OUTPUT)/test-results
+
 clean_objects := $(wildcard $(OUTPUT)/*.o                \
                             $(OUTPUT)/.*.o.cmd           \
                             $(OUTPUT)/.*.o.d             \
@@ -96,7 +109,9 @@ clean_objects := $(wildcard $(OUTPUT)/*.o                \
                             $(LIBBPF_DESTDIR)            \
                             $(SUBCMD_OUT)                \
                             $(SUBCMD_DESTDIR)            \
-                            $(OUTPUT)/resolve_btfids)
+                            $(OUTPUT)/resolve_btfids     \
+                            $(OUTPUT)/btf_rebuild_test   \
+                            $(OUTPUT)/test-results)
 
 ifneq ($(clean_objects),)
 clean: fixdep-clean
@@ -112,4 +127,4 @@ tags:
 
 FORCE:
 
-.PHONY: all FORCE clean tags prepare
+.PHONY: all FORCE clean tags prepare test
