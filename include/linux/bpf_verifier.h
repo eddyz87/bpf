@@ -1552,7 +1552,7 @@ struct ref_obj_desc {
  * after all arguments have been checked.
  */
 struct arg_raw_mem_desc {
-	u8 regno;
+	u8 regno; /* Register number, or one-based kfunc argument slot. */
 	int size;
 };
 

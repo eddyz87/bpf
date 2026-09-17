@@ -6981,7 +6981,7 @@ static int check_stack_range_initialized(
 	 */
 	bool allow_poison = access_size < 0 || clobber;
 	/* The call will initialize the memory; uninitialized stack allowed */
-	bool raw_mode = meta && meta->arg_raw_mem.regno == reg_from_argno(argno);
+	bool raw_mode = meta && meta->arg_raw_mem.regno == abs(argno.argno);
 
 	access_size = abs(access_size);
 
@@ -7216,7 +7216,7 @@ static int check_mem_size_reg(struct bpf_verifier_env *env,
 	 * the memory that the helper could just partially fill up.
 	 */
 	if (!tnum_is_const(size_reg->var_off) &&
-	    meta->arg_raw_mem.regno == reg_from_argno(mem_argno))
+	    meta->arg_raw_mem.regno == abs(mem_argno.argno))
 		meta->arg_raw_mem.regno = 0;
 
 	if (reg_smin(size_reg) < 0) {
@@ -9559,13 +9559,14 @@ static int check_func_args(struct bpf_verifier_env *env, struct bpf_call_arg_met
 static int mark_raw_stack(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 			  int insn_idx)
 {
+	struct bpf_func_state *caller = cur_func(env);
 	struct bpf_reg_state *reg;
-	u32 regno = meta->arg_raw_mem.regno;
+	u32 slot = meta->arg_raw_mem.regno - 1;
 	int i, err;
 
 	if (!meta->arg_raw_mem.size)
 		return 0;
-	reg = cur_regs(env) + regno;
+	reg = get_func_arg_reg(caller, cur_regs(env), slot);
 
 	/*
 	 * Validate every argument before initializing outputs: an input argument
@@ -9573,7 +9574,7 @@ static int mark_raw_stack(struct bpf_verifier_env *env, struct bpf_call_arg_meta
 	 * stale spills and preserve the rules for special stack objects.
 	 */
 	for (i = 0; i < meta->arg_raw_mem.size; i++) {
-		err = check_mem_access(env, insn_idx, reg, argno_from_reg(regno), i, BPF_B,
+		err = check_mem_access(env, insn_idx, reg, argno_from_arg(slot + 1), i, BPF_B,
 				       BPF_WRITE, -1, false, false);
 		if (err)
 			return err;
