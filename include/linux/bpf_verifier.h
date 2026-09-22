@@ -1773,5 +1773,8 @@ int bpf_insn_def32(struct bpf_prog *prog, struct bpf_insn *insn);
 bool bpf_is_unwind_resume_kfunc(const struct bpf_insn *insn);
 int bpf_prepare_cleanup_exceptions(struct bpf_verifier_env *env);
 int bpf_check_cleanup_insn(struct bpf_verifier_env *env);
+int bpf_cleanup_alloc_info(struct bpf_prog_aux *aux);
+int bpf_cleanup_attach_info(struct bpf_prog_aux *aux, struct bpf_cleanup_info *recs, u32 cnt);
+const struct bpf_cleanup_range *bpf_cleanup_pad_for_ip(const struct bpf_prog *prog, u64 ip);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

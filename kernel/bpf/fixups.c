@@ -1110,6 +1110,108 @@ static void bpf_restore_subprog_starts(struct bpf_verifier_env *env, u32 *orig_s
 	env->subprog_info[env->subprog_cnt].start = env->prog->len;
 }
 
+static bool cleanup_kfunc_site(const struct bpf_insn_aux_data *aux, bool resume)
+{
+	return resume ? aux->cleanup_resume_site : aux->cleanup_throw_site;
+}
+
+static int cleanup_kfunc_sites_for_subprog(struct bpf_verifier_env *env, u32 start, u32 end,
+					   bool resume, u32 **at_p, u32 *nr_p)
+{
+	u32 i, cnt = 0, *at;
+
+	for (i = start; i < end; i++)
+		if (cleanup_kfunc_site(&env->insn_aux_data[i], resume))
+			cnt++;
+	if (!cnt)
+		return 0;
+
+	at = kvmalloc_array(cnt, sizeof(*at), GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
+	if (!at)
+		return -ENOMEM;
+
+	for (i = start, cnt = 0; i < end; i++) {
+		if (!cleanup_kfunc_site(&env->insn_aux_data[i], resume))
+			continue;
+		at[cnt++] = i - start;
+	}
+
+	*at_p = at;
+	*nr_p = cnt;
+	return 0;
+}
+
+static int cleanup_info_for_subprog(struct bpf_verifier_env *env, struct bpf_prog *sub,
+				    u32 start, u32 end)
+{
+	struct bpf_cleanup_info *recs;
+	u32 i, cnt = 0;
+	int err;
+
+	if (!env->has_cleanup)
+		return 0;
+
+	err = bpf_cleanup_alloc_info(sub->aux);
+	if (err)
+		return err;
+
+	err = cleanup_kfunc_sites_for_subprog(env, start, end, false,
+					      &sub->aux->exc->throw_at,
+					      &sub->aux->exc->nr_throw_at);
+	if (err)
+		return err;
+
+	err = cleanup_kfunc_sites_for_subprog(env, start, end, true,
+					      &sub->aux->exc->resume_at,
+					      &sub->aux->exc->nr_resume_at);
+	if (err)
+		return err;
+
+	for (i = 0; i < sub->len; i++)
+		if (bpf_is_unwind(&sub->insnsi[i]))
+			cnt++;
+	if (!cnt)
+		return 0;
+
+	recs = kvmalloc_array(cnt, sizeof(*recs), GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
+	if (!recs)
+		return -ENOMEM;
+
+	for (i = 0, cnt = 0; i < sub->len; i++) {
+		struct bpf_insn *insn = &sub->insnsi[i];
+		s64 pad;
+
+		if (!bpf_is_unwind(insn))
+			continue;
+		pad = (s64)i + 1 + insn->off;
+		if (verifier_bug_if(!i || sub->insnsi[i - 1].code != (BPF_JMP | BPF_CALL) ||
+				    pad < 0 || pad >= sub->len, env,
+				    "invalid UNWIND after instruction rewrites at %u", start + i)) {
+			kvfree(recs);
+			return -EFAULT;
+		}
+		recs[cnt].begin_off = i - 1;
+		recs[cnt].end_off = i;
+		recs[cnt].landing_pad_off = pad;
+		cnt++;
+	}
+	err = bpf_cleanup_attach_info(sub->aux, recs, cnt);
+	if (err)
+		return err;
+	/* No instruction-count changes after metadata extraction. */
+	for (i = 0; i < sub->len; i++)
+		if (bpf_is_unwind(&sub->insnsi[i]))
+			sub->insnsi[i] = BPF_JMP_A(0);
+	return 0;
+}
+
+int bpf_cleanup_attach_main_prog(struct bpf_verifier_env *env, struct bpf_prog *prog)
+{
+	if (!env || env->subprog_cnt > 1)
+		return 0;
+	return cleanup_info_for_subprog(env, prog, 0, prog->len);
+}
+
 static int jit_subprogs(struct bpf_verifier_env *env)
 {
 	struct bpf_prog *prog = env->prog, **func, *tmp;
@@ -1247,6 +1349,10 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->token = prog->aux->token;
 		if (!i)
 			func[i]->aux->exception_boundary = env->seen_exception;
+		err = cleanup_info_for_subprog(env, func[i], subprog_start,
+					       subprog_end);
+		if (err)
+			goto out_free;
 		func[i] = bpf_int_jit_compile(env, func[i]);
 		if (!func[i]->jited) {
 			err = -ENOTSUPP;
@@ -1351,6 +1457,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
 	prog->aux->exception_boundary = func[0]->aux->exception_boundary;
 	prog->aux->stack_arg_sp_adjust = func[0]->aux->stack_arg_sp_adjust;
+	prog->aux->exc = func[0]->aux->exc;
+	func[0]->aux->exc = NULL;
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
 out_free:
