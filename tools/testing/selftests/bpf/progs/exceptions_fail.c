@@ -111,7 +111,7 @@ static int timer_cb(void *map, int *key, struct bpf_timer *timer)
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback subprog")
+__failure __msg("may unwind and is used as a callback")
 int reject_async_callback_throw(struct __sk_buff *ctx)
 {
 	struct hmap_elem *elem;
@@ -181,7 +181,7 @@ static bool rbless(struct bpf_rb_node *n1, const struct bpf_rb_node *n2)
 }
 
 SEC("?tc")
-__failure __msg("function calls are not allowed while holding a lock")
+__failure __msg("may unwind and is used as a callback")
 int reject_with_rbtree_add_throw(void *ctx)
 {
 	struct foo *f;
@@ -248,7 +248,7 @@ __noinline static int subprog_cb_ref(u32 i, void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__failure __msg("may unwind and is used as a callback")
 int reject_with_cb_reference(void *ctx)
 {
 	struct foo *f;
@@ -262,7 +262,7 @@ int reject_with_cb_reference(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback")
+__failure __msg("may unwind and is used as a callback")
 int reject_with_cb(void *ctx)
 {
 	bpf_loop(5, subprog_cb_ref, NULL, 0);
@@ -370,7 +370,7 @@ __noinline static int loop_cb2(u32 index, int *ctx)
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback")
+__failure __msg("may unwind and is used as a callback")
 int reject_exception_throw_cb(struct __sk_buff *ctx)
 {
 	bpf_loop(5, loop_cb1, NULL, 0);
@@ -378,7 +378,7 @@ int reject_exception_throw_cb(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
-__failure __msg("cannot be called from callback")
+__failure __msg("may unwind and is used as a callback")
 int reject_exception_throw_cb_diff(struct __sk_buff *ctx)
 {
 	if (ctx->protocol)
