@@ -252,10 +252,15 @@ static void adjust_insn_aux_data(struct bpf_verifier_env *env,
 		/* Expand insni[off]'s seen count to the patched range. */
 		data[i].seen = old_seen;
 		data[i].zext_dst = bpf_insn_def32(new_prog, insn + i) >= 0;
+		data[i].in_cleanup_pad = data[off + cnt - 1].in_cleanup_pad;
 		if (!memcmp(insn + i, original_insn, sizeof(struct bpf_insn))) {
 			data[i].non_stack_access =
 				data[off + cnt - 1].non_stack_access;
 			data[off + cnt - 1].non_stack_access = false;
+			data[i].cleanup_throw_site = data[off + cnt - 1].cleanup_throw_site;
+			data[off + cnt - 1].cleanup_throw_site = false;
+			data[i].cleanup_resume_site = data[off + cnt - 1].cleanup_resume_site;
+			data[off + cnt - 1].cleanup_resume_site = false;
 		} else if (bpf_is_mem_insn(insn + i)) {
 			data[i].non_stack_access = true;
 		}
@@ -337,6 +342,12 @@ struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 	struct bpf_prog *new_prog;
 	struct bpf_insn_aux_data *new_data = NULL;
 	struct bpf_insn original_insn;
+
+	if (verifier_bug_if(off + 1 < env->prog->len &&
+			    bpf_is_unwind(&env->prog->insnsi[off + 1]) &&
+			    patch[len - 1].code != (BPF_JMP | BPF_CALL), env,
+			    "call fixup separates UNWIND from its call"))
+		return NULL;
 
 	if (len > 1) {
 		new_data = vrealloc(env->insn_aux_data,
@@ -602,6 +613,10 @@ void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
 	int i;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
+		/* Drop associations whose call or landing pad will be removed. */
+		if (bpf_is_unwind(insn) &&
+		    (!aux_data[i - 1].seen || !aux_data[i + 1 + insn->off].seen))
+			*insn = BPF_JMP_A(0);
 		if (!bpf_insn_is_cond_jump(insn->code))
 			continue;
 
@@ -1916,6 +1931,8 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_CALL)
 			goto next_insn;
+		if (env->insn_aux_data[i + delta].cleanup_resume_site)
+			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
 			ret = bpf_fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt);
 			if (ret)
@@ -2694,4 +2711,3 @@ int bpf_remove_fastcall_spills_fills(struct bpf_verifier_env *env)
 
 	return 0;
 }
-
