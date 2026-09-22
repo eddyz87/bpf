@@ -590,7 +590,7 @@ bool bpf_insn_is_cond_jump(u8 code)
 	if (BPF_CLASS(code) != BPF_JMP)
 		return false;
 
-	return op != BPF_JA && op != BPF_EXIT && op != BPF_CALL;
+	return op != BPF_JA && op != BPF_EXIT && op != BPF_CALL && op != BPF_UNWIND;
 }
 
 void bpf_opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)

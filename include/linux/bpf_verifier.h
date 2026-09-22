@@ -418,6 +418,7 @@ enum {
 	INSN_F_SRC_REG_STACK = BIT(2), /* src_reg is PTR_TO_STACK */
 
 	INSN_F_STACK_ARG_ACCESS = BIT(3),
+	INSN_F_UNWIND = BIT(4), /* this modifier entered a pad and defined R0 */
 };
 
 struct bpf_jmp_history_entry {
@@ -428,8 +429,8 @@ struct bpf_jmp_history_entry {
 	u32 : 2;
 	u32 prev_idx : 20;
 	/* special INSN_F_xxx flags */
-	u32 flags : 4;
-	u32 : 8;
+	u32 flags : 5;
+	u32 unwind_frames : 4;	/* frames popped by this instruction's unwind */
 	/*
 	 * additional registers that need precision tracking when this
 	 * jump is backtracked, vector of five 11-bit records
@@ -509,6 +510,8 @@ struct bpf_verifier_state {
 
 	bool speculative;
 	bool in_sleepable;
+	bool unwinding; /* an exception is in flight */
+	u8 unwind_frameno; /* pad owner; curframe below it means exceptional dispatch */
 
 	/* first and last insn idx of this verifier state */
 	u32 first_insn_idx;
@@ -681,6 +684,9 @@ struct bpf_insn_aux_data {
 	bool needs_zext; /* alu op needs to clear upper bits */
 	bool non_sleepable; /* helper/kfunc may be called from non-sleepable context */
 	bool is_iter_next; /* bpf_iter_<type>_next() kfunc call */
+	bool cleanup_throw_site; /* call to bpf_throw() */
+	bool cleanup_resume_site; /* call to bpf_unwind_resume() */
+	bool in_cleanup_pad; /* reachable from an exception cleanup landing pad */
 	bool call_with_percpu_alloc_ptr; /* {this,per}_cpu_ptr() with prog percpu alloc */
 	u8 alu_state; /* used in combination with alu_limit */
 	/* true if STX or LDX instruction is a part of a spill/fill
@@ -987,6 +993,7 @@ struct bpf_verifier_env {
 	struct arg_track **callsite_at_stack;
 	u32 pass_cnt; /* number of times do_check() was called */
 	u32 subprog_cnt;
+	bool has_cleanup;
 	/* number of instructions analyzed by the verifier */
 	u32 prev_insn_processed, insn_processed;
 	/* number of jmps, calls, exits analyzed so far */
@@ -1761,5 +1768,10 @@ int bpf_jit_subprogs(struct bpf_verifier_env *env);
 int bpf_fixup_call_args(struct bpf_verifier_env *env);
 int bpf_do_misc_fixups(struct bpf_verifier_env *env);
 int bpf_insn_def32(struct bpf_prog *prog, struct bpf_insn *insn);
+
+/* Functions in exception.c */
+bool bpf_is_unwind_resume_kfunc(const struct bpf_insn *insn);
+int bpf_prepare_cleanup_exceptions(struct bpf_verifier_env *env);
+int bpf_check_cleanup_insn(struct bpf_verifier_env *env);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

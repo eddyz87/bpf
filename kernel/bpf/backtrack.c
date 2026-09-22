@@ -47,6 +47,7 @@ int bpf_push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_state
 	p->flags = insn_flags;
 	p->spi = spi;
 	p->frame = frame;
+	p->unwind_frames = 0;
 	p->linked_regs = linked_regs;
 	cur->jmp_history_cnt = cnt;
 	env->cur_hist_ent = p;
@@ -275,6 +276,12 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 
 	if (insn->code == 0)
 		return 0;
+	/* An exceptional call or resume can pop frames without BPF_EXIT.
+	 * Re-enter them before interpreting the source instruction.
+	 */
+	for (fr = 0; hist && fr < hist->unwind_frames; fr++)
+		if (bt_subprog_enter(bt))
+			return -EFAULT;
 	if (env->log.level & BPF_LOG_LEVEL2) {
 		fmt_reg_mask(env->tmp_str_buf, TMP_STR_BUF_LEN, bt_reg_mask(bt));
 		verbose(env, "mark_precise: frame%d: regs=%s ",
@@ -291,6 +298,13 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 	 * accounts for these registers.
 	 */
 	bpf_bt_sync_linked_regs(bt, hist);
+
+	if (bpf_is_unwind(insn)) {
+		/* Pad entry defines R0; normal fallthrough changes no registers. */
+		if (hist && (hist->flags & INSN_F_UNWIND))
+			bt_clear_reg(bt, BPF_REG_0);
+		return 0;
+	}
 
 	if (class == BPF_ALU || class == BPF_ALU64) {
 		if (!bt_is_reg_set(bt, dreg))
@@ -419,7 +433,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				 * extra instructions from subprog; the next
 				 * instruction after call to global subprog
 				 * should be literally next instruction in
-				 * caller program
+				 * caller program (also the exceptional continuation)
 				 */
 				verifier_bug_if(idx + 1 != subseq_idx, env,
 						"extra insn from subprog");
@@ -888,11 +902,11 @@ int bpf_mark_chain_precision(struct bpf_verifier_env *env,
 		}
 
 		for (i = last_idx;;) {
+			hist = get_jmp_hist_entry(st, history, i);
 			if (skip_first) {
 				err = 0;
 				skip_first = false;
 			} else {
-				hist = get_jmp_hist_entry(st, history, i);
 				err = backtrack_insn(env, i, subseq_idx, hist, bt);
 			}
 			if (err == -ENOTSUPP) {

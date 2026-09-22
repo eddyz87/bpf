@@ -240,6 +240,7 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 		_J(BPF_JSLE,  {.can_jump = true,  .can_fallthrough = true}),
 		_J(BPF_JCOND, {.can_jump = true,  .can_fallthrough = true}),
 		_J(BPF_JSET,  {.can_jump = true,  .can_fallthrough = true}),
+		_J(BPF_UNWIND, {.can_jump = true, .can_fallthrough = true}),
 	#undef _J
 	};
 	struct bpf_prog *prog = env->prog;
@@ -255,6 +256,9 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 	/* pre-allocated array of size up to 2; reset cnt, as it may have been used already */
 	succ = env->succ;
 	succ->cnt = 0;
+
+	if (bpf_is_unwind_resume_kfunc(insn))
+		return succ;
 
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
@@ -2188,6 +2192,7 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 				use = 0;
 			break;
 		case BPF_JCOND:
+		case BPF_UNWIND:
 			def = 0;
 			use = 0;
 			break;
