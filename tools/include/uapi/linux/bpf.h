@@ -45,6 +45,7 @@
 #define BPF_JCOND	0xe0	/* conditional pseudo jumps: may_goto, goto_or_nop */
 #define BPF_CALL	0x80	/* function call */
 #define BPF_EXIT	0x90	/* function return */
+#define BPF_UNWIND	0xf0	/* postfix unwind, encoded with BPF_JMP | BPF_X */
 
 /* atomic op type fields (stored in immediate) */
 #define BPF_FETCH	0x01	/* not an opcode on its own, used to build others */

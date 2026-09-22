@@ -362,6 +362,9 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 							tmp, sizeof(tmp)),
 					insn->imm);
 			}
+		} else if (insn->code == (BPF_JMP | BPF_UNWIND | BPF_X)) {
+			verbose(cbs->private_data, "(%02x) unwind pc%+d",
+				insn->code, insn->off);
 		} else if (insn->code == (BPF_JMP | BPF_JA)) {
 			verbose(cbs->private_data, "(%02x) goto pc%+d",
 				insn->code, insn->off);
