@@ -1431,6 +1431,29 @@ static int simplify(struct scev *scev, u32 id, void *priv)
 	return id;
 }
 
+// TODO:
+// Handle the following program:
+//
+//    r0 = 0, r1 = 7
+// l: if r0 == 10 goto e;
+//    r0 += 1
+//    ... use r1 ...
+//    r1 = 42
+//    goto l
+// e:
+//
+// Here r1 has to be widened as 7..42.
+// For this compute_header_scevs() needs to assume that
+// for any register rX the real expression at entry is
+// a join between rX and whatever expression was computed
+// for the header_env.
+// E.g. adjust scev inference rules:
+// - rA = (+ rA IMM) -> (+ rA IMM)
+// - rA = rA -> rA
+// - rA = (any ...) -> (any ... rA)
+
+// TODO:
+// process registers in the topo/dependency order
 static int compute_header_scevs(struct bpf_verifier_env *env, struct env *header_env)
 {
 	struct scev *scev = env->scev;
