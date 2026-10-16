@@ -1595,6 +1595,86 @@ SEC("xdp")
 __success
 __log_level(2)
 __flag(BPF_F_TEST_STATE_FREQ)
+__msg_next("scev at header 1:")
+__msg_next("  r0=(zext32 (+ r0 1)) / (zext32 (linear r0 1))")
+__msg_next(" scev at latch 2:")
+__msg_next("  r0=(zext32 (+ r0 1)) / (zext32 (linear (+ r0 1) 1))")
+__msg("loop header at 1, widening r0")
+__msg("1: R0=scalar(smin=smin32=0,smax=umax=smax32=umax32=2,{{.*}})")
+__msg("1: (04) w0 += 1                       ; R0=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=3,{{.*}})")
+__msg("2: (56) if w0 != 0x3 goto pc-2")
+__msg("3: (95) exit")
+__msg("loop header at 1, clamping r0")
+__msg("from 2 to 1: safe")
+__msg("processed 5 insns")
+__naked void post_cond_jne32(void)
+{
+	asm volatile ("					\
+	w0 = 0;						\
+1:	w0 += 1;					\
+	if w0 != 3 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/* The entry -6 and zero-extended -9 have different residues modulo 3. */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 2")
+__msg("loop header at 1, widening r0 to -6..0xfffffffa step 1")
+__naked void post_cond_jne32_base_mismatch(void)
+{
+	asm volatile ("					\
+	r0 = -6;					\
+1:	w0 += -3;					\
+	if w0 != -12 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/* Header values are 0 and U32_MAX, rather than 0 and the 64-bit value -1. */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 1, header_count is 2")
+__msg("loop header at 1, widening r0 to 0..0xffffffff step 1")
+__naked void post_cond_jne32_neg_step(void)
+{
+	asm volatile ("					\
+	w0 = 0;						\
+1:	w0 += -1;					\
+	if w0 != -2 goto 1b;				\
+	exit;						\
+"	::: __clobber_all);
+}
+
+/* The circular union crosses S64_MAX/S64_MIN, but both header values are odd. */
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
+__msg("loop header at 2, header_count is 2")
+__msg("loop header at 2, widening r0 to 0x8000000000000000..0x7fffffffffffffff step 2")
+__msg("2: R0=scalar({{.*}}step=1+2)")
+__naked void post_cond_jne32_signed_boundary(void)
+{
+	asm volatile ("					\
+	r0 = %[initial] ll;				\
+1:	w0 += 2;					\
+	if w0 != 5 goto 1b;				\
+	exit;						\
+"	:
+	: __imm_const(initial, ITER_S64_MIN + 1)
+	: __clobber_all);
+}
+
+SEC("xdp")
+__success
+__log_level(2)
+__flag(BPF_F_TEST_STATE_FREQ)
 __msg("loop header at 1, header_count is [0..3] ")
 __naked void one_backedge_two_exits(void)
 {
