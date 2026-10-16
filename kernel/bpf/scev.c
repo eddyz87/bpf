@@ -248,6 +248,13 @@ static bool is_linear(struct scev *scev, int id, u32 *base, u32 *slope)
 {
 	return is_binop(scev, LINEAR_SCEV, id, base, slope);
 }
+// TODO: add is_linear64 and add a zext32 flag in is_linear64
+static bool is_linear32(struct scev *scev, int id, u32 *base, u32 *slope)
+{
+	u32 t;
+
+	return is_zext32(scev, id, &t) && is_linear(scev, t, base, slope);
+}
 
 static bool is_opaque(struct scev *scev, int id)
 {
@@ -1464,7 +1471,7 @@ static int transform_expr(struct scev *scev, u32 root, void *priv,
 
 static int simplify(struct scev *scev, u32 id, void *priv)
 {
-	u32 l, r, base, slope;
+	int a, b, l, r, t, base, slope;
 	s64 imm1, imm2;
 
 	/* (+ (linear base slope) imm) -> (linear (+ base imm) slope) */
@@ -1483,13 +1490,24 @@ static int simplify(struct scev *scev, u32 id, void *priv)
 	if (is_zext32(scev, id, &l) && is_imm(scev, l, &imm1))
 		return imm_expr(scev, (u64)(u32)imm1);
 
+	/*
+	 * (zext32 (+ (zext32 $a) $b)) -> (zext32 (+ $a $b))
+	 * (zext32 (+ $a (zext32 $b))) -> (zext32 (+ $a $b))
+	 */
+	if ((is_zext32(scev, id, &t) && is_add(scev, t, &l, &b) && is_zext32(scev, l, &a)) ||
+	    (is_zext32(scev, id, &t) && is_add(scev, t, &a, &r) && is_zext32(scev, r, &b))) {
+		t = expr2(scev, BPF_ADD, a, b);
+		t = expr1(scev, ZEXT32, t);
+		return t;
+	}
+
 	return id;
 }
 
 static int compute_header_scevs(struct bpf_verifier_env *env, struct env *header_env)
 {
 	struct scev *scev = env->scev;
-	int l, r, id, ra, rb, ra_expr;
+	int l, r, t, id, ra, rb, ra_expr;
 	s64 imm;
 
 	/*
@@ -1517,6 +1535,19 @@ static int compute_header_scevs(struct bpf_verifier_env *env, struct env *header
 		    is_imm(scev, r, &imm) &&
 		    ra == rb) {
 			id = expr2(scev, LINEAR_SCEV, l, r);
+			if (id < 0)
+				return id;
+			header_env->reg2scev[ra] = id;
+			continue;
+		}
+		/* rA = (is_zext32 (+ rA IMM)) -> (is_zext32 (linear rA IMM)) */
+		if (is_zext32(scev, ra_expr, &t) &&
+		    is_add(scev, t, &l, &r) &&
+		    is_reg(scev, l, &rb) &&
+		    is_imm(scev, r, &imm) &&
+		    ra == rb) {
+			id = expr2(scev, LINEAR_SCEV, l, r);
+			id = expr1(scev, ZEXT32, id);
 			if (id < 0)
 				return id;
 			header_env->reg2scev[ra] = id;
@@ -1852,7 +1883,8 @@ struct linear_latch {
 	u32 base_expr;
 	u32 step_expr;
 	u32 bound_expr;
-	u32 op;
+	u8 op;
+	bool zext32;
 };
 
 static bool loop_invariant(struct scev *scev, u32 id)
@@ -1878,9 +1910,6 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 	u32 t, l, r, op;
 	int id;
 
-	/* 32-bit arithmetic is not handled yet */
-	if (BPF_CLASS(insn->code) != BPF_JMP)
-		return false;
 	op = BPF_OP(insn->code);
 	/* Flip the condition if true branch jumps out of the loop. */
 	true_branch_tgt = latch_idx + bpf_jmp_offset(insn) + 1;
@@ -1915,7 +1944,9 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 	 *   'if <invariant> <op> <linear>' ⇔
 	 * 'if <linear> <flip(op)> <invariant>'.
 	 */
-	if (BPF_SRC(insn->code) == BPF_X && is_linear(scev, src_reg_scev, &l, &r)) {
+	if (BPF_SRC(insn->code) == BPF_X &&
+	    (is_linear(scev, src_reg_scev, &l, &r) ||
+	     is_linear32(scev, src_reg_scev, &l, &r))) {
 		swap(dst_reg_scev, src_reg_scev);
 		op = bpf_flip_opcode(op);
 	}
@@ -1928,7 +1959,11 @@ static int match_linear_latch(struct bpf_verifier_env *env,
 	 * - (linear (+ register imm) step)       |
 	 *           ^----------------------------'
 	 */
-	if (!is_linear(scev, dst_reg_scev, &latch->base_expr, &latch->step_expr))
+	if (is_linear(scev, dst_reg_scev, &latch->base_expr, &latch->step_expr))
+		latch->zext32 = false;
+	else if (is_linear32(scev, dst_reg_scev, &latch->base_expr, &latch->step_expr))
+		latch->zext32 = true;
+	else
 		return false;
 
 	if (BPF_SRC(insn->code) == BPF_K) {
@@ -2049,64 +2084,23 @@ static bool eval_expr(struct bpf_verifier_env *env, struct scev *scev,
 	return false;
 }
 
-/*
- * Loop with post-condition:
- *
- *    r0 = 0
- * l: ...                r0 ∈ [0,1,2] header executed 3 times
- *    r0 += 1            r0 ∈ [0,1,2]
- *    ...                r0 ∈ [1,2,3]
- *    if r0 != 3 goto l  r0 ∈ [1,2,3] backedge taken 2 times
- *    ...                r0 ∈ [3]
- *
- * SCEV at header: r0 = k
- * SCEV at latch:  r0 = 1 + k
- *
- * Loop with pre-condition:
- *
- *    r0 = 0
- * l: ...                r0 ∈ [0,1,2,3] header executed 4 times
- *    if r0 == 3 goto e  r0 ∈ [0,1,2,3] backedge taken 3 times
- *    r0 += 1            r0 ∈ [0,1,2]
- *    ...                r0 ∈ [1,2,3]
- *    goto l             r0 ∈ [1,2,3]
- * e: ...                r0 ∈ [3]
- *
- * SCEV at header: r0 = k
- * SCEV at latch:  r0 = k
- */
-static bool compute_max_iters(struct bpf_verifier_env *env,
-			      struct bpf_func_state *st,
-			      struct linear_latch *latch,
-			      struct bpf_loop_iters *iters)
+static bool is_signed_op(u8 op)
 {
-	struct bpf_insn_aux_data *aux = env->insn_aux_data;
-	struct bpf_loop *loop = aux[bpf_loop_at_index(env, latch->insn_idx)].loop;
-	struct scev *scev = env->scev;
-	struct scev_value initial_val, step_val, bound_val;
-	u64 rem, step, diff, bound, initial, backedge_taken_count;
-	u8 op = latch->op;
-	bool up, down;
-
-	if (!eval_expr(env, scev, st, latch->base_expr, &initial_val) ||
-	    !eval_expr(env, scev, st, latch->step_expr, &step_val) ||
-	    !eval_expr(env, scev, st, latch->bound_expr, &bound_val))
-		return false;
-
-	if (step_val.ptr_reg >= 0) {
-		if (env->log.level & BPF_LOG_LEVEL2) {
-			bpf_log(&env->log, "scev: latch step is a pointer ");
-			log_scev_value(env, st, &step_val);
-			bpf_log(&env->log, "\n");
-		}
+	switch (op) {
+	case BPF_JSLT:
+	case BPF_JSLE:
+	case BPF_JSGT:
+	case BPF_JSGE:
+		return true;
+	default:
 		return false;
 	}
-	if (!scev_value_compatible(env, st, &initial_val, &bound_val))
-		return false;
+}
 
-	initial = initial_val.value;
-	step = step_val.value;
-	bound = bound_val.value;
+static bool compute_backedge_taken_count(u8 op, u64 initial, u64 step, u64 bound, u64 *result)
+{
+	u64 rem, diff, backedge_taken_count;
+	bool up, down;
 
 	if (step == 0)
 		return false;
@@ -2215,6 +2209,98 @@ static bool compute_max_iters(struct bpf_verifier_env *env,
 		break;
 	default:
 		return false;
+	}
+
+	*result = backedge_taken_count;
+	return true;
+}
+
+/*
+ * Loop with post-condition:
+ *
+ *    r0 = 0
+ * l: ...                r0 ∈ [0,1,2] header executed 3 times
+ *    r0 += 1            r0 ∈ [0,1,2]
+ *    ...                r0 ∈ [1,2,3]
+ *    if r0 != 3 goto l  r0 ∈ [1,2,3] backedge taken 2 times
+ *    ...                r0 ∈ [3]
+ *
+ * SCEV at header: r0 = k
+ * SCEV at latch:  r0 = 1 + k
+ *
+ * Loop with pre-condition:
+ *
+ *    r0 = 0
+ * l: ...                r0 ∈ [0,1,2,3] header executed 4 times
+ *    if r0 == 3 goto e  r0 ∈ [0,1,2,3] backedge taken 3 times
+ *    r0 += 1            r0 ∈ [0,1,2]
+ *    ...                r0 ∈ [1,2,3]
+ *    goto l             r0 ∈ [1,2,3]
+ * e: ...                r0 ∈ [3]
+ *
+ * SCEV at header: r0 = k
+ * SCEV at latch:  r0 = k
+ */
+static bool compute_max_iters(struct bpf_verifier_env *env,
+			      struct bpf_func_state *st,
+			      struct linear_latch *latch,
+			      struct bpf_loop_iters *iters)
+{
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_loop *loop = aux[bpf_loop_at_index(env, latch->insn_idx)].loop;
+	struct scev *scev = env->scev;
+	struct scev_value initial_val, step_val, bound_val;
+	u64 step, bound, initial, total_change, backedge_taken_count;
+	u8 op = latch->op;
+
+	if (!eval_expr(env, scev, st, latch->base_expr, &initial_val) ||
+	    !eval_expr(env, scev, st, latch->step_expr, &step_val) ||
+	    !eval_expr(env, scev, st, latch->bound_expr, &bound_val))
+		return false;
+
+	if (step_val.ptr_reg >= 0) {
+		if (env->log.level & BPF_LOG_LEVEL2) {
+			bpf_log(&env->log, "scev: latch step is a pointer ");
+			log_scev_value(env, st, &step_val);
+			bpf_log(&env->log, "\n");
+		}
+		return false;
+	}
+	if (!scev_value_compatible(env, st, &initial_val, &bound_val))
+		return false;
+
+	initial = initial_val.value;
+	step = step_val.value;
+	bound = bound_val.value;
+
+	if (latch->zext32) {
+		if (is_signed_op(op)) {
+			initial = (s64)(s32)(u32)initial;
+			bound   = (s64)(s32)(u32)bound;
+			step    = (s64)(s32)(u32)step;
+		} else {
+			initial = (u32)initial;
+			bound   = (u32)bound;
+			step    = (s64)(s32)(u32)step;
+		}
+	}
+
+	if (!compute_backedge_taken_count(op, initial, step, bound, &backedge_taken_count))
+		return false;
+
+	if (latch->zext32) {
+		/*
+		 * compute_backedge_taken_count() guarantees that 'total_change'
+		 * does not overflow in 64-bit domain.
+		 */
+		total_change = initial + step * backedge_taken_count;
+		if (is_signed_op(op)) {
+			if ((s64)total_change < S32_MIN || (s64)total_change > S32_MAX)
+				return false;
+		} else {
+			if (total_change > U32_MAX)
+				return false;
+		}
 	}
 
 	/*
@@ -2342,35 +2428,68 @@ struct bounds {
 	u16 step;
 };
 
-static bool is_simple_linear(struct scev *scev, u32 id, u32 *base_reg, s64 *slope_imm)
+// TODO: pack `u32 *base_reg, s64 *slope_imm, bool *zext32` as a struct and use those
+//       in linear_bounds?
+static bool is_simple_linear(struct scev *scev, u32 id, u32 *base_reg, s64 *slope_imm, bool *zext32)
 {
 	u32 base, slope;
 
-	return is_linear(scev, id, &base, &slope) &&
-	       is_reg(scev, base, base_reg) &&
+	if (is_linear(scev, id, &base, &slope))
+		*zext32 = false;
+	else if (is_linear32(scev, id, &base, &slope))
+		*zext32 = true;
+	else
+		return false;
+	return is_reg(scev, base, base_reg) &&
 	       is_imm(scev, slope, slope_imm) &&
 	       *slope_imm <= S16_MAX &&
 	       *slope_imm >= S16_MIN &&
 	       *slope_imm != 0;
 }
 
-/*
- * Compute the range an induction variable in `reg` spans over the loop.
- * If the computation overflows s64 the range is unbounded, only the
- * power-of-two alignment survives the wraparound.
- */
-static void linear_bounds(struct bpf_reg_state *reg, u32 max_header_count, s64 slope,
+static struct cnum64 cnum64_zext32(struct cnum64 r64)
+{
+	struct cnum32 r32;
+
+	r32 = cnum32_from_cnum64(r64);
+	return cnum64_from_urange(cnum32_umin(r32), cnum32_umax(r32));
+}
+
+/* Compute the range an induction variable in `reg` spans over the loop. */
+static void linear_bounds(struct bpf_reg_state *reg, u32 max_header_count, s64 slope, bool zext32,
 			  struct bounds *out)
 {
 	s64 slope_abs = slope < 0 ? -slope : slope;
 	s64 min_val = reg_smin(reg);
 	s64 max_val = reg_smax(reg);
+	struct cnum64 r64, r64_zext;
 	s64 total_change;
 	bool overflow;
 
 	overflow = check_mul_overflow(slope, (s64)max_header_count - 1, &total_change) ||
 		   (slope > 0 && check_add_overflow(max_val, total_change, &max_val)) ||
 		   (slope < 0 && check_add_overflow(min_val, total_change, &min_val));
+	r64 = overflow ? CNUM64_UNBOUNDED : cnum64_from_srange(min_val, max_val);
+	if (zext32) {
+		/*
+		 * In case of zext32, full range is a union of a reg's value at loop entry,
+		 * plus a range produced by 32-bit iteration.
+		 */
+		r64_zext = cnum64_zext32(r64);
+		r64 = cnum64_union(reg->r64, r64_zext);
+		/*
+		 * 32-bit iteration overflow is equivalent to subtracting N * 2**32:
+		 * (base + slope * k) % slope ≠ (base + slope * k - N * 2**32) % slope.
+		 */
+		overflow |= r64_zext.size == U32_MAX;
+		/*
+		 * The entry and zero-extended values must agree on how they define `base`,
+		 * otherwise `base + slope * k` would define different sets of points between
+		 * the two.
+		 */
+		overflow |= imod(reg_smin(reg), slope_abs) !=
+			    imod(cnum64_smin(r64_zext), slope_abs);
+	}
 	/*
 	 * If the entry value is a single point the value set is 'v + slope * k',
 	 * so the step is |slope|. Otherwise, only the power-of-two alignment
@@ -2378,12 +2497,12 @@ static void linear_bounds(struct bpf_reg_state *reg, u32 max_header_count, s64 s
 	 */
 	if (cnum64_is_const(reg->r64) && !overflow) {
 		out->step = slope_abs;
-		out->base = imod(min_val, out->step);
+		out->base = imod(reg_smin(reg), out->step);
 	} else {
 		out->step = 1u << min_t(u32, tnum_alignment(reg->var_off), __ffs(slope_abs));
 		out->base = 0;
 	}
-	out->range = overflow ? CNUM64_UNBOUNDED : cnum64_from_srange(min_val, max_val);
+	out->range = r64;
 }
 
 static int mark_expr_precise(struct bpf_verifier_env *env, struct bpf_func_state *st, u32 id,
@@ -2428,6 +2547,7 @@ int bpf_compute_loop_iters(struct bpf_verifier_env *env, struct bpf_verifier_sta
 	u32 r, base_reg;
 	int latch_idx;
 	s64 slope_imm;
+	bool zext32;
 	int err, j;
 
 	if (!env->allow_uninit_stack)
@@ -2542,7 +2662,7 @@ int bpf_compute_loop_iters(struct bpf_verifier_env *env, struct bpf_verifier_sta
 		r_scev = header_env->reg2scev[r];
 		reg = scev_reg_for_linear(cur_func, r);
 		/* If SCEV for r is (linear <reg> <slope>) */
-		if (is_simple_linear(scev, r_scev, &base_reg, &slope_imm) &&
+		if (is_simple_linear(scev, r_scev, &base_reg, &slope_imm, &zext32) &&
 		    reg && is_widenable_reg_type(reg)) {
 			/* Spills at varying offsets lose precision */
 			if (test_bit(r, loop->store_base_regs)) {
@@ -2643,6 +2763,7 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	u32 r, base_reg, r_expr, a, b;
 	int insn_idx = st->insn_idx;
 	s64 slope_imm;
+	bool zext32;
 	int err;
 
 	for_each_set_bit(r, iters->precise_regs, REGS_NUM) {
@@ -2662,12 +2783,12 @@ int bpf_widen_scev_regs(struct bpf_verifier_env *env, struct bpf_verifier_state 
 
 		r_expr = header_env->reg2scev[r];
 		/* If SCEV for r is (linear <reg> <slope>)*/
-		if (is_simple_linear(scev, r_expr, &base_reg, &slope_imm) &&
+		if (is_simple_linear(scev, r_expr, &base_reg, &slope_imm, &zext32) &&
 		    base_reg == r) {
 			err = scev_reg_for_write(env, cur_func, r, &reg);
 			if (err)
 				return err;
-			linear_bounds(reg, iters->max_header_count, slope_imm, &bounds);
+			linear_bounds(reg, iters->max_header_count, slope_imm, zext32, &bounds);
 			if (log->level & BPF_LOG_LEVEL2) {
 				bpf_log(log, "loop header at %d, widening ", insn_idx);
 				log_reg(env, r);
@@ -2716,6 +2837,7 @@ int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *cur
 	struct bounds bounds;
 	u32 r, base_reg;
 	s64 slope_imm;
+	bool zext32;
 	int err;
 
 	if (entry_state->curframe != cur_func_state->frameno) {
@@ -2727,7 +2849,7 @@ int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *cur
 	header_env = find_header_env(scev, insn_idx);
 	for (r = 0; r < REGS_NUM; r++) {
 		/* If SCEV for r is (linear <reg> <slope>)*/
-		if (!is_simple_linear(scev, header_env->reg2scev[r], &base_reg, &slope_imm) ||
+		if (!is_simple_linear(scev, header_env->reg2scev[r], &base_reg, &slope_imm, &zext32) ||
 		    base_reg != r)
 			continue;
 
@@ -2737,7 +2859,7 @@ int bpf_clamp_scev_regs(struct bpf_verifier_env *env, struct bpf_func_state *cur
 		    is_unbound_scev_reg(env, entry_st, r))
 			continue;
 
-		linear_bounds(entry_reg, max_header_count, slope_imm, &bounds);
+		linear_bounds(entry_reg, max_header_count, slope_imm, zext32, &bounds);
 		bounds.range = cnum64_intersect(reg->r64, bounds.range);
 		if (cnum64_is_empty(bounds.range)) {
 			verifier_bug(env, "scev clamp produced empty range for r%d", r);
