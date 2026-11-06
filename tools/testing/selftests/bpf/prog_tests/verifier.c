@@ -166,6 +166,7 @@
 #include "verifier_jit_inline.skel.h"
 #include "irq.skel.h"
 #include "verifier_ctx_ptr_param.skel.h"
+#include "verifier_iter_loop_carried_index.skel.h"
 #include "verifier_loop_invariant_slot.skel.h"
 #include "verifier_zext.skel.h"
 
@@ -425,6 +426,7 @@ void test_verifier_array_access(void)
 		      init_array_access_maps);
 }
 void test_verifier_async_cb_context(void)    { RUN(verifier_async_cb_context); }
+void test_verifier_iter_loop_carried_index(void)        { RUN(verifier_iter_loop_carried_index); }
 void test_verifier_loop_invariant_slot(void)            { RUN(verifier_loop_invariant_slot); }
 
 static int init_value_ptr_arith_maps(struct bpf_object *obj)
